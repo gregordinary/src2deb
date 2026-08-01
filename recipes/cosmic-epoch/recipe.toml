@@ -1,0 +1,166 @@
+# COSMIC desktop (cosmic-epoch) build recipe.
+#
+# Generated from github.com/pop-os/cosmic-epoch. Each component is its own
+# Debian source package (its own debian/ tree); src2deb reads each
+# debian/control to discover build-deps and compute the build order, so the
+# order below does not matter. git-ref values are cosmic-epoch's pinned
+# submodule commits (reproducible); set a ref to "master" for latest.
+#
+# NOTE: the COSMIC Debian build graph is essentially flat -- only cosmic-osd
+# build-depends on another component (cosmic-randr). Every other component
+# builds independently. Builds vendor Rust crates (cargo/just) and expect a
+# vendor.tar prepared before an offline build; see README.md.
+#
+# No architecture is named, so the recipe builds for whichever host runs it.
+# Pass --architecture to target another one.
+
+name = "cosmic-epoch"
+suite = "trixie"
+
+# COSMIC needs a newer Rust than trixie's archive ships (`let_chains` and other
+# recently stabilized features), so the build root installs a pinned rustup
+# toolchain rather than using the archive's rustc.
+[toolchain.rust]
+provider = "rustup"
+version = "1.97.0"
+
+[[components]]
+name = "cosmic-applets"
+source.git = "https://github.com/pop-os/cosmic-applets"
+source.git-ref = "48c363315194b8901ada03b9e965893b6e13d477"
+
+[[components]]
+name = "cosmic-applibrary"
+source.git = "https://github.com/pop-os/cosmic-applibrary"
+source.git-ref = "ce33b9e1ccbebc2108eddee405a485cb92cb83e3"
+
+[[components]]
+name = "cosmic-bg"
+source.git = "https://github.com/pop-os/cosmic-bg"
+source.git-ref = "ed65f7d3dc9e3d4af3cd65244a966e01bff0f730"
+
+[[components]]
+name = "cosmic-comp"
+source.git = "https://github.com/pop-os/cosmic-comp"
+source.git-ref = "4d370cdf92b5d96d78032593947f4ad9eae793bf"
+
+[[components]]
+name = "cosmic-edit"
+source.git = "https://github.com/pop-os/cosmic-edit"
+source.git-ref = "a3d492028574af878fbe300a29ca9533fa063531"
+
+[[components]]
+name = "cosmic-files"
+source.git = "https://github.com/pop-os/cosmic-files"
+source.git-ref = "9a21542825af92811b622a58ace5f25f962506d7"
+
+[[components]]
+name = "cosmic-greeter"
+source.git = "https://github.com/pop-os/cosmic-greeter"
+source.git-ref = "2290aae5e2e078a1d79c6ec1a27cdf3ccc366a45"
+
+[[components]]
+name = "cosmic-icons"
+source.git = "https://github.com/pop-os/cosmic-icons"
+source.git-ref = "b78b059636ed967ad7c6f120709c7d29b2bafac1"
+
+[[components]]
+name = "cosmic-idle"
+source.git = "https://github.com/pop-os/cosmic-idle"
+source.git-ref = "c95d066b5b640509a6369634b669ca60dc50e168"
+
+[[components]]
+name = "cosmic-initial-setup"
+source.git = "https://github.com/pop-os/cosmic-initial-setup"
+source.git-ref = "b209a8d460d23a3a202e19a3de95027e9f4a61d8"
+
+[[components]]
+name = "cosmic-launcher"
+source.git = "https://github.com/pop-os/cosmic-launcher"
+source.git-ref = "b742d13acd0b218a2c9f36f64ecd6437f6cfb02d"
+
+[[components]]
+name = "cosmic-monitor"
+source.git = "https://github.com/pop-os/cosmic-monitor"
+source.git-ref = "4b3b177092348c88eedf46f41567df59753fa38a"
+
+[[components]]
+name = "cosmic-notifications"
+source.git = "https://github.com/pop-os/cosmic-notifications"
+source.git-ref = "7c723b7705ec77b1ad5396a1baa9ae1c0cb5a0da"
+
+[[components]]
+name = "cosmic-osd"
+source.git = "https://github.com/pop-os/cosmic-osd"
+source.git-ref = "ce431b4d710a198b13298c96d22fe5ccaadb1943"
+
+[[components]]
+name = "cosmic-panel"
+source.git = "https://github.com/pop-os/cosmic-panel"
+source.git-ref = "f416dbbe72d8600d395d24bf9f96f6ba1299d13b"
+
+[[components]]
+name = "cosmic-player"
+source.git = "https://github.com/pop-os/cosmic-player"
+source.git-ref = "7550c300c4997b7b0d61314ab1cfd15fb587ca80"
+
+[[components]]
+name = "cosmic-randr"
+source.git = "https://github.com/pop-os/cosmic-randr"
+source.git-ref = "6e8e795970fa06d434af22775e415b517f7552d3"
+
+[[components]]
+name = "cosmic-screenshot"
+source.git = "https://github.com/pop-os/cosmic-screenshot"
+source.git-ref = "d6ef210e981d045fec5022416b85edd0afc03e16"
+
+[[components]]
+name = "cosmic-session"
+source.git = "https://github.com/pop-os/cosmic-session"
+source.git-ref = "b5ef6c0c0d68762b2991e4f5906cc70599e2f1fc"
+
+[[components]]
+name = "cosmic-settings"
+source.git = "https://github.com/pop-os/cosmic-settings"
+source.git-ref = "c2624965bc06eb9d39bbd2d549543fad99754c07"
+
+[[components]]
+name = "cosmic-settings-daemon"
+source.git = "https://github.com/pop-os/cosmic-settings-daemon"
+source.git-ref = "e6ca13522a64227371bbd39bcfdffab3bb34d9b3"
+
+# [[components]]  # cosmic-sound-theme: no debian/ on master -- packaging TBD
+#   name = "cosmic-sound-theme"
+#   source.git = "https://github.com/pop-os/cosmic-sound-theme"
+#   source.git-ref = "7aabe449093787163c74c25aa1bd4663fb4c324c"
+
+[[components]]
+name = "cosmic-store"
+source.git = "https://github.com/pop-os/cosmic-store"
+source.git-ref = "e5822a1c51825afa11a95baa48483c695ea95828"
+
+[[components]]
+name = "cosmic-term"
+source.git = "https://github.com/pop-os/cosmic-term"
+source.git-ref = "117644e9c1bd525034e5c24570584f7b1d3478de"
+
+[[components]]
+name = "cosmic-wallpapers"
+source.git = "https://github.com/pop-os/cosmic-wallpapers"
+source.git-ref = "3c59953e7ee5792efecdb232cb4c7211e7785f52"
+
+[[components]]
+name = "cosmic-workspaces-epoch"
+source.git = "https://github.com/pop-os/cosmic-workspaces-epoch"
+source.git-ref = "6511d2f1a6be1b90ef0ac6ef7555f7ed2c809e47"
+
+[[components]]
+name = "pop-launcher"
+source.git = "https://github.com/pop-os/launcher"
+source.git-ref = "a332a3a73316a3595816dd02fe426a1d3543167a"
+
+[[components]]
+name = "xdg-desktop-portal-cosmic"
+source.git = "https://github.com/pop-os/xdg-desktop-portal-cosmic"
+source.git-ref = "969f3ca5995d157f78da60231af9e59641dae44d"
+

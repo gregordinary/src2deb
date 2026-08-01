@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/src2deb", "crates/src2deb-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gregordinary/src2deb"
+
+[workspace.dependencies]
+# The rootless build sandbox and Debian provisioner.
+ferroday-cage = { version = "0.1.2", features = ["debian"] }
+# Host architecture detection via `uname`, matching ferroday-cage's own mapping
+# so the two agree on which builds are foreign.
+rustix = { version = "1.1.4", features = ["system"] }
+serde = { version = "1", features = ["derive"] }
+# Safe registration of a signal handler that only sets a flag, so the CLI can
+# turn Ctrl-C into a request the run consults rather than a killed process.
+# The library takes the flag as an input and installs nothing itself.
+signal-hook = { version = "0.3.18", default-features = false }
+toml = "0.8"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

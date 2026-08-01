@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned to match ferroday-cage: reproducible formatting, linting, and builds
+# across machines, and the crate's minimum supported Rust version. Bump
+# deliberately, reformatting in the same commit.
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

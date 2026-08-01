@@ -1,0 +1,19 @@
+[package]
+name = "src2deb-cli"
+description = "Command-line interface for src2deb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "src2deb"
+path = "src/main.rs"
+
+[dependencies]
+signal-hook.workspace = true
+src2deb = { path = "../src2deb" }
+
+[lints]
+workspace = true

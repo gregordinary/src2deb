@@ -1,0 +1,48 @@
+# Pop desktop data build recipe.
+#
+# The theme, icon, font, and metadata packages COSMIC depends on at runtime and
+# Debian does not ship. Every binary package here is Architecture: all, built by
+# plain dh with no Rust and no vendoring, so one build serves every
+# architecture and the recipe needs no [toolchain] block.
+#
+# git-ref values are pinned upstream commits. Set a ref to "master" for latest.
+#
+# The suite below is this recipe's default; every component builds against forky
+# as well, with only a debhelper compat-level deprecation warning. Pass
+# --suite forky for that target. No architecture is named, so the recipe builds
+# for whichever host runs it; pass --architecture to target another one.
+
+name = "pop-desktop-data"
+suite = "trixie"
+
+# Recommended by cosmic-settings and depended on by cosmic-settings-daemon.
+[[components]]
+name = "adw-gtk3"
+source.git = "https://github.com/pop-os/adw-gtk3"
+source.git-ref = "213b5edad14afcf35b1c1c0bda41c6865dcc38b4"
+
+# appstream-data-pop: required by cosmic-store and cosmic-initial-setup.
+[[components]]
+name = "appstream-data-pop"
+source.git = "https://github.com/pop-os/appstream-data"
+source.git-ref = "23d51d32ecf7c83fe5b304fcebf8643c2bb2effc"
+
+# pop-fonts: required by cosmic-session.
+[[components]]
+name = "pop-fonts"
+source.git = "https://github.com/pop-os/fonts"
+source.git-ref = "2da23d5e76bf724c49875e8fd328e1fd5a6de80e"
+
+# pop-sound-theme: required by cosmic-settings-daemon. The source package is
+# pop-gtk-theme and also builds the pop-gtk-theme and pop-gnome-shell-theme
+# binaries; see README.md.
+[[components]]
+name = "pop-gtk-theme"
+source.git = "https://github.com/pop-os/gtk-theme"
+source.git-ref = "25ea85d97126992024b03bfb4e4c3b0711c749ed"
+
+# pop-icon-theme: required by cosmic-icons.
+[[components]]
+name = "pop-icon-theme"
+source.git = "https://github.com/pop-os/icon-theme"
+source.git-ref = "1a575a8e99b4ae629b9b16543a3a04d148632ba9"

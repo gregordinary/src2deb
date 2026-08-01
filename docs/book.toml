@@ -1,0 +1,13 @@
+[book]
+title = "src2deb"
+authors = ["gregordinary"]
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+
+[output.html]
+site-url = "/src2deb/"
+git-repository-url = "https://github.com/gregordinary/src2deb"
+edit-url-template = "https://github.com/gregordinary/src2deb/edit/main/docs/{path}"

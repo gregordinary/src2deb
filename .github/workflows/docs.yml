@@ -1,0 +1,61 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Allow the deploy job to publish to Pages via OIDC.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and let an in-flight one finish rather than
+# cancelling it partway through a publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the guide
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      # Built from source rather than from a pinned release asset, so the
+      # toolchain in rust-toolchain.toml is the only version this job pins.
+      - name: Install mdBook
+        run: cargo install mdbook --locked
+
+      # create-missing = false in book.toml, so a SUMMARY entry with no file
+      # fails the build rather than generating an empty chapter.
+      - name: Build
+        run: mdbook build docs
+
+      - name: Upload the artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    name: Deploy to Pages
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,38 @@
+# Pool-level packaging for a COSMIC desktop on Debian.
+#
+# The metapackage that installs the desktop, and the compatibility packages
+# needed because Pop's packaging names its dependencies as Ubuntu's archive names
+# them. Each component is a packaging-only source: no upstream code, plain dh, and
+# an empty Architecture: all package whose whole content is its dependency
+# relationships, so one build serves every architecture.
+#
+# The repository holds one directory per source package; each component names its
+# own with source.subdir.
+#
+# source.git names the packaging repository's home. That repository is not
+# published yet, so this recipe does not build until it is; point source.git at a
+# local clone to build it before then.
+#
+# Build this into the same pool as the COSMIC packages, for the same suite: the
+# metapackage is only useful next to the packages it names.
+
+name = "cosmic-debian"
+suite = "forky"
+
+# cosmic-desktop: the metapackage. `apt install cosmic-desktop` installs the
+# desktop, its first-run setup, and everything those reach.
+[[components]]
+name = "cosmic-desktop"
+source.git = "https://github.com/gregordinary/cosmic-debian.git"
+source.git-ref = "main"
+source.subdir = "cosmic-desktop"
+
+# network-manager-gnome: required by cosmic-settings, removed from Debian after
+# trixie in favour of nm-connection-editor. Needed on forky and later; on trixie
+# the archive still carries the real package, at a version that wins over this
+# one.
+[[components]]
+name = "network-manager-gnome"
+source.git = "https://github.com/gregordinary/cosmic-debian.git"
+source.git-ref = "main"
+source.subdir = "network-manager-gnome"
