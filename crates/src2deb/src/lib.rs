@@ -58,6 +58,6 @@ pub use engine::{
     RunReport, Selection, SkipReason, Skipped,
 };
 pub use error::{Error, Result};
-pub use fingerprint::{Fingerprint, SourceInput, SourceKind};
+pub use fingerprint::{Fingerprint, SourceInput, SourceKind, SourceRole};
 pub use manifest::Manifest;
 pub use recipe::{Component, Origin, Recipe, Source};

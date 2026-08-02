@@ -1378,7 +1378,7 @@ impl Engine {
     ) -> Result<Resolution<'a>> {
         // The recipe's own directory, so a relative `source.path` resolves
         // against the recipe rather than against wherever src2deb was invoked.
-        let resolver = SourceResolver::new(self.work_dir.join("sources"), recipe.dir());
+        let resolver = SourceResolver::new(&self.work_dir, recipe.dir());
 
         let mut trees: Vec<Resolved> = Vec::new();
         let mut failed: Vec<Failed> = Vec::new();
@@ -2397,7 +2397,10 @@ mod tests {
 
     /// A git source at `commit`, the shape the resolver produces.
     fn git(commit: &str) -> Fingerprint {
-        Fingerprint::of(crate::fingerprint::SourceInput::git(commit))
+        Fingerprint::of(crate::fingerprint::SourceInput::git(
+            crate::fingerprint::SourceRole::Source,
+            commit,
+        ))
     }
 
     /// `count` stand-in artifacts, for a report whose test only counts them.
@@ -2649,8 +2652,10 @@ mod tests {
         // from, not what it held. A prior record that matches exactly is still
         // not evidence the source stood still.
         let selected: BTreeSet<&str> = ["a"].into_iter().collect();
-        let working_tree =
-            Fingerprint::of(crate::fingerprint::SourceInput::path("/home/someone/a"));
+        let working_tree = Fingerprint::of(crate::fingerprint::SourceInput::path(
+            crate::fingerprint::SourceRole::Source,
+            "/home/someone/a",
+        ));
         let mut prior = BTreeMap::new();
         prior.insert(
             "a".to_string(),

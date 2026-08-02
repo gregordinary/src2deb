@@ -501,11 +501,11 @@ impl Manifest {
 mod tests {
     use super::*;
 
-    use crate::fingerprint::SourceInput;
+    use crate::fingerprint::{SourceInput, SourceRole};
 
     /// A git source at `commit`, the shape the resolver produces.
     fn git(commit: &str) -> Fingerprint {
-        Fingerprint::of(SourceInput::git(commit))
+        Fingerprint::of(SourceInput::git(SourceRole::Source, commit))
     }
 
     fn built(name: &str, commit: &str, version: &str) -> ComponentRecord {
@@ -566,8 +566,8 @@ mod tests {
                 error: None,
                 buildinfo: None,
                 source: Fingerprint::over(vec![
-                    SourceInput::git("abc123"),
-                    SourceInput::path("/home/someone/packaging"),
+                    SourceInput::git(SourceRole::Source, "abc123"),
+                    SourceInput::path(SourceRole::Packaging, "/home/someone/packaging"),
                 ]),
                 packages: Vec::new(),
             }],
@@ -977,7 +977,10 @@ mod tests {
         // A path names where a tree was read from, not what it held, so a run
         // agreeing with the record establishes nothing about whether the source
         // moved. Skipping here would publish a stale package as a fresh build.
-        let working_tree = Fingerprint::of(SourceInput::path("/home/someone/cosmic-comp"));
+        let working_tree = Fingerprint::of(SourceInput::path(
+            SourceRole::Source,
+            "/home/someone/cosmic-comp",
+        ));
         let record = ComponentRecord {
             name: "c".to_string(),
             status: STATUS_BUILT.to_string(),
@@ -992,8 +995,8 @@ mod tests {
         // One unpinned input among pinned ones is enough: whatever else the
         // build consumed, part of it cannot be compared.
         let overlaid = Fingerprint::over(vec![
-            SourceInput::git("abc"),
-            SourceInput::path("/home/someone/packaging"),
+            SourceInput::git(SourceRole::Source, "abc"),
+            SourceInput::path(SourceRole::Packaging, "/home/someone/packaging"),
         ]);
         let record = ComponentRecord {
             source: overlaid.clone(),
@@ -1008,8 +1011,8 @@ mod tests {
         // a different source, so a prior run's record does not excuse a build.
         let record = built("c", "abc", "1.0");
         assert!(!record.is_built_at(&Fingerprint::over(vec![
-            SourceInput::git("abc"),
-            SourceInput::sha256("9f8e7d6"),
+            SourceInput::git(SourceRole::Source, "abc"),
+            SourceInput::sha256(SourceRole::Packaging, "9f8e7d6"),
         ])));
     }
 

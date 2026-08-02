@@ -218,6 +218,52 @@ copy would either walk into its own output or be deleted by the wipe that
 precedes it, so the component is refused. Move `--work` outside the source tree,
 or point the source somewhere else.
 
+### `the packaging source at X has no debian directory`
+
+```text
+src2deb: FAILED foo: resolving source for foo: the packaging source at
+/work/packaging/foo/debian has no debian directory; a packaging overlay supplies
+one, and packaging.subdir names the directory holding it rather than the
+directory itself
+```
+
+Almost always the setting pointing one level too deep. A packaging overlay names
+the directory that *holds* `debian/`, so a repository whose root is the packaging
+tree needs no `packaging.subdir` at all, and one that keeps its packaging under
+`debian-packaging/foo/debian/` sets `packaging.subdir = "debian-packaging/foo"`.
+
+The other cause is a repository that genuinely has no packaging in it — check the
+branch. Packaging repositories often keep `debian/` on a branch of its own, which
+`packaging.git-ref` selects.
+
+### `packaging.subdir X names Y, which the source does not hold`
+
+```text
+src2deb: FAILED foo: resolving source for foo: packaging.subdir debian/foo names
+/work/packaging/foo/debian/foo, which the source does not hold
+```
+
+The subdirectory is not in the tree that was checked out. The same message
+appears for `source.subdir` against a component's own source. Compare the path in
+the message with the tree under the work directory, and check
+`packaging.git-ref`: a subdirectory that exists on one branch need not exist on
+another.
+
+### `the packaging source X and the component's source tree Y sit inside one another`
+
+```text
+src2deb: FAILED foo: resolving source for foo: the packaging source
+/work/sources/foo and the component's source tree /work/sources/foo sit inside
+one another, so the overlay would be copied onto itself; point packaging at a
+tree outside the work directory
+```
+
+A `packaging.path` pointing into src2deb's own work directory, usually at the
+copy of the source it is meant to overlay. The overlay's destination is removed
+before the copy, so this would delete the tree it was about to read. Point
+`packaging.path` at the packaging as you keep it — beside the recipe, or wherever
+you edit it — rather than at anything under `--work`.
+
 ### `patch X does not apply`
 
 ```text

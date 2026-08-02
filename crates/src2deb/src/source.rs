@@ -14,6 +14,38 @@
 //! For a **path** source it copies the tree on disk into the work directory and
 //! builds from the copy. See [Path sources](#path-sources).
 //!
+//! # Assembling a tree
+//!
+//! A component's tree is assembled from up to three inputs, in this order:
+//!
+//! 1. its **source**, resolved into the work directory as above;
+//! 2. its **packaging overlay**, if it declares one — see [Packaging
+//!    overlays](#packaging-overlays);
+//! 3. its **patch series**, if it declares one.
+//!
+//! Everything downstream reads the assembled tree, `debian/control` included,
+//! so an overlay may supply the build-dependencies a component is ordered by
+//! and a patch may change them.
+//!
+//! Each input contributes one entry to the component's [`Fingerprint`], in that
+//! same order, so the version stamp and the manifest name every tree the build
+//! was assembled from.
+//!
+//! # Packaging overlays
+//!
+//! Not every upstream ships a `debian/` directory, and for many that do not,
+//! someone else's packaging exists — a distribution's packaging repository, or
+//! one of your own. A component may therefore name a second tree, resolved by
+//! the same two origins as its source, whose `debian/` directory becomes the
+//! component's.
+//!
+//! The overlay **replaces** any `debian/` the source ships rather than merging
+//! with it, so the packaging that reaches the build is the packaging that was
+//! declared, with nothing of an abandoned one left beside it. Nothing outside
+//! `debian/` is taken: a packaging repository that also carries a copy of the
+//! upstream tree — the ordinary shape of a distribution's repository —
+//! contributes its packaging and not its idea of the source.
+//!
 //! # Path sources
 //!
 //! A path source is never built where it lies. The vendor pass binds the source
@@ -60,56 +92,94 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{Error, Result, io_error};
-use crate::fingerprint::{Fingerprint, SourceInput};
-use crate::recipe::{Component, Origin};
+use crate::fingerprint::{Fingerprint, SourceInput, SourceRole};
+use crate::recipe::{Component, Origin, Source};
 
 /// A resolved component source: the tree that holds `debian/`, and what the
 /// tree was resolved from.
 ///
-/// The fingerprint of a git source is the resolved `HEAD` after checkout, so it
+/// The fingerprint names every input the tree was assembled from, in assembly
+/// order. A git source contributes the resolved `HEAD` after checkout, so it
 /// names a concrete revision even when the recipe tracked a branch or the
-/// remote's default; the fingerprint of a path source is the path it was read
-/// from, which pins nothing. It anchors the run's provenance manifest, the
-/// version stamp, and the `--skip-published` comparison.
+/// remote's default; a path source contributes the path it was read from, which
+/// pins nothing. It anchors the run's provenance manifest, the version stamp,
+/// and the `--skip-published` comparison.
 #[derive(Debug, Clone)]
 pub struct ResolvedSource {
     /// The path to the tree that holds the `debian/` directory.
     pub tree: PathBuf,
-    /// What the tree was resolved from.
+    /// What the tree was assembled from.
     pub source: Fingerprint,
 }
 
-/// Puts component sources under a work directory: cloning and checking out a
-/// git source, and copying a path source.
+/// One of a component's declared trees, resolved into the work directory: where
+/// it landed, and the input naming what it was.
+struct ResolvedTree {
+    /// The tree itself — the resolved source, or its `subdir` when one is set.
+    tree: PathBuf,
+    /// The input this tree contributes to the component's fingerprint.
+    input: SourceInput,
+}
+
+/// Puts the trees a component is built from under a work directory: cloning and
+/// checking out a git source, and copying a path source.
 pub struct SourceResolver {
     sources_dir: PathBuf,
+    packaging_dir: PathBuf,
     recipe_dir: PathBuf,
 }
 
 impl SourceResolver {
-    /// Creates a resolver that places sources under `sources_dir` and resolves a
-    /// relative [`Source::path`](crate::Source::path) against `recipe_dir`.
-    pub fn new(sources_dir: impl Into<PathBuf>, recipe_dir: impl Into<PathBuf>) -> SourceResolver {
+    /// Creates a resolver that works under `work_dir` and resolves a relative
+    /// [`Source::path`](crate::Source::path) against `recipe_dir`.
+    ///
+    /// A component's own source lands in `<work_dir>/sources/<component>` and
+    /// the source of its packaging overlay, when it declares one, in
+    /// `<work_dir>/packaging/<component>`. They are kept apart because both are
+    /// checkouts named for the component, and a component's source tree is
+    /// bound into a cage while its packaging source is only ever read.
+    pub fn new(work_dir: impl AsRef<Path>, recipe_dir: impl Into<PathBuf>) -> SourceResolver {
+        let work_dir = work_dir.as_ref();
         SourceResolver {
-            sources_dir: sources_dir.into(),
+            sources_dir: work_dir.join("sources"),
+            packaging_dir: work_dir.join("packaging"),
             recipe_dir: recipe_dir.into(),
         }
     }
 
-    /// Resolves `component`'s source, returning the tree holding its `debian/`
-    /// directory and the fingerprint of what it was resolved from.
+    /// Resolves `component`, returning the assembled tree holding its `debian/`
+    /// directory and the fingerprint of everything it was assembled from.
     ///
-    /// The returned tree is the resolved source, or its `subdir` when the recipe
-    /// sets one. Which work the resolve does follows the component's [`Origin`]:
-    /// a git source is cloned or fetched and checked out, landing on the fetched
-    /// remote state and fingerprinted by the resolved `HEAD`; a path source is
-    /// copied under the work directory and fingerprinted, unpinned, by the path
-    /// it was read from. See [Path sources](self#path-sources).
+    /// The tree is assembled from the component's source, then its packaging
+    /// overlay, then its patch series — see [Assembling a
+    /// tree](self#assembling-a-tree). Which work the source resolve does follows
+    /// its [`Origin`]: a git source is cloned or fetched and checked out,
+    /// landing on the fetched remote state and fingerprinted by the resolved
+    /// `HEAD`; a path source is copied under the work directory and
+    /// fingerprinted, unpinned, by the path it was read from. See [Path
+    /// sources](self#path-sources).
+    ///
+    /// The `debian/control` check comes after the overlay, because a component
+    /// declaring one has no `debian/` until it is applied. It is what makes the
+    /// tree a component at all, so nothing downstream has to ask again.
     ///
     /// A component that names no origin — or two — cannot be resolved. A
     /// validated recipe has neither ([`Recipe::load`](crate::Recipe::load)
     /// refuses both), so this is reported rather than assumed away.
     pub fn resolve(&self, component: &Component) -> Result<ResolvedSource> {
+        let source = self.resolve_source(component)?;
+        let mut inputs = vec![source.input];
+        inputs.extend(self.overlay_packaging(component, &source.tree)?);
+        refuse_without_control(component, &source.tree)?;
+        inputs.extend(self.apply_patches(component, &source.tree)?);
+        Ok(ResolvedSource {
+            tree: source.tree,
+            source: Fingerprint::over(inputs),
+        })
+    }
+
+    /// Resolves the component's own source into `sources/<component>`.
+    fn resolve_source(&self, component: &Component) -> Result<ResolvedTree> {
         match component.source.origin() {
             Some(Origin::Git { url, git_ref }) => self.resolve_git(component, url, git_ref),
             Some(Origin::Path(path)) => self.resolve_path(component, path),
@@ -125,9 +195,9 @@ impl SourceResolver {
     /// Resolves a git source: clones the repository on first use and fetches on
     /// later use, checks out `git_ref`, and initializes submodules.
     ///
-    /// The fingerprint names the resolved `HEAD` for the run's provenance, so it
-    /// is a concrete revision even when the recipe tracked a branch or the
-    /// remote's default.
+    /// The input names the resolved `HEAD` for the run's provenance, so it is a
+    /// concrete revision even when the recipe tracked a branch or the remote's
+    /// default.
     ///
     /// A re-run always lands on the fetched remote state: a branch ref advances
     /// to its upstream tip, a tag or commit resolves to itself, and an unset ref
@@ -137,60 +207,20 @@ impl SourceResolver {
         component: &Component,
         url: &str,
         git_ref: Option<&str>,
-    ) -> Result<ResolvedSource> {
-        std::fs::create_dir_all(&self.sources_dir).map_err(|err| self.fail(component, err))?;
-        let checkout = self.sources_dir.join(&component.name);
-
-        if checkout.join(".git").is_dir() {
-            // Fetch updates the remote-tracking refs (`origin/*`) and tags, but
-            // never the local branches; the checkout below targets that fetched
-            // remote state so a re-run picks up upstream. `--force` lets a moved
-            // tag update rather than being rejected.
-            self.git(
-                component,
-                &checkout,
-                &["fetch", "--tags", "--prune", "--force"],
-            )?;
-        } else {
-            self.git(
-                component,
-                &self.sources_dir,
-                &["clone", "--recurse-submodules", url, &component.name],
-            )?;
-        }
-
-        // Check out the fetched target detached, so we never pin to a stale
-        // local branch that `fetch` did not move.
-        let target = self.resolve_target(component, &checkout, git_ref)?;
-        self.git(
-            component,
-            &checkout,
-            &["checkout", "--force", "--detach", &target],
-        )?;
-        // Re-sync submodules to the checked-out commit, forcing a checkout so a
-        // submodule that moved between refs is updated rather than left behind.
-        self.git(
-            component,
-            &checkout,
-            &["submodule", "update", "--init", "--recursive", "--force"],
-        )?;
-
-        let tree = source_tree(&checkout, component.source.subdir.as_deref());
-        refuse_without_control(component, &tree)?;
-        // A checkout persists between runs, so anything a prior run's series
-        // created is still there — and would refuse to be created again, or
-        // stay behind a patch the recipe has since dropped.
-        self.discard_prior_patch_output(component, &checkout)?;
+    ) -> Result<ResolvedTree> {
+        let checkout = self.checkout_git(component, &self.sources_dir, url, git_ref)?;
+        let subdir = component.source.subdir.as_deref();
+        let tree = source_tree(&checkout, subdir);
+        refuse_missing_subdir(component, "source", subdir, &tree)?;
+        // A checkout persists between runs, so anything a prior run's overlay
+        // or series left is still there — and would refuse to be created again,
+        // or stay behind an input the recipe has since dropped.
+        self.discard_prior_assembly(component, &checkout)?;
         self.materialize_lfs(component, &checkout, &tree)?;
-        let patches = self.apply_patches(component, &tree)?;
         let commit = self.head_commit(component, &checkout)?;
-        Ok(ResolvedSource {
+        Ok(ResolvedTree {
             tree,
-            source: Fingerprint::over(
-                std::iter::once(SourceInput::git(commit))
-                    .chain(patches)
-                    .collect(),
-            ),
+            input: SourceInput::git(SourceRole::Source, commit),
         })
     }
 
@@ -199,15 +229,14 @@ impl SourceResolver {
     ///
     /// `declared` is taken relative to the recipe's own directory, so a recipe
     /// kept beside the trees it builds moves with them; an absolute path is used
-    /// as it stands. The fingerprint is the canonical path the tree was read
-    /// from, which is unpinned — see [`crate::fingerprint`].
+    /// as it stands. The input is the canonical path the tree was read from,
+    /// which is unpinned — see [`crate::fingerprint`].
     ///
     /// The copy is what makes this safe to run against a working tree, and the
     /// order of the work here is what makes it cheap to get wrong: the tree is
-    /// checked for a `debian/control` and scanned for Git LFS pointers *before*
-    /// anything is copied, so a misdirected path fails at once rather than after
-    /// a full traversal of whatever it pointed at.
-    fn resolve_path(&self, component: &Component, declared: &Path) -> Result<ResolvedSource> {
+    /// checked over *before* anything is copied, so a misdirected path fails at
+    /// once rather than after a full traversal of whatever it pointed at.
+    fn resolve_path(&self, component: &Component, declared: &Path) -> Result<ResolvedTree> {
         // `join` takes an absolute `declared` whole, so this is the relative
         // case and the absolute one at once.
         let joined = self.recipe_dir.join(declared);
@@ -227,7 +256,14 @@ impl SourceResolver {
 
         let subdir = component.source.subdir.as_deref();
         let tree_origin = source_tree(&origin, subdir);
-        refuse_without_control(component, &tree_origin)?;
+        refuse_missing_subdir(component, "source", subdir, &tree_origin)?;
+        // A component that gets its packaging from elsewhere has no `debian/`
+        // to find yet, so it is checked once the overlay is in place. Every
+        // other component is checked here, before the copy, which is what keeps
+        // a misdirected path from costing a full traversal.
+        if component.packaging.is_none() {
+            refuse_without_control(component, &tree_origin)?;
+        }
         self.refuse_lfs_pointers(component, &tree_origin)?;
 
         std::fs::create_dir_all(&self.sources_dir).map_err(|err| self.fail(component, err))?;
@@ -248,25 +284,192 @@ impl SourceResolver {
         // Afresh, so the copy is the tree as it now stands rather than that tree
         // over the leavings of the run before — the same guarantee `git checkout
         // --force` gives a git source, which is also what stops a prior run's
-        // `vendor.tar` from being handed to the next one.
+        // `vendor.tar` from being handed to the next one. It is also why a path
+        // source needs no `discard_prior_assembly`: nothing survives to discard.
         if checkout.exists() {
             std::fs::remove_dir_all(&checkout)
                 .map_err(|err| io_error("clearing", &checkout, err))?;
         }
         copy_tree(&origin, &checkout)?;
 
-        // The copy is fresh, so the series applies over the tree as it stands
-        // with nothing to discard first.
-        let tree = source_tree(&checkout, subdir);
-        let patches = self.apply_patches(component, &tree)?;
-        Ok(ResolvedSource {
-            tree,
-            source: Fingerprint::over(
-                std::iter::once(SourceInput::path(origin.to_string_lossy()))
-                    .chain(patches)
-                    .collect(),
-            ),
+        Ok(ResolvedTree {
+            tree: source_tree(&checkout, subdir),
+            input: SourceInput::path(SourceRole::Source, origin.to_string_lossy()),
         })
+    }
+
+    /// Clones `url` into `parent/<component>` on first use and fetches it on
+    /// later use, checks out `git_ref` detached, and syncs submodules. Returns
+    /// the checkout.
+    ///
+    /// Serves a component's source and its packaging overlay alike, differing
+    /// only in the `parent` they land under.
+    fn checkout_git(
+        &self,
+        component: &Component,
+        parent: &Path,
+        url: &str,
+        git_ref: Option<&str>,
+    ) -> Result<PathBuf> {
+        std::fs::create_dir_all(parent).map_err(|err| self.fail(component, err))?;
+        let checkout = parent.join(&component.name);
+
+        if checkout.join(".git").is_dir() {
+            // Fetch updates the remote-tracking refs (`origin/*`) and tags, but
+            // never the local branches; the checkout below targets that fetched
+            // remote state so a re-run picks up upstream. `--force` lets a moved
+            // tag update rather than being rejected.
+            self.git(
+                component,
+                &checkout,
+                &["fetch", "--tags", "--prune", "--force"],
+            )?;
+        } else {
+            self.git(
+                component,
+                parent,
+                &["clone", "--recurse-submodules", url, &component.name],
+            )?;
+        }
+
+        // Check out the fetched target detached, so we never pin to a stale
+        // local branch that `fetch` did not move.
+        let target = self.resolve_target(component, &checkout, git_ref)?;
+        self.git(
+            component,
+            &checkout,
+            &["checkout", "--force", "--detach", &target],
+        )?;
+        // Re-sync submodules to the checked-out commit, forcing a checkout so a
+        // submodule that moved between refs is updated rather than left behind.
+        self.git(
+            component,
+            &checkout,
+            &["submodule", "update", "--init", "--recursive", "--force"],
+        )?;
+        Ok(checkout)
+    }
+
+    /// Puts the component's declared packaging in place of whatever `debian/`
+    /// its source tree carries, and returns the input the overlay contributes to
+    /// the component's fingerprint — `None` when the component declares none.
+    ///
+    /// The overlay's source is resolved by the same two origins the component's
+    /// own source is, and held to the same rules: a git one is cloned and
+    /// checked out under the work directory, a path one is read where it lies,
+    /// and either is refused if it holds an unmaterialized Git LFS pointer. A
+    /// path is read rather than copied because nothing ever writes to it — the
+    /// build sees the component's tree, and the overlay reaches it by this copy.
+    ///
+    /// See [Packaging overlays](self#packaging-overlays) for what is taken and
+    /// what is left.
+    fn overlay_packaging(&self, component: &Component, tree: &Path) -> Result<Option<SourceInput>> {
+        let Some(packaging) = &component.packaging else {
+            return Ok(None);
+        };
+        let resolved = self.resolve_packaging(component, packaging)?;
+        self.copy_packaging(component, &resolved.tree, tree)?;
+        Ok(Some(resolved.input))
+    }
+
+    /// Resolves the tree a packaging overlay is taken from, without copying
+    /// anything out of it yet.
+    fn resolve_packaging(&self, component: &Component, packaging: &Source) -> Result<ResolvedTree> {
+        let subdir = packaging.subdir.as_deref();
+        match packaging.origin() {
+            Some(Origin::Git { url, git_ref }) => {
+                let checkout = self.checkout_git(component, &self.packaging_dir, url, git_ref)?;
+                let tree = source_tree(&checkout, subdir);
+                refuse_missing_subdir(component, "packaging", subdir, &tree)?;
+                self.materialize_lfs(component, &checkout, &tree)?;
+                let commit = self.head_commit(component, &checkout)?;
+                Ok(ResolvedTree {
+                    tree,
+                    input: SourceInput::git(SourceRole::Packaging, commit),
+                })
+            }
+            Some(Origin::Path(declared)) => {
+                let joined = self.recipe_dir.join(declared);
+                let origin = joined.canonicalize().map_err(|err| Error::Source {
+                    component: component.name.clone(),
+                    reason: format!("packaging.path {} cannot be read: {err}", joined.display()),
+                })?;
+                if !origin.is_dir() {
+                    return Err(Error::Source {
+                        component: component.name.clone(),
+                        reason: format!("packaging.path {} is not a directory", origin.display()),
+                    });
+                }
+                let tree = source_tree(&origin, subdir);
+                refuse_missing_subdir(component, "packaging", subdir, &tree)?;
+                self.refuse_lfs_pointers(component, &tree)?;
+                Ok(ResolvedTree {
+                    tree,
+                    // The declared root rather than the subdir within it, as a
+                    // path source records: the recipe is the authority for
+                    // which part of a tree was taken, and the record for where
+                    // the tree was.
+                    input: SourceInput::path(SourceRole::Packaging, origin.to_string_lossy()),
+                })
+            }
+            None => Err(Error::Source {
+                component: component.name.clone(),
+                reason: "the component names no single packaging source; set \
+                         packaging.git to clone a repository, or packaging.path to \
+                         overlay a tree on disk"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Copies the `debian/` directory of `overlay` over the one in `tree`.
+    ///
+    /// The destination is removed first, so the packaging that reaches the build
+    /// is the packaging that was declared rather than that packaging over the
+    /// remains of whatever the source shipped. For a git source that removal is
+    /// undone by the next run's `git checkout --force` before it happens again,
+    /// so the source's own `debian/` is never lost — only set aside.
+    fn copy_packaging(&self, component: &Component, overlay: &Path, tree: &Path) -> Result<()> {
+        // First, because it is the check that stands between a misdirected
+        // recipe and a directory removed before it is read. Canonical on both
+        // sides, so a symlinked route to the same tree is caught rather than
+        // passed over.
+        refuse_packaging_overlap(
+            component,
+            &overlay
+                .canonicalize()
+                .map_err(|err| self.fail(component, err))?,
+            &tree
+                .canonicalize()
+                .map_err(|err| self.fail(component, err))?,
+        )?;
+
+        let from = overlay.join(PACKAGING);
+        if !from.is_dir() {
+            return Err(Error::Source {
+                component: component.name.clone(),
+                reason: format!(
+                    "the packaging source at {} has no {PACKAGING} directory; a \
+                     packaging overlay supplies one, and packaging.subdir names \
+                     the directory holding it rather than the directory itself",
+                    overlay.display(),
+                ),
+            });
+        }
+
+        // Inspected without following, so a `debian` that is a symlink is
+        // removed as the link it is rather than reported as a directory that
+        // will not remove — and never followed out of the tree.
+        let to = tree.join(PACKAGING);
+        match std::fs::symlink_metadata(&to) {
+            Ok(metadata) if metadata.is_dir() => {
+                std::fs::remove_dir_all(&to).map_err(|err| io_error("clearing", &to, err))?;
+            }
+            Ok(_) => std::fs::remove_file(&to).map_err(|err| io_error("clearing", &to, err))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_error("inspecting", &to, err)),
+        }
+        copy_tree(&from, &to)
     }
 
     /// Applies `component`'s patch series to `tree`, and returns the input it
@@ -422,53 +625,62 @@ impl SourceResolver {
             .map_err(|err| self.fail(component, err))
     }
 
-    /// Removes whatever a patch series left in `checkout` on an earlier run, so
-    /// this run's series applies to the tree upstream ships.
+    /// Removes whatever this component's assembly wrote into `checkout` on an
+    /// earlier run, so this run assembles over the tree upstream ships.
     ///
-    /// Only a git checkout needs this, and only for the files a series
-    /// *creates*. `git checkout --force` restores every tracked file a series
-    /// modified, but it leaves untracked files where they are — deliberately,
-    /// since that is what carries the vendor pass's output between runs. So a
-    /// patch that adds a file finds it already there on the second run and
-    /// refuses to create it.
+    /// Only a git checkout needs this, and only for the paths an assembly
+    /// *creates*. `git checkout --force` restores every tracked file an
+    /// assembly modified, but it leaves untracked files where they are —
+    /// deliberately, since that is what carries the vendor pass's output between
+    /// runs. So a patch that adds a file finds it already there on the second
+    /// run and refuses to create it, and a `debian/` an overlay contributed
+    /// stays put after the recipe stops declaring one.
     ///
-    /// The paths to discard are the ones the patches themselves name, taken from
-    /// `git apply --numstat`, which parses a patch without applying it. Cleaning
-    /// exactly those leaves everything else — the vendored crates above all —
-    /// where it was.
+    /// The paths to discard are the ones the assembly itself names: `debian/`
+    /// for a packaging overlay, and for a patch whatever `git apply --numstat`
+    /// reports, which parses a patch without applying it. Cleaning exactly those
+    /// leaves everything else — the vendored crates above all — where it was.
     ///
-    /// Two series are consulted, not one: this run's, and whatever the last run
-    /// recorded ([`PATCH_TARGETS`]). A patch dropped from the recipe is no
-    /// longer there to name the file it added, and without the record that file
-    /// would stay in the tree and be built into the package — a change to the
-    /// recipe that the build silently does not follow.
-    fn discard_prior_patch_output(&self, component: &Component, checkout: &Path) -> Result<()> {
-        let record = checkout.join(PATCH_TARGETS);
-        if component.patches.is_empty() && !record.is_file() {
+    /// Two assemblies are consulted, not one: this run's, and whatever the last
+    /// run recorded ([`ASSEMBLED_PATHS`]). An input dropped from the recipe is
+    /// no longer there to name what it wrote, and without the record that would
+    /// stay in the tree and be built into the package — a change to the recipe
+    /// that the build silently does not follow.
+    ///
+    /// It runs before the overlay and the series are applied, so what it clears
+    /// is the previous run's work and never this one's.
+    fn discard_prior_assembly(&self, component: &Component, checkout: &Path) -> Result<()> {
+        let record = checkout.join(ASSEMBLED_PATHS);
+        if component.patches.is_empty() && component.packaging.is_none() && !record.is_file() {
             return Ok(());
         }
 
         let tree = source_tree(checkout, component.source.subdir.as_deref());
         let mut current = Vec::new();
+        if component.packaging.is_some() {
+            current.push(PathBuf::from(PACKAGING));
+        }
         for (path, contents) in self.read_patches(component)? {
             current.extend(self.patch_targets(component, &tree, &path, &contents)?);
         }
         // The union, so a path this run no longer touches is still cleared once.
-        let mut targets = read_patch_targets(&record)?;
+        let mut targets = read_assembled_paths(&record)?;
         targets.extend(current.iter().cloned());
         targets.sort();
         targets.dedup();
-        write_patch_targets(&record, &current)?;
+        write_assembled_paths(&record, &current)?;
 
         if targets.is_empty() {
             return Ok(());
         }
         // `-x` reaches an ignored file too, which a patch may well create; the
-        // pathspecs keep that bounded to what a series touches. A pathspec
+        // pathspecs keep that bounded to what the assembly touches. A pathspec
         // matching nothing is not an error, so a series that only modifies
-        // tracked files costs one no-op call. A tracked file is never removed
+        // tracked files costs one no-op call, as does an overlay onto a source
+        // that ships no `debian/` of its own. A tracked file is never removed
         // whatever a pathspec says, so the modifications stay the checkout's to
-        // restore.
+        // restore — and an overlay's destination is removed outright in
+        // `copy_packaging`, which is what makes it replace rather than merge.
         let mut args: Vec<&std::ffi::OsStr> = vec![
             "clean".as_ref(),
             "--force".as_ref(),
@@ -489,7 +701,7 @@ impl SourceResolver {
         Err(Error::Source {
             component: component.name.clone(),
             reason: format!(
-                "clearing what a prior patch series left in {} failed: {}",
+                "clearing what a prior run's assembly left in {} failed: {}",
                 tree.display(),
                 String::from_utf8_lossy(&output.stderr).trim(),
             ),
@@ -861,22 +1073,27 @@ fn source_tree(checkout: &Path, subdir: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Where a checkout records the paths its last patch series named, relative to
-/// the checkout.
+/// The directory a packaging overlay supplies, and the one path an overlay
+/// writes into the source tree.
+const PACKAGING: &str = "debian";
+
+/// Where a checkout records the paths its last assembly wrote, relative to the
+/// checkout.
 ///
 /// Kept inside `.git`, so it belongs to the checkout rather than to the source
 /// tree: it is removed when the checkout is, it cannot collide with a file the
 /// component ships, and nothing that reads the tree — the LFS scan, the build —
 /// ever sees it.
-const PATCH_TARGETS: &str = ".git/src2deb-patch-targets";
+const ASSEMBLED_PATHS: &str = ".git/src2deb-assembled-paths";
 
-/// The paths a `PATCH_TARGETS` record holds, or none when there is no record.
+/// The paths an [`ASSEMBLED_PATHS`] record holds, or none when there is no
+/// record.
 ///
 /// NUL-separated, so a path holding a newline or invalid UTF-8 survives the
 /// round trip. A record that cannot be read is a failure rather than an empty
 /// answer: treating it as empty would silently give up the cleanup it exists to
 /// drive.
-fn read_patch_targets(record: &Path) -> Result<Vec<PathBuf>> {
+fn read_assembled_paths(record: &Path) -> Result<Vec<PathBuf>> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -892,9 +1109,9 @@ fn read_patch_targets(record: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-/// Records the paths this run's patch series named, replacing any earlier
-/// record, and removes the record entirely when the series names none.
-fn write_patch_targets(record: &Path, targets: &[PathBuf]) -> Result<()> {
+/// Records the paths this run's assembly writes, replacing any earlier record,
+/// and removes the record entirely when it writes none.
+fn write_assembled_paths(record: &Path, targets: &[PathBuf]) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
     if targets.is_empty() {
@@ -963,6 +1180,66 @@ fn refuse_without_control(component: &Component, tree: &Path) -> Result<()> {
     Err(Error::Source {
         component: component.name.clone(),
         reason: format!("{} has no debian/control", tree.display()),
+    })
+}
+
+/// Fails the component when a declared `subdir` names something the resolved
+/// tree does not hold.
+///
+/// `field` names the setting that declared it — `source` or `packaging` — so
+/// the error points at the line to fix. A source with no `subdir` resolves to
+/// the whole of itself, which the resolve has already established exists, so
+/// there is nothing to check.
+///
+/// Checked here rather than left to whatever runs first, which would report a
+/// directory it could not enter or a `debian/control` it could not find: both
+/// are true, and neither says that the subdirectory is the thing that is not
+/// there.
+fn refuse_missing_subdir(
+    component: &Component,
+    field: &str,
+    subdir: Option<&Path>,
+    tree: &Path,
+) -> Result<()> {
+    let Some(subdir) = subdir else {
+        return Ok(());
+    };
+    if tree.is_dir() {
+        return Ok(());
+    }
+    Err(Error::Source {
+        component: component.name.clone(),
+        reason: format!(
+            "{field}.subdir {} names {}, which the source does not hold",
+            subdir.display(),
+            tree.display(),
+        ),
+    })
+}
+
+/// Fails the component when its packaging source and its own source tree sit
+/// inside one another.
+///
+/// The overlay is copied from the first into the second, so a tree that is both
+/// is a tree copied onto itself — and since the destination is removed before
+/// the copy, it is one removed before being read. Neither can arise from an
+/// ordinary recipe, and both are cheap to rule out.
+///
+/// Compares canonical paths, so a symlinked route to the same directory is
+/// caught rather than passed over.
+fn refuse_packaging_overlap(component: &Component, overlay: &Path, tree: &Path) -> Result<()> {
+    if !overlay.starts_with(tree) && !tree.starts_with(overlay) {
+        return Ok(());
+    }
+    Err(Error::Source {
+        component: component.name.clone(),
+        reason: format!(
+            "the packaging source {} and the component's source tree {} sit \
+             inside one another, so the overlay would be copied onto itself; \
+             point packaging at a tree outside the work directory",
+            overlay.display(),
+            tree.display(),
+        ),
     })
 }
 
@@ -1224,6 +1501,7 @@ mod tests {
                 path: Some(path.to_path_buf()),
                 ..crate::recipe::Source::default()
             },
+            packaging: None,
             patches: Vec::new(),
             extra_build_deps: Vec::new(),
         }
@@ -1358,6 +1636,77 @@ mod tests {
         refuse_overlap(
             &component,
             Path::new("/work/sources/pkg-extra"),
+            Path::new("/work/sources/pkg"),
+        )
+        .expect("a sibling whose name extends this one is not inside it");
+    }
+
+    #[test]
+    fn a_subdir_the_source_does_not_hold_is_named_against_the_setting() {
+        // Left to whatever runs next, this reports a directory git could not
+        // enter or a `debian/control` that is not there: both true, and neither
+        // saying that the subdirectory is the thing that is missing.
+        let root = scratch("subdir");
+        let component = path_component(&root);
+
+        let err = refuse_missing_subdir(
+            &component,
+            "packaging",
+            Some(Path::new("nowhere")),
+            &root.join("nowhere"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("packaging.subdir"), "{err}");
+        assert!(err.contains("nowhere"), "{err}");
+
+        // A source that declares none resolves to the whole of itself, which
+        // the resolve has already established exists.
+        refuse_missing_subdir(&component, "source", None, &root.join("nowhere"))
+            .expect("an undeclared subdir has nothing to check");
+
+        std::fs::create_dir_all(root.join("members/pkg")).unwrap();
+        refuse_missing_subdir(
+            &component,
+            "source",
+            Some(Path::new("members/pkg")),
+            &root.join("members/pkg"),
+        )
+        .expect("a subdir the source holds is fine");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_packaging_source_and_the_tree_it_overlays_may_not_contain_one_another() {
+        // The destination is removed before the copy, so a packaging source
+        // that is the tree it overlays would be deleted and then read.
+        let component = path_component(Path::new("/home/someone/tree"));
+        for (overlay, tree) in [
+            // The same tree by both routes.
+            ("/work/sources/pkg", "/work/sources/pkg"),
+            // The overlay inside the tree it would be copied into...
+            ("/work/sources/pkg/packaging", "/work/sources/pkg"),
+            // ...and the tree inside the overlay.
+            ("/work/sources", "/work/sources/pkg"),
+        ] {
+            let err = refuse_packaging_overlap(&component, Path::new(overlay), Path::new(tree))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("sit inside one another"), "{overlay}: {err}");
+        }
+
+        // The ordinary arrangement — the two checkouts a resolve makes — passes.
+        refuse_packaging_overlap(
+            &component,
+            Path::new("/work/packaging/pkg"),
+            Path::new("/work/sources/pkg"),
+        )
+        .expect("the two work-directory checkouts never overlap");
+        // A shared prefix that is not a parent is not an overlap.
+        refuse_packaging_overlap(
+            &component,
+            Path::new("/work/sources/pkg-packaging"),
             Path::new("/work/sources/pkg"),
         )
         .expect("a sibling whose name extends this one is not inside it");

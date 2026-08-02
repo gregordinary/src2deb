@@ -178,6 +178,11 @@ Each `[[components]]` entry is one buildable component: a source tree with a
     inside the source: a `..` component or an absolute path is refused, since the
     tree it names is what the vendor pass binds into a cage that runs upstream's
     own `debian/rules clean`.
+- `packaging` — where the component's `debian/` directory comes from, for a
+  source that carries none of its own. Optional; see [Packaging
+  overlays](#packaging-overlays) below. It takes the same settings `source`
+  does — `packaging.git`, `packaging.git-ref`, `packaging.path`,
+  `packaging.subdir` — under the same rules.
 - `patches` — patch files applied over the resolved source tree, in the order
   given. Optional; see [Patches](#patches) below.
 - `extra-build-deps` — extra build-dependency package names beyond those
@@ -201,6 +206,83 @@ Each `[[components]]` entry is one buildable component: a source tree with a
 src2deb computes the build order from the components' declared dependencies, so
 they may be listed in any order.
 
+## Packaging overlays
+
+Not every upstream ships a `debian/` directory. For many that do not, someone
+else's packaging exists — a distribution's packaging repository, or one of your
+own. Point a component at it:
+
+```toml
+[[components]]
+name = "foo"
+source.git = "https://github.com/example/foo"
+
+packaging.git = "https://salsa.debian.org/debian/foo"
+packaging.git-ref = "debian/latest"
+```
+
+`packaging` takes the same settings `source` does, resolved the same way: a git
+repository is cloned and checked out, a path is a tree already on disk, a
+`git-ref` selects the revision, and a `subdir` names the directory within it
+that holds `debian/`.
+
+### What is taken, and what is not
+
+The overlay's `debian/` directory becomes the component's. Nothing else is
+taken.
+
+That boundary matters, because a distribution's packaging repository usually
+carries a copy of the upstream tree beside its packaging — and that copy is not
+the source you are building, it is whichever release was last packaged. Taking
+it would silently replace your source with an older one. Only `debian/` crosses
+over, so a repository of either shape works: one holding packaging alone, and
+one holding packaging beside a tree it happens not to be used for.
+
+In the other direction, the overlay **replaces** any `debian/` the source ships
+rather than merging with it. There is no per-file precedence to reason about:
+the packaging that reaches the build is the packaging you declared, with nothing
+of an abandoned one left beside it — no stale `install` file naming a path the
+new packaging never builds, no `patches/series` applied by a build that was
+never asked to. The source's own `debian/` is set aside for the build, not lost;
+drop the `packaging` setting and the next run has it back.
+
+### Both trees are recorded
+
+A component with an overlay has two inputs, and both count:
+
+- The version carries both, source first:
+  `1.0.0-1+deb13.20260731.abc1234.def5678`.
+- The manifest records two `[[component.source]]` entries, each naming the part
+  it played — `role = "source"` and `role = "packaging"`. See [The provenance
+  manifest](provenance.md).
+- `--skip-published` rebuilds the component when *either* moves. New packaging
+  against an unchanged source produces a new package, which is what you want the
+  moment you fix a `debian/rules`.
+
+`SOURCE_GIT_HASH`, which packaging reads to stamp a revision into what it
+builds, is the *source's* commit and never the packaging repository's.
+
+### A worked example
+
+Packaging kept in the same repository as the recipe, under a directory of its
+own:
+
+```toml
+[[components]]
+name = "foo"
+source.git = "https://github.com/example/foo"
+packaging.path = "packaging/foo"
+```
+
+`packaging.path` is relative to the recipe's own directory, as `source.path` and
+`patches` are, so `recipes/mine/packaging/foo/debian/` is what gets overlaid. A
+path is not a pinned input, so a component overlaid from one is recorded as
+unreproducible and is never skipped by `--skip-published` — the same rule
+`source.path` follows, for the same reason.
+
+Nothing is ever written to a packaging source, so a path one is read where it
+lies rather than copied into the work directory.
+
 ## Patches
 
 A component may carry local fixes upstream has not taken. Declare them per
@@ -221,9 +303,10 @@ recipe carries its patches alongside it. Keeping them under a directory named
 for the component is a convention, not a requirement.
 
 The series is applied to the tree src2deb resolved — a git checkout, or its copy
-of a `source.path` tree — and never to anything of yours. It is applied before
-anything reads the tree, so a patch may change `debian/control` and the build
-order follows the patched file.
+of a `source.path` tree — and never to anything of yours. It is applied last, so
+a patch may change a file a [packaging overlay](#packaging-overlays) supplied,
+and before anything reads the tree, so a patch may change `debian/control` and
+the build order follows the patched file.
 
 ### What a patch may be
 
@@ -232,8 +315,9 @@ a patch that adds or deletes files, one that changes a file's mode. Paths are
 read at `-p1` — the `a/` and `b/` prefixes git writes — and must stay inside the
 tree.
 
-Patches apply to either kind of source, and to a `subdir` component they apply
-relative to the subdirectory that holds `debian/`.
+Patches apply to either kind of source, over a packaging overlay if there is
+one, and to a `subdir` component they apply relative to the subdirectory that
+holds `debian/`.
 
 ### A patch either applies or the component fails
 

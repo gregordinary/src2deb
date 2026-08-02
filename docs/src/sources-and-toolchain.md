@@ -16,7 +16,8 @@ than by layering a preferences engine on top.
 ## Component sources
 
 Each component names one source: a git repository to clone, or a tree already on
-disk.
+disk. What gets built is assembled from that source, then any packaging overlay,
+then any patch series — in that order, before anything reads the tree.
 
 A **git source** is cloned into the work directory on first use and fetched on
 later use, then checked out detached at the requested ref. A branch or an unset
@@ -63,12 +64,32 @@ component fails rather than building a package around the stubs, and the error
 names the tree to run `git lfs pull` in. src2deb does not fetch on your behalf
 here: the tree is yours.
 
-### Patches over either source
+### Packaging from somewhere else
+
+A component's tree has to hold a `debian/` directory, and not every upstream
+ships one. A component may therefore name a second tree — resolved by the same
+two origins, under the same rules — whose `debian/` becomes the component's.
+
+The rule is a narrow one in both directions, and both halves are deliberate.
+Only `debian/` is taken, because a distribution's packaging repository usually
+carries a copy of the upstream tree beside its packaging, and that copy is
+whichever release was last packaged rather than the source you are building.
+And what is taken *replaces* the source's own `debian/` rather than merging with
+it, so there is no per-file precedence to reason about and nothing of an
+abandoned packaging tree left beside the declared one.
+
+An overlay is a build input like any other: both revisions reach the version
+stamp and the manifest, and `--skip-published` rebuilds when either moves. See
+[Packaging overlays](recipes.md#packaging-overlays).
+
+### Patches over the assembled tree
 
 Either kind of source may carry a patch series — local fixes upstream has not
 taken — applied to the tree src2deb resolved rather than to anything of yours.
-The series is applied before any `debian/control` is read, so a patch may change
-what a component build-depends on and the build order follows.
+The series is applied last, after any packaging overlay, so a patch is the way
+to fix packaging you do not control; and it is applied before any
+`debian/control` is read, so a patch may change what a component build-depends
+on and the build order follows.
 
 A series is a pinned input in its own right, identified by a digest over its
 members' contents in order. It is stamped into the package version alongside the

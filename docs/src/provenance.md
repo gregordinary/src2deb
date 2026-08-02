@@ -50,6 +50,7 @@ status = "built"
   sha256 = "4c1a0f..."
 
   [[component.source]]
+  role = "source"
   kind = "git"
   value = "1f3a9c2e5b7d..."
   pinned = true
@@ -68,6 +69,7 @@ status = "failed"
 error = "building cosmic-osd: dpkg-buildpackage exited with status 2"
 
   [[component.source]]
+  role = "source"
   kind = "git"
   value = "9b2e4d6a8c1f..."
   pinned = true
@@ -76,10 +78,13 @@ error = "building cosmic-osd: dpkg-buildpackage exited with status 2"
 ## The source record
 
 Each `[[component.source]]` entry is one input the component was built from. It
-names three things:
+names four things:
 
+- `role` — what part the input played in assembling the tree. The component's own
+  source is `source`; a [packaging overlay](recipes.md#packaging-overlays) is
+  `packaging`; a [patch series](recipes.md#patches) is `patches`.
 - `kind` — what sort of input it is. A git checkout is `git`; a tree on disk is
-  `path`; a component's patch series is `patches`.
+  `path`; a patch series is `patches`.
 - `value` — what identifies it. For `git`, the exact `HEAD` the tree was checked
   out at, so a branch or default-branch ref is recorded as the concrete revision
   it resolved to, not the moving ref that named it. For `path`, the canonical
@@ -94,6 +99,7 @@ A build from a tree on disk therefore records:
 
 ```toml
   [[component.source]]
+  role = "source"
   kind = "path"
   value = "/home/someone/checkouts/cosmic-comp"
   pinned = false
@@ -104,36 +110,58 @@ what it records. Where the tree was is worth keeping — it is the only trace of
 what was built — but it is not a revision, and the record does not let it pass
 for one.
 
-A component carrying [patches](recipes.md#patches) records two inputs, the
-upstream revision and the series applied over it:
+A component's tree may be assembled from more than one input, and its record
+then carries one entry per input, in the order they were applied: the source,
+then any [packaging overlay](recipes.md#packaging-overlays), then any
+[patch series](recipes.md#patches). A component whose packaging comes from a
+second repository and which carries a local fix records all three:
 
 ```toml
   [[component.source]]
+  role = "source"
   kind = "git"
   value = "1f3a9c2e5b7d..."
   pinned = true
 
   [[component.source]]
+  role = "packaging"
+  kind = "git"
+  value = "8d4b0e1c7a92..."
+  pinned = true
+
+  [[component.source]]
+  role = "patches"
   kind = "patches"
   value = "5f2e1a9c3b8d..."
   pinned = true
 ```
 
-The digest covers the series' members in the order they were applied, so it
-changes when a patch is edited, added, removed, or reordered — and not when one
-is merely renamed. The recipe remains the authority for *which* patches were
-applied; this records *what* they were.
+The role is what tells the two `git` entries apart. Nothing else does: a
+packaging repository and a source repository are the same sort of thing, and only
+the part each played says which was which. `SOURCE_GIT_HASH` carries the one
+whose role is `source`, so packaging that stamps a revision into what it builds
+reports the source's rather than its own.
+
+Role and kind answer different questions, and neither implies the other: an
+overlay may come from a repository or from a tree on disk, and so may a source.
+The one pairing that always holds is a patch series, whose kind and role are both
+`patches` — it is identified by a digest over the patches, and applying patches is
+the only thing it does.
+
+A patch series' digest covers the series' members in the order they were
+applied, so it changes when a patch is edited, added, removed, or reordered —
+and not when one is merely renamed. The recipe remains the authority for *which*
+patches were applied; this records *what* they were.
 
 `pinned` follows from the kind, and is written out so that a reproducible build
 can be told from one that only looks like one without knowing which kinds are
 which. It is what `--skip-published` rests on: see [Resume
 state](#resume-state).
 
-A component can have more than one input, and its record then carries one entry
-per input. A component that failed before it resolved anything — its source
-would not clone, or its `debian/control` would not read — carries no entry at
-all, which is the manifest saying it never got that far rather than naming an
-input it never reached.
+A component that failed before it resolved anything — its source would not
+clone, or its `debian/control` would not read — carries no entry at all, which is
+the manifest saying it never got that far rather than naming an input it never
+reached.
 
 The recorded versions are the stamped ones the packages actually carry, so the
 suite, the build date, and the abbreviated source are legible from the manifest

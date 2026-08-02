@@ -20,7 +20,8 @@ lists the components to build, each with a source — a git repository, or a tre
 already on disk. src2deb:
 
 1. resolves each component's source into an unpacked tree with a `debian/`
-   directory,
+   directory — taking that `debian/` from a second source, and applying a patch
+   series over the result, where the recipe says so,
 2. reads every `debian/control` to learn what each component build-depends on
    and what binary packages it produces, and orders the components so each one
    builds after the components that produce its build-dependencies,

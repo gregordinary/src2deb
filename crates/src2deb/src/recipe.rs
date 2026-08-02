@@ -178,6 +178,21 @@ pub struct Component {
     /// instead of by the parser with the name of a table.
     #[serde(default)]
     pub source: Source,
+    /// Where the component's `debian/` directory comes from, for a source that
+    /// carries none of its own.
+    ///
+    /// Resolved exactly as [`source`](Self::source) is — a git repository to
+    /// clone, or a tree already on disk — and its `debian/` directory becomes
+    /// the component's, replacing whatever the source ships. Nothing outside
+    /// `debian/` is taken from it, so a packaging repository that also carries
+    /// a copy of the upstream tree contributes only its packaging.
+    ///
+    /// The overlay is a second input to the component's fingerprint: the
+    /// manifest names both revisions, the version stamp carries both, and
+    /// moving either triggers a rebuild under `--skip-published`. See
+    /// [`crate::fingerprint`].
+    #[serde(default)]
+    pub packaging: Option<Source>,
     /// Patch files applied over the resolved source tree, in the order given.
     ///
     /// Each is relative to the recipe's own directory ([`Recipe::dir`]), as
@@ -198,12 +213,14 @@ pub struct Component {
     pub extra_build_deps: Vec<String>,
 }
 
-/// Where a component's source comes from.
+/// Where a tree a component is built from comes from.
 ///
-/// A component names exactly one origin — [`git`](Self::git) or
-/// [`path`](Self::path) — which [`Recipe::load`] enforces, so
-/// [`origin`](Self::origin) answers for a validated recipe. The remaining
-/// fields qualify whichever was named.
+/// Serves both of a component's inputs: its own [`source`](Component::source),
+/// and the [`packaging`](Component::packaging) overlay that supplies a
+/// `debian/` directory when the source carries none. Each names exactly one
+/// origin — [`git`](Self::git) or [`path`](Self::path) — which
+/// [`Recipe::load`] enforces, so [`origin`](Self::origin) answers for a
+/// validated recipe. The remaining fields qualify whichever was named.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Source {
@@ -230,12 +247,16 @@ pub struct Source {
     /// A subdirectory within the source that holds the `debian/` tree, for a
     /// component that lives inside a larger superproject or monorepo. The whole
     /// source is the tree when unset.
+    ///
+    /// On a [`packaging`](Component::packaging) overlay it names the directory
+    /// holding the `debian/` tree to overlay, which is the same thing said of
+    /// the other input.
     #[serde(default)]
     pub subdir: Option<PathBuf>,
 }
 
-/// Where a component's source comes from, as a single choice rather than a set
-/// of fields that could contradict each other.
+/// Where a tree comes from, as a single choice rather than a set of fields
+/// that could contradict each other.
 ///
 /// Produced by [`Source::origin`] once a recipe has been validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,13 +274,14 @@ pub enum Origin<'a> {
 }
 
 impl Source {
-    /// Where this source comes from, or `None` when it names neither a git
+    /// Where this tree comes from, or `None` when it names neither a git
     /// repository nor a path.
     ///
     /// Never `None` for a validated recipe: [`Recipe::load`] refuses a
-    /// component that names no origin, and refuses one that names both, so
-    /// exactly one arm applies. A caller that builds a [`Source`] itself is
-    /// outside that guarantee, which is why this reports rather than asserts.
+    /// component whose source or packaging overlay names no origin, and refuses
+    /// one that names both, so exactly one arm applies. A caller that builds a
+    /// [`Source`] itself is outside that guarantee, which is why this reports
+    /// rather than asserts.
     pub fn origin(&self) -> Option<Origin<'_>> {
         match (&self.git, &self.path) {
             (Some(url), None) => Some(Origin::Git {
@@ -338,9 +360,8 @@ impl Recipe {
 
     /// Rejects a structurally invalid recipe: no components; an unsafe recipe
     /// name, suite, architecture, or component name; a duplicate component or
-    /// repository name; a component naming no source or two, whose git URL or
-    /// ref would be read as an option, whose `git-ref` qualifies a source that
-    /// is not a repository, or whose `subdir` leaves the source; a rustup
+    /// repository name; a component naming no source or two, or whose source or
+    /// packaging overlay is otherwise unusable (see [`source_error`]); a rustup
     /// toolchain missing its version; or a signed repository missing its
     /// keyring.
     ///
@@ -440,69 +461,46 @@ impl Recipe {
                 }
                 _ => {}
             }
-            // The git URL and ref are passed to git as positional arguments, so
-            // an option-like value would be read as a flag rather than as what
-            // it names.
-            if let Some(git) = &component.source.git
-                && let Some(reason) = argument_error(git)
-            {
-                return Err(bad(format!(
-                    "component {:?} source.git {:?} {reason}",
-                    component.name, git
-                )));
+            if let Some(reason) = source_error("source", &component.source) {
+                return Err(bad(format!("component {:?} {reason}", component.name)));
             }
-            if let Some(git_ref) = &component.source.git_ref {
-                if let Some(reason) = argument_error(git_ref) {
-                    return Err(bad(format!(
-                        "component {:?} source.git-ref {:?} {reason}",
-                        component.name, git_ref
-                    )));
+
+            // A packaging overlay is resolved the same way the source is, so it
+            // is held to the same rules. Its cardinality is stated separately
+            // because the remedy is: an overlay is optional, and a table that
+            // exists without naming an origin is a half-written one.
+            if let Some(packaging) = &component.packaging {
+                match (&packaging.git, &packaging.path) {
+                    (Some(_), Some(_)) => {
+                        return Err(bad(format!(
+                            "component {:?} declares both packaging.git and \
+                             packaging.path; a packaging overlay comes from one \
+                             source",
+                            component.name
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(bad(format!(
+                            "component {:?} declares a packaging overlay with no \
+                             source; set packaging.git to clone a repository, or \
+                             packaging.path to overlay a tree on disk",
+                            component.name
+                        )));
+                    }
+                    _ => {}
                 }
-                // A ref selects a revision of a repository, so it says nothing
-                // about a tree on disk. Refused rather than ignored: a recipe
-                // switched from git to a path keeps its ref, and silently
-                // dropping it would build something other than what it reads as
-                // building.
-                if component.source.git.is_none() {
-                    return Err(bad(format!(
-                        "component {:?} sets source.git-ref, which applies only to \
-                         source.git",
-                        component.name
-                    )));
+                if let Some(reason) = source_error("packaging", packaging) {
+                    return Err(bad(format!("component {:?} {reason}", component.name)));
                 }
             }
-            // The path is joined onto the recipe's directory and then copied
-            // into the work directory, so an empty one would name the recipe
-            // directory itself rather than a source tree.
-            if let Some(path) = &component.source.path
-                && path.as_os_str().is_empty()
-            {
-                return Err(bad(format!(
-                    "component {:?} source.path is empty",
-                    component.name
-                )));
-            }
-            // A patch path is joined onto the recipe's directory the same way,
-            // where an empty one would name that directory rather than a file.
+
+            // A patch path is joined onto the recipe's directory as a source
+            // path is, where an empty one would name that directory rather than
+            // a file.
             if component.patches.iter().any(|p| p.as_os_str().is_empty()) {
                 return Err(bad(format!(
                     "component {:?} lists an empty patch path",
                     component.name
-                )));
-            }
-            // The subdir is joined onto the resolved source to give the tree the
-            // vendor pass binds read-write into a cage that runs the component's
-            // own `debian/rules clean` with the host network. An absolute subdir
-            // would not extend that path but replace it, and a `..` would climb
-            // out of it, so either would hand that pass a tree outside the work
-            // directory.
-            if let Some(subdir) = &component.source.subdir
-                && let Some(reason) = subdir_error(subdir)
-            {
-                return Err(bad(format!(
-                    "component {:?} source.subdir {:?} {reason}",
-                    component.name,
-                    subdir.display()
                 )));
             }
         }
@@ -612,6 +610,56 @@ fn name_error(name: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Reports why one of a component's declared trees is unusable, or `None` when
+/// it is usable.
+///
+/// `field` names the table the settings came from — `source` or `packaging` —
+/// so one set of rules serves both inputs while each message names the setting
+/// the recipe actually wrote. Cardinality is not checked here: naming no origin
+/// is a different mistake for a required source than for an optional overlay,
+/// and each caller says so in its own words.
+fn source_error(field: &str, source: &Source) -> Option<String> {
+    // The git URL and ref are passed to git as positional arguments, so an
+    // option-like value would be read as a flag rather than as what it names.
+    if let Some(git) = &source.git
+        && let Some(reason) = argument_error(git)
+    {
+        return Some(format!("{field}.git {git:?} {reason}"));
+    }
+    if let Some(git_ref) = &source.git_ref {
+        if let Some(reason) = argument_error(git_ref) {
+            return Some(format!("{field}.git-ref {git_ref:?} {reason}"));
+        }
+        // A ref selects a revision of a repository, so it says nothing about a
+        // tree on disk. Refused rather than ignored: a recipe switched from git
+        // to a path keeps its ref, and silently dropping it would build
+        // something other than what it reads as building.
+        if source.git.is_none() {
+            return Some(format!(
+                "sets {field}.git-ref, which applies only to {field}.git"
+            ));
+        }
+    }
+    // The path is joined onto the recipe's directory, so an empty one would
+    // name the recipe directory itself rather than a tree.
+    if let Some(path) = &source.path
+        && path.as_os_str().is_empty()
+    {
+        return Some(format!("{field}.path is empty"));
+    }
+    // The subdir is joined onto the resolved tree. For a source that gives the
+    // tree the vendor pass binds read-write into a cage running the component's
+    // own `debian/rules clean` with the host network; an absolute subdir would
+    // not extend that path but replace it, and a `..` would climb out of it, so
+    // either would hand that pass a tree outside the work directory.
+    if let Some(subdir) = &source.subdir
+        && let Some(reason) = subdir_error(subdir)
+    {
+        return Some(format!("{field}.subdir {:?} {reason}", subdir.display()));
+    }
+    None
 }
 
 /// Reports why a value is unsafe to pass to a subprocess as a positional
@@ -1112,6 +1160,113 @@ mod tests {
         ))
         .unwrap();
         assert!(recipe.components[0].patches.is_empty());
+    }
+
+    #[test]
+    fn a_packaging_overlay_names_its_own_origin_and_qualifiers() {
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             packaging.git = \"https://salsa.example/debian/c\"\n\
+             packaging.git-ref = \"debian/latest\"\n\
+             packaging.subdir = \"packaging\"\n",
+        )
+        .expect("a packaging overlay beside a source is valid");
+        let packaging = recipe.components[0]
+            .packaging
+            .as_ref()
+            .expect("the overlay parsed");
+        assert_eq!(
+            packaging.origin(),
+            Some(Origin::Git {
+                url: "https://salsa.example/debian/c",
+                git_ref: Some("debian/latest"),
+            }),
+        );
+        assert_eq!(packaging.subdir.as_deref(), Some(Path::new("packaging")));
+
+        // A tree on disk serves as well, and a component that declares no
+        // overlay carries none — which is what keeps the whole step a no-op for
+        // a source that ships its own packaging.
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             packaging.path = \"packaging/c\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.components[0].packaging.as_ref().unwrap().origin(),
+            Some(Origin::Path(Path::new("packaging/c"))),
+        );
+        let recipe = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap();
+        assert!(recipe.components[0].packaging.is_none());
+    }
+
+    #[test]
+    fn a_packaging_overlay_naming_no_source_or_two_is_rejected() {
+        // An overlay is optional, so a table that exists without naming an
+        // origin is a half-written one rather than a missing setting.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             packaging.subdir = \"packaging\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("declares a packaging overlay with no source"),
+            "{err}"
+        );
+
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             packaging.git = \"https://salsa.example/debian/c\"\n\
+             packaging.path = \"packaging/c\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("declares both packaging.git and packaging.path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_packaging_overlay_is_held_to_the_rules_its_source_is() {
+        // One set of checks serves both trees, and each message names the
+        // setting the recipe actually wrote rather than the one it resembles.
+        for (setting, needle) in [
+            (
+                "packaging.git = \"--upload-pack=touch /tmp/x\"",
+                "packaging.git",
+            ),
+            (
+                "packaging.git = \"https://e/c\"\npackaging.git-ref = \"--output=/tmp/x\"",
+                "packaging.git-ref",
+            ),
+            (
+                "packaging.path = \"p\"\npackaging.git-ref = \"debian/latest\"",
+                "applies only to packaging.git",
+            ),
+            ("packaging.path = \"\"", "packaging.path is empty"),
+            (
+                "packaging.path = \"p\"\npackaging.subdir = \"../elsewhere\"",
+                "packaging.subdir",
+            ),
+        ] {
+            let err = load(&format!(
+                "name = \"r\"\nsuite = \"trixie\"\n\
+                 [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n{setting}\n"
+            ))
+            .expect_err(&format!("{setting} should be rejected"));
+            let message = format!("{err}");
+            assert!(
+                message.contains("component \"c\"") && message.contains(needle),
+                "{setting} gave: {message}"
+            );
+        }
     }
 
     #[test]

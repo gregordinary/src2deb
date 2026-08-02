@@ -44,9 +44,9 @@ pair orders the way you expect.
 
 ### More than one input
 
-A component built from more than one input carries an abbreviation of each. A
-component with [patches](recipes.md#patches) is the ordinary case: the upstream
-revision, then the series applied over it.
+A component built from more than one input carries an abbreviation of each, in
+the order they were applied. A component with [patches](recipes.md#patches) is
+the ordinary case: the upstream revision, then the series applied over it.
 
 ```text
 1.0.0~alpha.7-1+deb13.20260731.abc1234.5f2e1a9
@@ -57,6 +57,19 @@ revision, then the series applied over it.
 A patched package and an unpatched one built from the same revision on the same
 day are therefore distinct versions, and ordered — so a fix reaches a machine
 that already installed the build without it.
+
+A [packaging overlay](recipes.md#packaging-overlays) sits between the two, so a
+component taking its `debian/` from a second repository and carrying a local fix
+besides reads:
+
+```text
+1.0.0~alpha.7-1+deb13.20260731.abc1234.def5678.5f2e1a9
+                                └──┬──┘ └──┬──┘ └──┬──┘
+                              revision  packaging patches
+```
+
+The source's revision is always first, which is what makes the leading
+abbreviation mean the same thing on every package src2deb builds.
 
 ### A local build says so
 
@@ -221,10 +234,23 @@ source revision in its text:
 ```text
 cosmic-comp (1.0.0~alpha.7-1+deb13.20260731.abc1234) trixie; urgency=medium
 
-  * Automated build from source: abc1234def5678.
+  * Automated build from source abc1234def5678.
 
  -- Pop Packaging <pop@example.invalid>  Fri, 31 Jul 2026 00:00:00 +0000
 ```
+
+Each input names the part it played, so a component assembled from more than one
+reads without any of them having to be guessed at:
+
+```text
+  * Automated build from source abc1234def5678, packaging def5678abc1234,
+    patches 5f2e1a9c3b8d.
+```
+
+A tree on disk appears as `local` rather than as the path it was read from: this
+text ships inside the `.deb`, and a build host's directory layout is not
+something a package should carry. The manifest, which stays in the work
+directory, records the path.
 
 The entry lands on the build's own copy of the source tree, inside the cage —
 not on the resolved checkout in the work directory. The checkout keeps

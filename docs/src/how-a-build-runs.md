@@ -4,12 +4,13 @@ A build is driven by the engine over a recipe. For each recipe, in order:
 
 ## 1. Resolve
 
-Every component's source is put under the work directory. A git source is cloned
-or updated, its ref checked out, and its submodules initialized — so a submodule
+Every component's tree is assembled under the work directory, from its source,
+then any packaging overlay, then any patch series. A git source is cloned or
+updated, its ref checked out, and its submodules initialized — so a submodule
 superproject such as cosmic-epoch resolves its members. A `source.path` tree is
 copied under the work directory as it stands, afresh each run, so nothing writes
-into the tree the recipe named. Either way the result is the source tree that
-holds the component's `debian/` directory, and it is one src2deb owns.
+into the tree the recipe named. Either way the result is a source tree that holds
+the component's `debian/` directory, and it is one src2deb owns.
 
 Every component is resolved, whatever the run was asked to build, because the
 build order derives from all of them: which component produces a package is read
@@ -45,13 +46,21 @@ pointer there fails the component with the command that fixes it, and src2deb
 leaves the tree alone. A path that is not part of a git working tree carries no
 pointers, and is passed over.
 
-Last, a component's declared patch series is applied over the resolved tree, in
-the order the recipe lists it. This happens inside resolve, before any
-`debian/control` is read, so a patch may change what a component build-depends
-on or what it produces and the build order follows the patched file. A patch
-that does not apply fails the component; the series is a pinned input of the
-component's fingerprint, so changing it rebuilds. See
-[Patches](recipes.md#patches).
+A component that declares a [packaging overlay](recipes.md#packaging-overlays)
+then has one applied. Its source is resolved by the same two origins the
+component's own source is, and its `debian/` directory replaces whatever the
+source tree held. Only `debian/` is taken, so a packaging repository that also
+carries a copy of the upstream tree contributes its packaging and not its idea
+of the source.
+
+Last, a component's declared patch series is applied over the tree, in the order
+the recipe lists it — after any overlay, so a patch may fix packaging the recipe
+did not write. All of this happens inside resolve, before any `debian/control` is
+read, so an overlay may supply what a component build-depends on and a patch may
+change it, and the build order follows the assembled file. A patch that does not
+apply fails the component; both an overlay and a series are inputs of the
+component's fingerprint, so changing either rebuilds. See [Packaging
+overlays](recipes.md#packaging-overlays) and [Patches](recipes.md#patches).
 
 ## 2. Plan
 

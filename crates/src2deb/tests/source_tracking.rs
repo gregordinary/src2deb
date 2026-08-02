@@ -3,7 +3,10 @@
 //! For a git source: a branch or default ref must advance to the fetched
 //! upstream tip on a re-run, while a pinned commit must stay put. For a path
 //! source: the tree on disk must be copied rather than built in place, and the
-//! record it leaves must not read as a reproducible build.
+//! record it leaves must not read as a reproducible build. For a packaging
+//! overlay: it must replace the packaging a source ships rather than merge with
+//! it, contribute nothing outside `debian/`, and leave nothing behind once a
+//! recipe stops declaring it.
 //!
 //! These drive real `git` against local repositories, so the ones that need it
 //! are skipped when `git` is unavailable.
@@ -14,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use src2deb::recipe::Component;
 use src2deb::source::SourceResolver;
-use src2deb::{Fingerprint, Source, SourceInput};
+use src2deb::{Fingerprint, Source, SourceInput, SourceRole};
 
 /// Whether `git` can be launched at all; the tests no-op when it cannot.
 fn git_available() -> bool {
@@ -54,11 +57,15 @@ fn init_repo(dir: &Path) {
 fn commit_marker(upstream: &Path, marker: &str) {
     std::fs::write(upstream.join("marker"), marker).unwrap();
     std::fs::create_dir_all(upstream.join("debian")).unwrap();
-    std::fs::write(
-        upstream.join("debian/control"),
-        "Source: pkg\n\nPackage: pkg\nArchitecture: any\n",
-    )
-    .unwrap();
+    std::fs::write(upstream.join("debian/control"), CONTROL).unwrap();
+    git(upstream, &["add", "-A"]);
+    git(upstream, &["commit", "-q", "-m", marker]);
+}
+
+/// Writes a marker file and commits, leaving the tree without a `debian/` of
+/// its own — the upstream a packaging overlay exists for.
+fn commit_bare_marker(upstream: &Path, marker: &str) {
+    std::fs::write(upstream.join("marker"), marker).unwrap();
     git(upstream, &["add", "-A"]);
     git(upstream, &["commit", "-q", "-m", marker]);
 }
@@ -93,6 +100,7 @@ fn component(name: &str, git: &Path, git_ref: Option<&str>) -> Component {
             git_ref: git_ref.map(str::to_string),
             ..Source::default()
         },
+        packaging: None,
         patches: Vec::new(),
         extra_build_deps: Vec::new(),
     }
@@ -106,6 +114,7 @@ fn path_component(name: &str, path: &Path) -> Component {
             path: Some(path.to_path_buf()),
             ..Source::default()
         },
+        packaging: None,
         patches: Vec::new(),
         extra_build_deps: Vec::new(),
     }
@@ -113,7 +122,7 @@ fn path_component(name: &str, path: &Path) -> Component {
 
 /// A resolver whose relative paths are taken from `recipe_dir`.
 fn resolver_in(root: &Path, recipe_dir: &Path) -> SourceResolver {
-    SourceResolver::new(root.join("sources"), recipe_dir)
+    SourceResolver::new(root, recipe_dir)
 }
 
 /// `component` with a patch series applied over it.
@@ -154,17 +163,77 @@ fn patched_content(tree: &Path) -> String {
 /// A minimal source tree on disk: a `debian/control` and a marker file.
 fn write_tree(dir: &Path, marker: &str) {
     std::fs::create_dir_all(dir.join("debian")).unwrap();
-    std::fs::write(
-        dir.join("debian/control"),
-        "Source: pkg\n\nPackage: pkg\nArchitecture: any\n",
-    )
-    .unwrap();
+    std::fs::write(dir.join("debian/control"), CONTROL).unwrap();
+    std::fs::write(dir.join("marker"), marker).unwrap();
+}
+
+/// A source tree carrying no `debian/` of its own, which is the case a
+/// packaging overlay exists for.
+fn write_bare_tree(dir: &Path, marker: &str) {
+    std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("marker"), marker).unwrap();
 }
 
 /// The marker content in a resolved tree.
 fn resolved_marker(tree: &Path) -> String {
     std::fs::read_to_string(tree.join("marker")).unwrap()
+}
+
+/// The `debian/control` every tree in these tests carries, wherever it came
+/// from.
+const CONTROL: &str = "Source: pkg\n\nPackage: pkg\nArchitecture: any\n";
+
+/// A packaging tree: a `debian/` holding a control file and a marker the tests
+/// read back, and — outside `debian/` — a file of the same name the component's
+/// own source uses, which an overlay must not carry across.
+fn write_packaging(dir: &Path, marker: &str) {
+    std::fs::create_dir_all(dir.join("debian")).unwrap();
+    std::fs::write(dir.join("debian/control"), CONTROL).unwrap();
+    std::fs::write(dir.join("debian/marker"), format!("{marker}\n")).unwrap();
+    std::fs::write(dir.join("marker"), "the packaging repository's own tree").unwrap();
+}
+
+/// Writes packaging into a repository and commits it.
+fn commit_packaging(dir: &Path, marker: &str) {
+    write_packaging(dir, marker);
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", marker]);
+}
+
+/// The marker a packaging overlay left in a resolved tree.
+fn packaging_marker(tree: &Path) -> String {
+    std::fs::read_to_string(tree.join("debian/marker"))
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+/// `component` with its packaging overlaid from a git repository.
+fn overlaid_from_git(mut component: Component, repository: &Path) -> Component {
+    component.packaging = Some(Source {
+        git: Some(repository.to_string_lossy().into_owned()),
+        ..Source::default()
+    });
+    component
+}
+
+/// `component` with its packaging overlaid from a tree on disk.
+fn overlaid_from_path(mut component: Component, path: &Path) -> Component {
+    component.packaging = Some(Source {
+        path: Some(path.to_path_buf()),
+        ..Source::default()
+    });
+    component
+}
+
+/// `component`'s packaging overlay, taken from `subdir` within its source.
+fn overlay_subdir(mut component: Component, subdir: &str) -> Component {
+    component
+        .packaging
+        .as_mut()
+        .expect("the component declares a packaging overlay")
+        .subdir = Some(PathBuf::from(subdir));
+    component
 }
 
 #[test]
@@ -273,7 +342,10 @@ fn resolve_reports_the_checked_out_commit_for_provenance() {
     // the tree was checked out at, which the provenance manifest records and
     // the version stamp abbreviates.
     let resolved = resolver.resolve(&comp).expect("resolve");
-    assert_eq!(resolved.source, Fingerprint::of(SourceInput::git(&pinned)));
+    assert_eq!(
+        resolved.source,
+        Fingerprint::of(SourceInput::git(SourceRole::Source, &pinned)),
+    );
     assert!(resolved.source.is_pinned());
     assert_eq!(resolved.source.git_commit(), Some(pinned.as_str()));
     assert_eq!(resolved.source.short(), &pinned[..7]);
@@ -427,6 +499,7 @@ fn a_path_source_is_recorded_as_an_unpinned_input() {
     assert_eq!(
         resolved.source,
         Fingerprint::of(SourceInput::path(
+            SourceRole::Source,
             upstream.canonicalize().unwrap().to_string_lossy()
         )),
     );
@@ -873,6 +946,424 @@ fn dropping_a_patch_drops_what_it_added() {
         .resolve(&patched(comp, &["adds.patch"]))
         .expect("resolve with the patch restored");
     assert!(again.tree.join("added.txt").is_file());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_packaging_overlay_supplies_the_debian_tree_a_source_has_none_of() {
+    if !git_available() {
+        return;
+    }
+    // The case the feature exists for: upstream ships no packaging, and
+    // someone else's repository does.
+    let root = scratch("overlay-supplies");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_bare_marker(&upstream, "v1");
+    let packaging = root.join("packaging-repo");
+    init_repo(&packaging);
+    commit_packaging(&packaging, "from packaging");
+
+    let resolver = resolver_in(&root, &root);
+    let comp = overlaid_from_git(component("pkg", &upstream, None), &packaging);
+    let resolved = resolver.resolve(&comp).expect("resolve");
+
+    // The tree is the component's own source, with the overlay's packaging in
+    // it. The overlay's source is kept apart, since both are named for the
+    // component and only one of them is what gets built.
+    assert_eq!(resolved.tree, root.join("sources/pkg"));
+    assert_eq!(resolved_marker(&resolved.tree), "v1");
+    assert!(resolved.tree.join("debian/control").is_file());
+    assert_eq!(packaging_marker(&resolved.tree), "from packaging");
+    assert!(root.join("packaging/pkg/debian").is_dir());
+
+    // Both revisions are recorded, and each says which part it played — the
+    // only thing that tells two git inputs apart. `git_commit` reads the
+    // component's own source, which is what packaging asking for the revision
+    // it was built from means.
+    assert_eq!(resolved.source.len(), 2);
+    assert!(resolved.source.is_pinned());
+    assert_eq!(resolved.source.git_commit(), Some(head(&upstream).as_str()));
+    assert_eq!(resolved.source.inputs()[0].role(), SourceRole::Source);
+    assert_eq!(resolved.source.inputs()[1].role(), SourceRole::Packaging);
+    assert_eq!(resolved.source.inputs()[1].value(), head(&packaging));
+    // The version carries both, so a package is legible back to the packaging
+    // it was built with as well as the source.
+    assert_eq!(
+        resolved.source.short(),
+        format!("{}.{}", &head(&upstream)[..7], &head(&packaging)[..7]),
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_packaging_overlay_contributes_nothing_outside_debian() {
+    if !git_available() {
+        return;
+    }
+    // A distribution's packaging repository ordinarily carries a copy of the
+    // upstream tree beside its `debian/`, and that copy is not the source this
+    // component is being built from — it is usually an older release of it.
+    // Taking it would replace the component's source with upstream's last
+    // packaged version, silently.
+    let root = scratch("overlay-bounded");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_bare_marker(&upstream, "the source being built");
+    let packaging = root.join("packaging-repo");
+    init_repo(&packaging);
+    commit_packaging(&packaging, "from packaging");
+
+    let resolver = resolver_in(&root, &root);
+    let resolved = resolver
+        .resolve(&overlaid_from_git(
+            component("pkg", &upstream, None),
+            &packaging,
+        ))
+        .expect("resolve");
+
+    assert_eq!(
+        resolved_marker(&resolved.tree),
+        "the source being built",
+        "the overlay replaced a file outside debian/",
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_packaging_overlay_replaces_the_debian_tree_a_source_ships() {
+    if !git_available() {
+        return;
+    }
+    // Union with the source's own packaging would leave whatever the abandoned
+    // one shipped beside the declared one — an install file naming a path the
+    // new packaging never builds, a `patches/series` applied by a build that
+    // was never asked to.
+    let root = scratch("overlay-replaces");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+    std::fs::write(upstream.join("debian/stray"), "the source's own\n").unwrap();
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-q", "-m", "stray"]);
+    let packaging = root.join("packaging-repo");
+    init_repo(&packaging);
+    commit_packaging(&packaging, "from packaging");
+
+    let resolver = resolver_in(&root, &root);
+    let resolved = resolver
+        .resolve(&overlaid_from_git(
+            component("pkg", &upstream, None),
+            &packaging,
+        ))
+        .expect("resolve");
+
+    assert_eq!(packaging_marker(&resolved.tree), "from packaging");
+    assert!(
+        !resolved.tree.join("debian/stray").exists(),
+        "the source's own packaging survived alongside the overlay",
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dropping_a_packaging_overlay_restores_the_sources_own_packaging() {
+    if !git_available() {
+        return;
+    }
+    // A recipe stops declaring an overlay when upstream starts shipping
+    // packaging of its own. The overlay's files are untracked in the checkout,
+    // so nothing in a plain re-checkout removes them, and the run would keep
+    // building the packaging the recipe no longer names.
+    let root = scratch("overlay-dropped");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+    std::fs::write(upstream.join("debian/stray"), "the source's own\n").unwrap();
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-q", "-m", "stray"]);
+    let packaging = root.join("packaging-repo");
+    init_repo(&packaging);
+    commit_packaging(&packaging, "from packaging");
+
+    let resolver = resolver_in(&root, &root);
+    let plain = component("pkg", &upstream, None);
+    let overlaid = overlaid_from_git(plain.clone(), &packaging);
+
+    let tree = resolver.resolve(&overlaid).expect("resolve overlaid").tree;
+    assert_eq!(packaging_marker(&tree), "from packaging");
+    // What the vendor pass leaves in the tree, which the cleanup must not touch.
+    std::fs::write(tree.join("vendor.tar"), "left by pass 1").unwrap();
+
+    let resolved = resolver.resolve(&plain).expect("resolve with it dropped");
+    assert_eq!(
+        std::fs::read_to_string(resolved.tree.join("debian/stray")).unwrap(),
+        "the source's own\n",
+        "the source's own packaging did not come back",
+    );
+    assert!(
+        !resolved.tree.join("debian/marker").exists(),
+        "a dropped overlay left its packaging behind",
+    );
+    assert!(resolved.tree.join("vendor.tar").is_file());
+    assert_eq!(resolved.source.len(), 1);
+
+    // ...and declaring it again still works, rather than the cleanup having
+    // left state that trips the next run.
+    let again = resolver.resolve(&overlaid).expect("resolve overlaid again");
+    assert_eq!(packaging_marker(&again.tree), "from packaging");
+    assert!(!again.tree.join("debian/stray").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_overlaid_checkout_re_resolves_unchanged_across_runs() {
+    if !git_available() {
+        return;
+    }
+    let root = scratch("overlay-rerun");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_bare_marker(&upstream, "v1");
+    let packaging = root.join("packaging-repo");
+    init_repo(&packaging);
+    commit_packaging(&packaging, "from packaging");
+
+    let resolver = resolver_in(&root, &root);
+    let comp = overlaid_from_git(component("pkg", &upstream, None), &packaging);
+    let first = resolver.resolve(&comp).expect("first resolve");
+    std::fs::write(first.tree.join("vendor.tar"), "left by pass 1").unwrap();
+
+    for run in 2..=3 {
+        let again = resolver
+            .resolve(&comp)
+            .unwrap_or_else(|err| panic!("resolve {run} must succeed: {err}"));
+        assert_eq!(packaging_marker(&again.tree), "from packaging");
+        assert_eq!(again.source, first.source);
+        assert!(
+            again.tree.join("vendor.tar").is_file(),
+            "the discard must leave the vendor pass's output alone",
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn moving_the_packaging_repository_changes_what_the_component_is_built_from() {
+    if !git_available() {
+        return;
+    }
+    // The overlay is a build input like any other, so a packaging change has to
+    // reach the version stamp and `--skip-published` even though the component's
+    // own source has not moved.
+    let root = scratch("overlay-moves");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_bare_marker(&upstream, "v1");
+    let packaging = root.join("packaging-repo");
+    init_repo(&packaging);
+    commit_packaging(&packaging, "first");
+
+    let resolver = resolver_in(&root, &root);
+    let comp = overlaid_from_git(component("pkg", &upstream, None), &packaging);
+    let before = resolver.resolve(&comp).expect("resolve").source;
+
+    commit_packaging(&packaging, "second");
+    let after = resolver.resolve(&comp).expect("re-resolve").source;
+
+    assert_ne!(before, after);
+    assert_eq!(after.git_commit(), before.git_commit());
+    assert_eq!(after.inputs()[1].value(), head(&packaging));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_packaging_overlay_from_a_tree_on_disk_is_read_where_it_lies() {
+    let root = scratch("overlay-path");
+    let upstream = root.join("working-tree");
+    write_bare_tree(&upstream, "v1");
+    let packaging = root.join("packaging");
+    write_packaging(&packaging, "from a tree on disk");
+
+    let resolver = resolver_in(&root, &root);
+    let resolved = resolver
+        .resolve(&overlaid_from_path(
+            path_component("pkg", &upstream),
+            &packaging,
+        ))
+        .expect("resolve");
+
+    assert_eq!(packaging_marker(&resolved.tree), "from a tree on disk");
+    // Nothing writes to a packaging source, so a path one is read where it is
+    // rather than copied under the work directory as a source is.
+    assert!(
+        !root.join("packaging/pkg").exists(),
+        "a path packaging source was copied for no reason",
+    );
+
+    // Two unpinned inputs: a path says where a tree was read from and nothing
+    // about what it held, whichever of a component's trees it names. The role
+    // is what tells them apart, since the version marks both the same way.
+    assert_eq!(resolved.source.len(), 2);
+    assert!(!resolved.source.is_pinned());
+    assert_eq!(resolved.source.short(), "local.local");
+    assert_eq!(resolved.source.inputs()[1].role(), SourceRole::Packaging);
+    assert_eq!(
+        resolved.source.inputs()[1].value(),
+        packaging.canonicalize().unwrap().to_string_lossy(),
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_packaging_subdir_names_the_directory_holding_debian() {
+    let root = scratch("overlay-subdir");
+    let upstream = root.join("working-tree");
+    write_bare_tree(&upstream, "v1");
+    let packaging = root.join("packaging");
+    write_packaging(&packaging.join("pkg"), "from a subdirectory");
+
+    let resolver = resolver_in(&root, &root);
+    let comp = overlay_subdir(
+        overlaid_from_path(path_component("pkg", &upstream), &packaging),
+        "pkg",
+    );
+    let resolved = resolver.resolve(&comp).expect("resolve");
+    assert_eq!(packaging_marker(&resolved.tree), "from a subdirectory");
+
+    // The record names the tree the recipe declared, as a path source does; the
+    // recipe stays the authority for which part of it was taken.
+    assert_eq!(
+        resolved.source.inputs()[1].value(),
+        packaging.canonicalize().unwrap().to_string_lossy(),
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_packaging_subdir_that_is_not_there_names_the_setting_that_declared_it() {
+    let root = scratch("overlay-subdir-missing");
+    let upstream = root.join("working-tree");
+    write_bare_tree(&upstream, "v1");
+    let packaging = root.join("packaging");
+    write_packaging(&packaging, "unused");
+
+    let resolver = resolver_in(&root, &root);
+    let comp = overlay_subdir(
+        overlaid_from_path(path_component("pkg", &upstream), &packaging),
+        "nowhere",
+    );
+    let err = resolver
+        .resolve(&comp)
+        .expect_err("a subdir the source does not hold is not resolvable")
+        .to_string();
+    assert!(err.contains("packaging.subdir"), "{err}");
+    assert!(err.contains("nowhere"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_packaging_source_carrying_no_debian_directory_does_not_resolve() {
+    let root = scratch("overlay-no-debian");
+    let upstream = root.join("working-tree");
+    write_bare_tree(&upstream, "v1");
+    let packaging = root.join("packaging");
+    // The mistake the error has to name: pointed one level too deep, at the
+    // `debian/` itself rather than the directory holding it.
+    write_packaging(&packaging, "unused");
+
+    let resolver = resolver_in(&root, &root);
+    let err = resolver
+        .resolve(&overlaid_from_path(
+            path_component("pkg", &upstream),
+            &packaging.join("debian"),
+        ))
+        .expect_err("a packaging source with no debian/ supplies no packaging")
+        .to_string();
+    assert!(err.contains("no debian directory"), "{err}");
+    assert!(err.contains("packaging.subdir"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_component_may_not_take_its_packaging_from_its_own_source_tree() {
+    if !git_available() {
+        return;
+    }
+    // The destination is removed before the copy, so a packaging source that is
+    // the component's own tree would be deleted and then read.
+    let root = scratch("overlay-overlap");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+
+    let resolver = resolver_in(&root, &root);
+    let plain = component("pkg", &upstream, None);
+    resolver
+        .resolve(&plain)
+        .expect("resolve to establish the tree");
+
+    let err = resolver
+        .resolve(&overlaid_from_path(plain, &root.join("sources/pkg")))
+        .expect_err("a tree may not be overlaid onto itself")
+        .to_string();
+    assert!(err.contains("sit inside one another"), "{err}");
+    // ...and the tree it would have removed is still there.
+    assert!(root.join("sources/pkg/debian/control").is_file());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_patch_series_applies_over_the_packaging_an_overlay_supplied() {
+    // The assembly order the guide states: source, then overlay, then patches.
+    // A patch that could not reach the overlay's files would leave the one
+    // input a recipe has for fixing packaging it does not control.
+    let root = scratch("overlay-patched");
+    let upstream = root.join("working-tree");
+    write_bare_tree(&upstream, "v1");
+    let packaging = root.join("packaging");
+    write_packaging(&packaging, "from packaging");
+    write_patch(
+        &root,
+        "fix.patch",
+        "--- a/debian/marker\n+++ b/debian/marker\n@@ -1 +1 @@\n\
+         -from packaging\n+patched after the overlay\n",
+    );
+
+    let resolver = resolver_in(&root, &root);
+    let comp = patched(
+        overlaid_from_path(path_component("pkg", &upstream), &packaging),
+        &["fix.patch"],
+    );
+    let resolved = resolver.resolve(&comp).expect("resolve");
+
+    assert_eq!(
+        packaging_marker(&resolved.tree),
+        "patched after the overlay"
+    );
+    // Applied to the assembled tree, never to the packaging the recipe named.
+    assert_eq!(
+        std::fs::read_to_string(packaging.join("debian/marker")).unwrap(),
+        "from packaging\n",
+    );
+    // Three inputs, in assembly order.
+    assert_eq!(resolved.source.len(), 3);
+    assert_eq!(
+        resolved.source.inputs()[2].kind(),
+        src2deb::SourceKind::Patches
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

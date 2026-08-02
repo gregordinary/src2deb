@@ -221,14 +221,16 @@ impl BuildStamp {
         // `Fingerprint::describe` renders them for publication rather than as
         // the manifest records them.
         //
-        // The inputs follow a colon rather than the word "revision", because not
-        // every kind of input is one: a build from a tree on disk is described as
-        // `local`, and "from source revision local" reads as a defect rather than
-        // as the plain statement it is.
+        // Each input carries the part it played, so the sentence reads
+        // "from source abc1234, packaging def5678" and needs no word of its own
+        // for what an input is. That matters because not every input is a
+        // revision: a build from a tree on disk is described as `local`, and
+        // "from source revision local" would read as a defect rather than as
+        // the plain statement it is.
         format!(
             "{source_name} ({version}) {suite}; urgency=medium\n\
              \n\
-             \x20 * Automated build from source: {described}.\n\
+             \x20 * Automated build from {described}.\n\
              \n\
              \x20-- {maintainer}  {timestamp}\n\
              \n",
@@ -366,11 +368,11 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::SourceInput;
+    use crate::fingerprint::{SourceInput, SourceRole};
 
     /// A git source at `commit`, the only shape a resolver produces.
     fn git(commit: &str) -> Fingerprint {
-        Fingerprint::of(SourceInput::git(commit))
+        Fingerprint::of(SourceInput::git(SourceRole::Source, commit))
     }
 
     const CHANGELOG: &str = "\
@@ -440,8 +442,8 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
         // does not — the two would otherwise share a version within a day.
         let stamp = BuildStamp::at("deb13", 1_785_456_000);
         let composed = Fingerprint::over(vec![
-            SourceInput::git("abc1234def5678"),
-            SourceInput::sha256("9f8e7d6c5b4a3928"),
+            SourceInput::git(SourceRole::Source, "abc1234def5678"),
+            SourceInput::git(SourceRole::Packaging, "9f8e7d6c5b4a3928"),
         ]);
         assert_eq!(
             stamp.version("1.0-1", &composed),
@@ -451,7 +453,7 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
         assert!(
             stamp
                 .changelog_entry(&head, "trixie", &composed)
-                .contains("from source: abc1234def5678, sha256:9f8e7d6c5b4a3928.")
+                .contains("from source abc1234def5678, packaging 9f8e7d6c5b4a3928.")
         );
     }
 
@@ -462,11 +464,14 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
         // states it without pretending it is a revision or naming the build
         // host's directory layout.
         let stamp = BuildStamp::at("deb13", 1_785_456_000);
-        let local = Fingerprint::of(SourceInput::path("/home/someone/cosmic-comp"));
+        let local = Fingerprint::of(SourceInput::path(
+            SourceRole::Source,
+            "/home/someone/cosmic-comp",
+        ));
         assert_eq!(stamp.version("1.0-1", &local), "1.0-1+deb13.20260731.local");
         let head = parse_changelog(CHANGELOG).expect("well-formed changelog");
         let entry = stamp.changelog_entry(&head, "trixie", &local);
-        assert!(entry.contains("from source: local."), "{entry}");
+        assert!(entry.contains("from source local."), "{entry}");
         assert!(!entry.contains("/home/someone"), "{entry}");
     }
 

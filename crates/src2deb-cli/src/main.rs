@@ -1146,22 +1146,33 @@ fn parse_build_date(value: &str) -> Result<src2deb::BuildDate, String> {
 /// A component's source, as the plan lists it: every input the component
 /// resolved, separated by commas.
 ///
-/// A git revision is printed bare, which is what a reader of a build order
-/// expects to see; an input of any other kind is qualified by its kind, so a
-/// digest is not mistaken for a commit. The full values are recorded in the
-/// manifest.
+/// A single-input component prints its value alone, which is what a reader of a
+/// build order expects to see. A component assembled from more than one prints
+/// the part each played, since two inputs of the same kind are told apart by
+/// nothing else.
+///
+/// A git revision is printed bare; an input of any other kind is qualified by
+/// its kind, so a digest is not mistaken for a commit — except a patch series,
+/// whose kind only repeats the part it played. The full values are recorded in
+/// the manifest.
 fn plan_source(source: &Fingerprint) -> String {
+    let labelled = source.len() > 1;
     source
         .inputs()
         .iter()
-        .map(|input| match input.kind() {
-            SourceKind::Git => abbreviate(input.value()).to_string(),
-            SourceKind::Sha256 => format!("sha256:{}", abbreviate(input.value())),
-            SourceKind::Patches => format!("patches:{}", abbreviate(input.value())),
-            // A path abbreviated is a path with its identifying part cut off,
-            // so it is printed whole. It stays on this terminal; only the
-            // marker in the version reaches a package.
-            SourceKind::Path => format!("path:{}", input.value()),
+        .map(|input| {
+            let value = match input.kind() {
+                SourceKind::Git | SourceKind::Patches => abbreviate(input.value()).to_string(),
+                SourceKind::Sha256 => format!("sha256:{}", abbreviate(input.value())),
+                // A path abbreviated is a path with its identifying part cut
+                // off, so it is printed whole. It stays on this terminal; only
+                // the marker in the version reaches a package.
+                SourceKind::Path => format!("path:{}", input.value()),
+            };
+            match labelled {
+                true => format!("{} {value}", input.role().label()),
+                false => value,
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -1493,7 +1504,10 @@ mod tests {
 
     /// A git source at `commit`, the shape the resolver produces.
     fn git(commit: &str) -> Fingerprint {
-        Fingerprint::of(src2deb::SourceInput::git(commit))
+        Fingerprint::of(src2deb::SourceInput::git(
+            src2deb::SourceRole::Source,
+            commit,
+        ))
     }
 
     /// A report with the given outcome counts, for exercising the exit status.
@@ -1715,31 +1729,43 @@ source.git = \"https://example.invalid/c\"
 
     #[test]
     fn the_plan_prints_a_git_revision_bare_and_qualifies_every_other_kind() {
+        use src2deb::{SourceInput, SourceRole};
+
         // A build order reads as a list of revisions, so a commit is printed as
         // one. Anything else is named, because an unqualified digest or path
         // would be read as a commit that is not one.
         assert_eq!(plan_source(&git("0123456789abcdef0123")), "0123456789ab");
         assert_eq!(
-            plan_source(&Fingerprint::of(src2deb::SourceInput::sha256(
-                "9f8e7d6c5b4a39281706"
+            plan_source(&Fingerprint::of(SourceInput::sha256(
+                SourceRole::Source,
+                "9f8e7d6c5b4a39281706",
             ))),
             "sha256:9f8e7d6c5b4a",
         );
         // A path abbreviated is a path with its identifying part cut off, so it
         // is printed whole.
         assert_eq!(
-            plan_source(&Fingerprint::of(src2deb::SourceInput::path(
-                "/home/someone/cosmic-comp"
+            plan_source(&Fingerprint::of(SourceInput::path(
+                SourceRole::Source,
+                "/home/someone/cosmic-comp",
             ))),
             "path:/home/someone/cosmic-comp",
         );
-        // A component built from more than one input lists them all.
+    }
+
+    #[test]
+    fn the_plan_names_the_part_each_input_played_once_there_is_more_than_one() {
+        use src2deb::{SourceInput, SourceRole};
+
+        // Two inputs of one kind are told apart by nothing else, and a build
+        // order that listed two bare commits would not say which was which.
         assert_eq!(
             plan_source(&Fingerprint::over(vec![
-                src2deb::SourceInput::git("0123456789abcdef0123"),
-                src2deb::SourceInput::sha256("9f8e7d6c5b4a39281706"),
+                SourceInput::git(SourceRole::Source, "0123456789abcdef0123"),
+                SourceInput::git(SourceRole::Packaging, "fedcba9876543210fedc"),
+                SourceInput::patches("9f8e7d6c5b4a39281706"),
             ])),
-            "0123456789ab, sha256:9f8e7d6c5b4a",
+            "source 0123456789ab, packaging fedcba987654, patches 9f8e7d6c5b4a",
         );
     }
 }
