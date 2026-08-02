@@ -1,5 +1,5 @@
-//! src2deb builds Debian `.deb` packages from git source, each in an
-//! unprivileged [ferroday-cage](ferroday_cage) sandbox.
+//! src2deb builds Debian `.deb` packages from source, each in an unprivileged
+//! [ferroday-cage](ferroday_cage) sandbox.
 //!
 //! Its first target is the COSMIC desktop (cosmic-epoch): 27 components, built
 //! from source for Debian Trixie and Forky using the `debian/` trees upstream
@@ -13,7 +13,8 @@
 //!
 //! [`engine::Engine`] drives the loop. For a [`recipe::Recipe`] it:
 //!
-//! 1. resolves each component's git [`source`] into an unpacked tree,
+//! 1. resolves each component's [`source`] into an unpacked tree — a git
+//!    checkout, or a copy of a tree already on disk,
 //! 2. reads every `debian/control`, computes the component dependency graph,
 //!    and topologically orders it ([`plan`]),
 //! 3. for each component in order, provisions a build root ([`provision`]),
@@ -37,6 +38,7 @@ pub mod build;
 pub mod cancel;
 pub mod engine;
 pub mod error;
+pub mod fingerprint;
 pub mod lock;
 pub mod manifest;
 pub mod observer;
@@ -49,12 +51,13 @@ pub mod source;
 pub mod toolchain;
 pub mod version;
 
-pub use build::Artifact;
+pub use build::{Artifact, BuildInfo};
 pub use cancel::Cancel;
 pub use engine::{
-    Built, Engine, Failed, Package, PlanReport, PlannedComponent, Progress, RunOptions, RunReport,
-    Selection, SkipReason, Skipped,
+    BuildDate, Built, Engine, Failed, Package, PlanReport, PlannedComponent, Progress, RunOptions,
+    RunReport, Selection, SkipReason, Skipped,
 };
 pub use error::{Error, Result};
+pub use fingerprint::{Fingerprint, SourceInput, SourceKind};
 pub use manifest::Manifest;
-pub use recipe::{Component, Recipe, Source};
+pub use recipe::{Component, Origin, Recipe, Source};

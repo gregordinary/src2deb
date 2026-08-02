@@ -27,6 +27,52 @@ alongside the suite, so runs for several targets share one work directory
 without overwriting one another. That holds for `Architecture: all` packages
 too, whose file names carry no architecture at all.
 
+## Who builds the `Architecture: all` packages
+
+An `Architecture: all` package is architecture-independent: one build serves
+every architecture. Its file name carries no architecture, and the version
+src2deb stamps does not vary with one either — so building a recipe for two
+architectures produces `cosmic-icons_1.0+deb13.20260731.abc1234_all.deb` twice,
+under one name and one version, over two different sets of bytes.
+
+Locally that is harmless, because each architecture has a pool of its own. It
+stops being harmless the moment those architectures merge into a single published
+archive, where one name and version must mean one file.
+
+By default every run produces its own arch-indep packages, so a single pool holds
+every package its recipe declares and can be served exactly as it stands.
+`arch-indep-owner` hands them to one architecture instead:
+
+```toml
+name = "cosmic-epoch"
+suite = "trixie"
+arch-indep-owner = "amd64"
+```
+
+or, per run, `--arch-indep-owner amd64`. Every other architecture then builds
+only its architecture-dependent packages (`dpkg-buildpackage -B` rather than
+`-b`), and a component whose every binary package is `Architecture: all` is
+skipped outright for those architectures — there is nothing left of it to build.
+A run in that position says so before it starts:
+
+```text
+src2deb: Architecture: all packages belong to amd64, so this run produces
+none of them; its pool holds only this architecture's own
+```
+
+Which to choose follows from what you do with the pool:
+
+| | Leave `arch-indep-owner` unset | Name an owner |
+| --- | --- | --- |
+| Each architecture's pool | Complete; servable as it stands | Missing the arch-indep packages |
+| `Architecture: all` packages | Built once per architecture | Built once in total |
+| Emulated build time | Spent rebuilding packages that contain no compiled code | Not spent |
+| Bytes | One set per architecture | One set |
+
+Name an owner when several architectures feed one published archive. Leave it
+unset when you serve a per-architecture pool directly — as a test machine does —
+since that pool has to carry every package the recipe declares.
+
 ## Native and foreign
 
 A build is native when the host CPU runs the target's binaries directly.
@@ -80,4 +126,6 @@ building, which under emulation is where the hours are. Later runs fetch rather
 than clone.
 
 src2deb does not orchestrate hosts. Run it once per host and collect the
-resulting pools — each is a complete archive for its own architecture.
+resulting pools — each is a complete archive for its own architecture, unless an
+[arch-indep owner](#who-builds-the-architecture-all-packages) is named, in which
+case only the owner's carries the `Architecture: all` packages.

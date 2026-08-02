@@ -1,13 +1,80 @@
 # Sources and the toolchain
 
-Where packages and the compiler come from is declared in the recipe, along three
-separate axes. The [recipe reference](recipes.md) lists the fields; this chapter
-explains the model behind them.
+Where the source, the packages, and the compiler come from is declared in the
+recipe, along separate axes. The [recipe reference](recipes.md) lists the fields;
+this chapter explains the model behind them.
 
-The guiding constraint is that the underlying resolver is highest-version-wins
-with no pin priorities. src2deb earns determinism by controlling the resolver's
-inputs — the exact set of archives it sees — rather than by layering a
-preferences engine on top.
+Source and archives are different questions. A component's *source* is the tree
+that gets built; an *archive source* is where its build-dependencies are
+resolved from. The first two sections below take them in that order.
+
+The guiding constraint for archives is that the underlying resolver is
+highest-version-wins with no pin priorities. src2deb earns determinism by
+controlling the resolver's inputs — the exact set of archives it sees — rather
+than by layering a preferences engine on top.
+
+## Component sources
+
+Each component names one source: a git repository to clone, or a tree already on
+disk.
+
+A **git source** is cloned into the work directory on first use and fetched on
+later use, then checked out detached at the requested ref. A branch or an unset
+ref advances to the fetched upstream tip on every run; a tag or a commit resolves
+to itself. What the run records is the `HEAD` the tree ended up at, so the
+revision in a package's version and in the manifest is always a concrete commit,
+never the moving ref that named it.
+
+A **path source** is a tree already on disk, built without being cloned. It is
+the difference between "edit, commit, push, run" and "run" while working on a
+packaging tree.
+
+### Building from a tree on disk
+
+A path source is copied into the work directory and built from the copy. Nothing
+writes into the tree the recipe named.
+
+That matters more than it might sound. The vendor pass binds the source tree
+read-write and runs the component's own `debian/rules clean` in it, which is what
+triggers the vendoring idiom — leaving a `vendor.tar` and a `vendor/` behind, and
+deleting whatever that target is written to delete. For a git source, the tree
+that happens to is a checkout src2deb made and owns. For a path source it would
+be your working directory.
+
+The copy is made afresh on every run, which is what a git source gets from `git
+checkout --force`: a file you delete really disappears from the build, and no
+state survives from the run before. The cost follows the size of the tree, so a
+path pointed at a directory that also holds a large build output — a `target/`,
+say — pays for that output on every run.
+
+Two further rules follow from a path naming *where* a tree was read from and
+nothing about *what* it held:
+
+- The build is recorded as unpinned. The manifest writes `pinned = false` against
+  the input, and the package version carries `local` where a git build carries an
+  abbreviated commit — so a local build is unmistakable in `apt policy` output.
+  See [Package versions](package-versions.md) and [The provenance
+  manifest](provenance.md).
+- `--skip-published` never skips it. There is nothing to compare a path against,
+  so a component built from one is rebuilt on every run.
+
+If the tree is a git checkout holding unmaterialized Git LFS pointers, the
+component fails rather than building a package around the stubs, and the error
+names the tree to run `git lfs pull` in. src2deb does not fetch on your behalf
+here: the tree is yours.
+
+### Patches over either source
+
+Either kind of source may carry a patch series — local fixes upstream has not
+taken — applied to the tree src2deb resolved rather than to anything of yours.
+The series is applied before any `debian/control` is read, so a patch may change
+what a component build-depends on and the build order follows.
+
+A series is a pinned input in its own right, identified by a digest over its
+members' contents in order. It is stamped into the package version alongside the
+source revision, recorded in the manifest, and compared by `--skip-published`, so
+editing a patch rebuilds the component and produces a version that supersedes the
+one built without it. See [Patches](recipes.md#patches).
 
 ## Archive sources
 

@@ -36,10 +36,49 @@ The format is chosen for how `dpkg` compares versions.
 - **The date is `YYYYMMDD`.** Digit runs compare numerically, so each build
   sorts after the one before it.
 - **The revision is the first seven characters of the commit**, which makes the
-  source a package was built from legible from `apt policy` alone.
+  source a package was built from legible from `apt policy` alone. A component
+  built from more than one input carries each of them, joined with `.`.
 
 Compare two versions with `dpkg --compare-versions` to confirm any particular
 pair orders the way you expect.
+
+### More than one input
+
+A component built from more than one input carries an abbreviation of each. A
+component with [patches](recipes.md#patches) is the ordinary case: the upstream
+revision, then the series applied over it.
+
+```text
+1.0.0~alpha.7-1+deb13.20260731.abc1234.5f2e1a9
+                                └──┬──┘ └──┬──┘
+                              revision   patches
+```
+
+A patched package and an unpatched one built from the same revision on the same
+day are therefore distinct versions, and ordered — so a fix reaches a machine
+that already installed the build without it.
+
+### A local build says so
+
+A component built from a `source.path` tree has no revision to abbreviate — a
+path says where a tree was read from, not what it held — so it carries `local`
+where a git build carries a commit:
+
+```text
+1.0.0~alpha.7-1+deb13.20260731.local
+```
+
+That is deliberate. A package built from someone's working tree is not a package
+anyone can reproduce, and the version says so in the one place everybody looks.
+`apt policy` shows it without the manifest being consulted, and a local build and
+a published one are never mistaken for each other. See [Building from a tree on
+disk](sources-and-toolchain.md#building-from-a-tree-on-disk).
+
+One consequence is worth knowing before it surprises you: successive local builds
+are distinguished only by the date, so two builds of a changed tree on the same
+day stamp the same version. `apt upgrade` sees nothing to do. Install the new
+`.deb` directly with `dpkg -i`, which reinstalls a matching version, or pass a
+distinct `--build-date` to separate the two.
 
 ## The date is the build date
 
@@ -54,6 +93,66 @@ often the stamp moves is decided by how often a build runs.
 Every component in a run shares one date, taken once when the run starts and in
 UTC, so a run that spans midnight or builds components in parallel still produces
 one coherent set.
+
+## Pinning the date
+
+`--build-date` fixes the date instead of taking today's:
+
+```sh
+src2deb build recipes/cosmic-epoch --build-date 2026-07-31
+```
+
+The date settles more than how the packages are versioned. src2deb writes it into
+the changelog entry it prepends, and `dpkg-buildpackage` derives
+`SOURCE_DATE_EPOCH` from that entry — so the build itself sees the same clock,
+which is what timestamps embedded in the packages are made from. Two runs from
+the same pinned sources with the same `--build-date` therefore produce not just
+the same version but the same build conditions.
+
+That is what makes a build reproducible enough to check. Without it, every run
+carries a different date, so no two runs can ever be compared.
+
+`--build-date manifest` takes the date the prior run recorded, which reproduces
+that build without transcribing anything:
+
+```sh
+src2deb build recipes/cosmic-epoch --build-date manifest
+```
+
+The run says which date it settled on before it starts:
+
+```text
+src2deb: stamping every version with build date 2026-07-31
+```
+
+A work directory that holds no build of this recipe for this suite and
+architecture records no date, and the run is refused rather than quietly falling
+back to today — which would produce a build that looks like a reproduction and is
+not.
+
+The default stays today's date. A moving date is what lets a rebuild reach a
+machine that already installed the build before it, and that is what an ordinary
+build wants; pinning is for verifying a build already made.
+
+### Verifying a build
+
+The manifest records everything a rebuild needs: the source each component
+resolved to, the date the run was stamped with, and the `.buildinfo` each build
+produced. See [The provenance manifest](provenance.md).
+
+1. Build normally. The manifest records the run.
+2. Rebuild from the same recipe with `--build-date manifest`, into a work
+   directory of its own so nothing of the first run is reused.
+3. Compare. The stamped versions match exactly when the sources have not moved;
+   the two `.buildinfo` files name what each build ran against, and differ where
+   the archive moved beneath them.
+
+Pin the recipe's `git-ref` values to commits for step 3 to mean anything — a
+branch ref resolves to whatever upstream has since pushed, and the manifest's
+recorded source will say so.
+
+src2deb provides the inputs for this comparison and does not perform it. Compare
+the artefacts with whatever tool you prefer.
 
 ## The version tag
 
@@ -122,7 +221,7 @@ source revision in its text:
 ```text
 cosmic-comp (1.0.0~alpha.7-1+deb13.20260731.abc1234) trixie; urgency=medium
 
-  * Automated build from source revision abc1234def5678.
+  * Automated build from source: abc1234def5678.
 
  -- Pop Packaging <pop@example.invalid>  Fri, 31 Jul 2026 00:00:00 +0000
 ```

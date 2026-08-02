@@ -1,6 +1,6 @@
 # Introduction
 
-src2deb builds Debian `.deb` packages from git source. It reads a recipe that
+src2deb builds Debian `.deb` packages from source. It reads a recipe that
 lists a set of components, resolves each component's source, works out the order
 they must build in, and builds each one inside an unprivileged
 [ferroday-cage][cage] sandbox. Every component is built in a Debian root src2deb
@@ -16,9 +16,10 @@ so the order src2deb builds them in is derived from their declared dependencies.
 ## The model
 
 A build is driven by a recipe — a `recipe.toml` that names a Debian suite and
-lists the components to build, each with a git source. src2deb:
+lists the components to build, each with a source — a git repository, or a tree
+already on disk. src2deb:
 
-1. resolves each component's git source into an unpacked tree with a `debian/`
+1. resolves each component's source into an unpacked tree with a `debian/`
    directory,
 2. reads every `debian/control` to learn what each component build-depends on
    and what binary packages it produces, and orders the components so each one

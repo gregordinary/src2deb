@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use src2deb::engine::Progress;
-use src2deb::{Cancel, Engine, PlanReport, Recipe, RunOptions, RunReport, Selection, SkipReason};
+use src2deb::{
+    Cancel, Engine, Fingerprint, PlanReport, Recipe, RunOptions, RunReport, Selection, SkipReason,
+    SourceKind,
+};
 
 /// The exit status of a run stopped by Ctrl-C or `SIGTERM`.
 ///
@@ -18,15 +21,16 @@ use src2deb::{Cancel, Engine, PlanReport, Recipe, RunOptions, RunReport, Selecti
 const CANCELLED_EXIT: u8 = 130;
 
 const USAGE: &str = "\
-Build Debian packages from git source in an unprivileged sandbox.
+Build Debian packages from source in an unprivileged sandbox.
 
 Usage:
   src2deb build RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]
-                           [--version-tag TAG]
+                           [--arch-indep-owner ARCH] [--version-tag TAG]
                            [--keep-going] [--jobs N] [--only C]... | [--from C]
-                           [--skip-published]
+                           [--skip-published] [--build-date DATE|manifest]
   src2deb plan  RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]
-                           [--version-tag TAG] [--build-deps]
+                           [--arch-indep-owner ARCH] [--version-tag TAG]
+                           [--build-deps]
 
 Arguments:
   RECIPE_DIR            A directory containing a recipe.toml
@@ -44,8 +48,14 @@ Build options:
                        with --from
   --from C             Build component C and every component after it in the
                        build order
-  --skip-published     Skip a component whose source is unchanged from the
-                       commit a prior run recorded as built
+  --skip-published     Skip a component whose source is unchanged from what a
+                       prior run recorded as built. A source that cannot be
+                       pinned to exact content is always rebuilt
+  --build-date DATE    Stamp every version with DATE (YYYY-MM-DD) instead of
+                       today, and hand the build the same SOURCE_DATE_EPOCH, so
+                       two runs from the same sources produce the same versions.
+                       Pass \"manifest\" to take the date the prior run recorded,
+                       which reproduces that build without transcribing it
 
   Both --only and --from narrow a run to part of its recipe, so whatever the
   components they select build-depend on has to come from the archive or from
@@ -71,6 +81,14 @@ Common options:
                        amd64 or arm64, overriding whatever the recipe names.
                        A recipe that names none builds for the host, so one
                        recipe serves every target
+  --arch-indep-owner ARCH
+                       Leave the recipe's Architecture: all packages to ARCH.
+                       Building for two architectures otherwise produces each
+                       of them twice, under one name and version, which
+                       collides when the architectures merge into one published
+                       archive. Unset, every run produces its own, so a single
+                       pool holds every package its recipe declares and can be
+                       served as it stands
   --version-tag TAG    Stamp built versions with TAG (for example deb13),
                        overriding both the recipe's version-tag and the tag
                        derived from the suite. Required with a --suite that is
@@ -165,6 +183,9 @@ struct BuildArgs {
     suite: Option<String>,
     /// The target architecture, overriding the recipe's own when given.
     architecture: Option<String>,
+    /// The architecture that produces the recipe's `Architecture: all`
+    /// packages, overriding the recipe's own when given.
+    arch_indep_owner: Option<String>,
     /// The version tag to stamp, overriding both the recipe's own and the tag
     /// derived from the suite.
     version_tag: Option<String>,
@@ -174,8 +195,10 @@ struct BuildArgs {
     jobs: usize,
     /// Which components to build.
     selection: Selection,
-    /// Skip components already built at the same commit in a prior run.
+    /// Skip components a prior run already built from the same source.
     skip_published: bool,
+    /// The date to stamp every version with.
+    build_date: src2deb::BuildDate,
     /// How much to print.
     verbosity: Verbosity,
 }
@@ -191,6 +214,9 @@ struct PlanArgs {
     suite: Option<String>,
     /// The target architecture, overriding the recipe's own when given.
     architecture: Option<String>,
+    /// The architecture that produces the recipe's `Architecture: all`
+    /// packages, overriding the recipe's own when given.
+    arch_indep_owner: Option<String>,
     /// The version tag to stamp, overriding both the recipe's own and the tag
     /// derived from the suite.
     version_tag: Option<String>,
@@ -242,6 +268,7 @@ struct CommonArgs {
     work: PathBuf,
     suite: Option<String>,
     architecture: Option<String>,
+    arch_indep_owner: Option<String>,
     version_tag: Option<String>,
     verbosity: Verbosity,
 }
@@ -260,6 +287,7 @@ fn common_args(
     let mut work: Option<PathBuf> = None;
     let mut suite: Option<String> = None;
     let mut architecture: Option<String> = None;
+    let mut arch_indep_owner: Option<String> = None;
     let mut version_tag: Option<String> = None;
     let mut verbosity = Verbosity::Normal;
     let mut iter = rest.iter();
@@ -295,6 +323,18 @@ fn common_args(
                 }
                 architecture = Some(value.clone());
             }
+            "--arch-indep-owner" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--arch-indep-owner requires a value".to_string())?;
+                // Checked here for the same reason as --architecture: it is
+                // compared against one, so a name that could never be one would
+                // hand arch-indep output to nothing.
+                if let Some(reason) = src2deb::arch::architecture_name_error(value) {
+                    return Err(format!("--arch-indep-owner value {value:?} {reason}"));
+                }
+                arch_indep_owner = Some(value.clone());
+            }
             "--version-tag" => {
                 let value = iter
                     .next()
@@ -328,6 +368,7 @@ fn common_args(
         work: work.unwrap_or_else(|| PathBuf::from("work")),
         suite,
         architecture,
+        arch_indep_owner,
         version_tag,
         verbosity,
     })
@@ -340,6 +381,7 @@ fn parse_build(rest: &[String]) -> Result<BuildArgs, String> {
     let mut only: Vec<String> = Vec::new();
     let mut from: Option<String> = None;
     let mut skip_published = false;
+    let mut build_date: Option<src2deb::BuildDate> = None;
     let common = common_args(rest, |flag, iter| match flag {
         "--keep-going" => {
             keep_going = true;
@@ -377,6 +419,13 @@ fn parse_build(rest: &[String]) -> Result<BuildArgs, String> {
             skip_published = true;
             Ok(true)
         }
+        "--build-date" => {
+            let value = iter
+                .next()
+                .ok_or_else(|| "--build-date requires a value".to_string())?;
+            build_date = Some(parse_build_date(value)?);
+            Ok(true)
+        }
         _ => Ok(false),
     })?;
 
@@ -392,9 +441,11 @@ fn parse_build(rest: &[String]) -> Result<BuildArgs, String> {
         work: common.work,
         suite: common.suite,
         architecture: common.architecture,
+        arch_indep_owner: common.arch_indep_owner,
         version_tag: common.version_tag,
         keep_going,
         jobs,
+        build_date: build_date.unwrap_or_default(),
         selection,
         skip_published,
         verbosity: common.verbosity,
@@ -416,6 +467,7 @@ fn parse_plan(rest: &[String]) -> Result<PlanArgs, String> {
         work: common.work,
         suite: common.suite,
         architecture: common.architecture,
+        arch_indep_owner: common.arch_indep_owner,
         version_tag: common.version_tag,
         show_build_deps,
         verbosity: common.verbosity,
@@ -459,6 +511,7 @@ fn load_recipe(
     dir: &Path,
     suite: Option<String>,
     architecture: Option<String>,
+    arch_indep_owner: Option<String>,
     version_tag: Option<String>,
 ) -> Result<Recipe, Fault> {
     let mut recipe = Recipe::load(dir)?;
@@ -468,6 +521,9 @@ fn load_recipe(
     }
     if let Some(architecture) = architecture {
         recipe.architecture = architecture;
+    }
+    if let Some(owner) = arch_indep_owner {
+        recipe.arch_indep_owner = Some(owner);
     }
     if let Some(version_tag) = version_tag {
         recipe.version_tag = Some(version_tag);
@@ -556,6 +612,7 @@ fn build(args: BuildArgs) -> Result<ExitCode, Fault> {
         &args.recipe_dir,
         args.suite,
         args.architecture,
+        args.arch_indep_owner,
         args.version_tag,
     )?;
     // A `--only` or `--from` naming a component the recipe does not have is a
@@ -569,6 +626,7 @@ fn build(args: BuildArgs) -> Result<ExitCode, Fault> {
     let options = RunOptions {
         keep_going: args.keep_going,
         jobs: args.jobs,
+        build_date: args.build_date,
         selection: args.selection,
         skip_published: args.skip_published,
         cancel: cancel_on_signal()?,
@@ -622,6 +680,7 @@ fn plan(args: PlanArgs) -> Result<ExitCode, Fault> {
         &args.recipe_dir,
         args.suite,
         args.architecture,
+        args.arch_indep_owner,
         args.version_tag,
     )?;
 
@@ -829,6 +888,20 @@ impl Reporter {
                 "src2deb: foreign-architecture build: target {target}, host {host} \
                  (runs through qemu-user; needs qemu-user-static and binfmt with the F flag)"
             ),
+            // Which date a reproduction settled on, said up front rather than
+            // left to be read off the versions once the packages exist.
+            Progress::BuildDate { date } => {
+                eprintln!("src2deb: stamping every version with build date {date}")
+            }
+            // A build here produces fewer packages than the recipe declares, and
+            // its pool is not servable on its own. Said up front — by `plan` as
+            // well as `build` — rather than left to be noticed in the tally of a
+            // run that has already finished.
+            Progress::ArchIndepElsewhere { owner } => eprintln!(
+                "src2deb: Architecture: all packages belong to {owner}; this architecture \
+                 builds only its own, so its pool holds fewer packages than the recipe \
+                 declares"
+            ),
             Progress::Ordered { order } if self.announce_order => {
                 eprintln!("src2deb: build order: {}", order.join(" -> "));
             }
@@ -1017,33 +1090,29 @@ fn print_summary(report: &RunReport) {
 /// like a run that fell over. Naming the reason is what makes the closing line
 /// say what happened.
 fn skipped_tally(report: &RunReport) -> String {
-    let counts: Vec<String> = [
-        SkipReason::AlreadyBuilt,
-        SkipReason::NotSelected,
-        SkipReason::Cancelled,
-    ]
-    .into_iter()
-    .filter_map(|reason| match report.skipped_for(reason) {
-        0 => None,
-        count => Some(format!("{count} {}", reason.label())),
-    })
-    .collect();
+    let counts: Vec<String> = SkipReason::ALL
+        .into_iter()
+        .filter_map(|reason| match report.skipped_for(reason) {
+            0 => None,
+            count => Some(format!("{count} {}", reason.label())),
+        })
+        .collect();
     if counts.is_empty() {
         return "0 skipped".to_string();
     }
     counts.join(", ")
 }
 
-/// Prints the resolved build order to stdout, one component per line with its
-/// short commit and, when requested, its build-dependencies. Progress goes to
-/// stderr, so the plan itself stays cleanly pipeable on stdout.
+/// Prints the resolved build order to stdout, one component per line with the
+/// source it resolved to and, when requested, its build-dependencies. Progress
+/// goes to stderr, so the plan itself stays cleanly pipeable on stdout.
 fn print_plan(report: &PlanReport, show_build_deps: bool) {
     for (position, component) in report.components.iter().enumerate() {
         println!(
             "{:>3}. {} @ {}",
             position + 1,
             component.name,
-            short_commit(&component.commit)
+            plan_source(&component.source)
         );
         if show_build_deps {
             if component.build_deps.is_empty() {
@@ -1055,14 +1124,54 @@ fn print_plan(report: &PlanReport, show_build_deps: bool) {
     }
 }
 
-/// A commit abbreviated to its first 12 characters for display; the full hash
-/// is recorded in the manifest.
-fn short_commit(commit: &str) -> &str {
-    let end = commit
-        .char_indices()
-        .nth(12)
-        .map_or(commit.len(), |(i, _)| i);
-    &commit[..end]
+/// Parses a `--build-date` value: a `YYYY-MM-DD` date, or `manifest` to take
+/// the date the prior run recorded.
+///
+/// Checked here rather than inside the run, for the same reason as the suite
+/// and the architecture: a date the calendar does not have is a usage error
+/// against the flag, and catching it now keeps it from surfacing after the run
+/// has cloned every source.
+fn parse_build_date(value: &str) -> Result<src2deb::BuildDate, String> {
+    if value == "manifest" {
+        return Ok(src2deb::BuildDate::Recorded);
+    }
+    match src2deb::version::epoch_at_date(value) {
+        Some(seconds) => Ok(src2deb::BuildDate::At(seconds)),
+        None => Err(format!(
+            "--build-date value {value:?} is neither a YYYY-MM-DD date nor \"manifest\""
+        )),
+    }
+}
+
+/// A component's source, as the plan lists it: every input the component
+/// resolved, separated by commas.
+///
+/// A git revision is printed bare, which is what a reader of a build order
+/// expects to see; an input of any other kind is qualified by its kind, so a
+/// digest is not mistaken for a commit. The full values are recorded in the
+/// manifest.
+fn plan_source(source: &Fingerprint) -> String {
+    source
+        .inputs()
+        .iter()
+        .map(|input| match input.kind() {
+            SourceKind::Git => abbreviate(input.value()).to_string(),
+            SourceKind::Sha256 => format!("sha256:{}", abbreviate(input.value())),
+            SourceKind::Patches => format!("patches:{}", abbreviate(input.value())),
+            // A path abbreviated is a path with its identifying part cut off,
+            // so it is printed whole. It stays on this terminal; only the
+            // marker in the version reaches a package.
+            SourceKind::Path => format!("path:{}", input.value()),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A hash abbreviated to its first 12 characters for display; the full value is
+/// recorded in the manifest.
+fn abbreviate(hash: &str) -> &str {
+    let end = hash.char_indices().nth(12).map_or(hash.len(), |(i, _)| i);
+    &hash[..end]
 }
 
 #[cfg(test)]
@@ -1382,6 +1491,11 @@ mod tests {
         );
     }
 
+    /// A git source at `commit`, the shape the resolver produces.
+    fn git(commit: &str) -> Fingerprint {
+        Fingerprint::of(src2deb::SourceInput::git(commit))
+    }
+
     /// A report with the given outcome counts, for exercising the exit status.
     fn report(built: usize, failed: usize, cancelled: bool) -> RunReport {
         RunReport {
@@ -1389,15 +1503,20 @@ mod tests {
             built: (0..built)
                 .map(|n| src2deb::Built {
                     component: format!("built-{n}"),
-                    commit: "abc".to_string(),
-                    artifacts: 1,
+                    source: git("abc"),
+                    artifacts: vec![src2deb::Artifact {
+                        package: format!("built-{n}"),
+                        version: "1.0".to_string(),
+                        path: PathBuf::from("/out/built.deb"),
+                    }],
+                    buildinfo: None,
                     packages: Vec::new(),
                 })
                 .collect(),
             failed: (0..failed)
                 .map(|n| src2deb::Failed {
                     component: format!("failed-{n}"),
-                    commit: "abc".to_string(),
+                    source: git("abc"),
                     error: src2deb::Error::Pool("boom".to_string()),
                 })
                 .collect(),
@@ -1435,20 +1554,21 @@ source.git = \"https://example.invalid/c\"
 
         // Untouched, the recipe stamps the tag it declares for the suite it
         // declares.
-        let recipe = load_recipe(&dir, None, None, None).unwrap();
+        let recipe = load_recipe(&dir, None, None, None, None).unwrap();
         assert_eq!(recipe.resolved_version_tag(), Some("debsid"));
 
         // Retargeted, that tag described a suite the run is no longer building
         // for, so the new suite's own tag stands. Carrying `debsid` onto a
         // trixie build would stamp packages with the name of a release they
         // were not built against.
-        let recipe = load_recipe(&dir, Some("trixie".to_string()), None, None).unwrap();
+        let recipe = load_recipe(&dir, Some("trixie".to_string()), None, None, None).unwrap();
         assert_eq!(recipe.suite, "trixie");
         assert_eq!(recipe.resolved_version_tag(), Some("deb13"));
 
         // A suite with no derivable tag is refused rather than guessed, and the
         // refusal names the flag that settles it.
-        let err = load_recipe(&dir, Some("experimental".to_string()), None, None).unwrap_err();
+        let err =
+            load_recipe(&dir, Some("experimental".to_string()), None, None, None).unwrap_err();
         let Fault::Usage(message) = err else {
             panic!("expected a usage error");
         };
@@ -1459,6 +1579,7 @@ source.git = \"https://example.invalid/c\"
             &dir,
             Some("experimental".to_string()),
             None,
+            None,
             Some("debexp".to_string()),
         )
         .unwrap();
@@ -1466,7 +1587,7 @@ source.git = \"https://example.invalid/c\"
 
         // The flag also overrides a tag the recipe would otherwise resolve on
         // its own, since it is the more specific statement of the two.
-        let recipe = load_recipe(&dir, None, None, Some("debexp".to_string())).unwrap();
+        let recipe = load_recipe(&dir, None, None, None, Some("debexp".to_string())).unwrap();
         assert_eq!(recipe.suite, "sid");
         assert_eq!(recipe.resolved_version_tag(), Some("debexp"));
 
@@ -1481,7 +1602,7 @@ source.git = \"https://example.invalid/c\"
                 .enumerate()
                 .map(|(n, reason)| src2deb::Skipped {
                     component: format!("skipped-{n}"),
-                    commit: "abc".to_string(),
+                    source: git("abc"),
                     reason: *reason,
                 })
                 .collect(),
@@ -1551,10 +1672,74 @@ source.git = \"https://example.invalid/c\"
     }
 
     #[test]
-    fn short_commit_takes_the_first_twelve_characters() {
-        assert_eq!(short_commit("0123456789abcdef0123"), "0123456789ab");
-        // A shorter string (an empty or partial commit) is returned whole.
-        assert_eq!(short_commit("abc"), "abc");
-        assert_eq!(short_commit(""), "");
+    fn build_date_takes_a_calendar_date_or_the_prior_manifests() {
+        assert_eq!(
+            build_args(&["build", "r", "--build-date", "2026-07-31"]).build_date,
+            src2deb::BuildDate::At(1_785_456_000),
+        );
+        assert_eq!(
+            build_args(&["build", "r", "--build-date", "manifest"]).build_date,
+            src2deb::BuildDate::Recorded,
+        );
+        // Unset, a run is dated as it always has been.
+        assert_eq!(
+            build_args(&["build", "r"]).build_date,
+            src2deb::BuildDate::Now,
+        );
+    }
+
+    #[test]
+    fn an_unusable_build_date_is_a_usage_error_against_the_flag() {
+        // Caught at parse time, so it never surfaces after the run has cloned
+        // every source.
+        for value in ["2026-02-30", "yesterday", "2026-7-31", ""] {
+            let err = parse(&["build", "r", "--build-date", value])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--build-date"), "{value:?}: {err}");
+        }
+        assert!(
+            parse(&["build", "r", "--build-date"])
+                .unwrap_err()
+                .contains("requires a value")
+        );
+    }
+
+    #[test]
+    fn a_hash_is_abbreviated_to_its_first_twelve_characters() {
+        assert_eq!(abbreviate("0123456789abcdef0123"), "0123456789ab");
+        // A shorter string (an empty or partial hash) is returned whole.
+        assert_eq!(abbreviate("abc"), "abc");
+        assert_eq!(abbreviate(""), "");
+    }
+
+    #[test]
+    fn the_plan_prints_a_git_revision_bare_and_qualifies_every_other_kind() {
+        // A build order reads as a list of revisions, so a commit is printed as
+        // one. Anything else is named, because an unqualified digest or path
+        // would be read as a commit that is not one.
+        assert_eq!(plan_source(&git("0123456789abcdef0123")), "0123456789ab");
+        assert_eq!(
+            plan_source(&Fingerprint::of(src2deb::SourceInput::sha256(
+                "9f8e7d6c5b4a39281706"
+            ))),
+            "sha256:9f8e7d6c5b4a",
+        );
+        // A path abbreviated is a path with its identifying part cut off, so it
+        // is printed whole.
+        assert_eq!(
+            plan_source(&Fingerprint::of(src2deb::SourceInput::path(
+                "/home/someone/cosmic-comp"
+            ))),
+            "path:/home/someone/cosmic-comp",
+        );
+        // A component built from more than one input lists them all.
+        assert_eq!(
+            plan_source(&Fingerprint::over(vec![
+                src2deb::SourceInput::git("0123456789abcdef0123"),
+                src2deb::SourceInput::sha256("9f8e7d6c5b4a39281706"),
+            ])),
+            "0123456789ab, sha256:9f8e7d6c5b4a",
+        );
     }
 }

@@ -1,6 +1,6 @@
 # src2deb
 
-src2deb builds Debian `.deb` packages from git source. Every component is built
+src2deb builds Debian `.deb` packages from source. Every component is built
 inside an unprivileged [ferroday-cage][cage] sandbox, in a Debian root src2deb
 provisions itself, and the finished packages are collected onto the host.
 
@@ -31,7 +31,7 @@ inside the sandbox.
 src2deb build recipes/cosmic-epoch --work ./work
 ```
 
-src2deb resolves each component's git source, derives the build order from every
+src2deb resolves each component's source, derives the build order from every
 `debian/control`, and builds the components in turn. Each one's packages are
 published to a local pool that later components resolve against, so an
 intra-recipe build-dependency is satisfied by the package src2deb just built.

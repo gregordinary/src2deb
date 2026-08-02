@@ -41,6 +41,15 @@ source.git = "https://github.com/pop-os/cosmic-settings"
   is what keeps one recipe serving every target. Name one when the recipe is
   meaningful for a single architecture. See
   [Cross-architecture builds](cross-architecture.md).
+- `arch-indep-owner` — the architecture that produces this recipe's
+  `Architecture: all` packages, such as `amd64`. Optional: unset, every run
+  produces its own, so a single pool holds every package the recipe declares and
+  can be served as it stands. Name one when several architectures feed a single
+  published archive, where one name and version must mean one file. Every other
+  architecture then builds only its architecture-dependent packages, and a
+  component whose every binary package is `Architecture: all` is skipped for
+  them. See [Who builds the `Architecture: all`
+  packages](cross-architecture.md#who-builds-the-architecture-all-packages).
 - `version-tag` — the tag every built version carries, identifying the suite it
   was built for, such as `deb13`. Optional: src2deb derives it from the suite for
   the numbered Debian releases. Name one when the recipe targets a suite outside
@@ -141,16 +150,36 @@ Each `[[components]]` entry is one buildable component: a source tree with a
 `debian/` directory.
 
 - `name` — the component name, unique within the recipe.
-- `source` — where the component's source comes from:
-  - `source.git` — the git repository URL to clone. Required.
+- `source` — where the component's source comes from. A component names exactly
+  one origin, `source.git` or `source.path`; naming both, or neither, is refused.
+  - `source.git` — the git repository URL to clone.
   - `source.git-ref` — the branch, tag, or commit to check out. Defaults to the
-    remote's default branch.
-  - `source.subdir` — a subdirectory within the checkout that holds the
-    `debian/` tree, for a component that lives inside a larger superproject. The
-    whole checkout is the source tree when unset. It must stay inside the
-    checkout: a `..` component or an absolute path is refused, since the source
+    remote's default branch. It qualifies `source.git`, and setting it on a path
+    source is refused rather than ignored.
+  - `source.path` — a tree already on disk, built without being cloned. Relative
+    to the recipe's own directory, so a recipe kept beside the trees it builds
+    names them relatively and moves with them; an absolute path is used as it
+    stands.
+
+    ```toml
+    [[components]]
+    name = "cosmic-comp"
+    source.path = "../../checkouts/cosmic-comp"
+    ```
+
+    The tree is copied into the work directory and built from the copy, so a
+    build never writes into it. Packages built from a path source are marked as
+    such in their version and in the manifest, and `--skip-published` never
+    skips one. See [Building from a tree on
+    disk](sources-and-toolchain.md#building-from-a-tree-on-disk).
+  - `source.subdir` — a subdirectory within the source that holds the `debian/`
+    tree, for a component that lives inside a larger superproject. The whole
+    source is the tree when unset. It applies to either origin, and must stay
+    inside the source: a `..` component or an absolute path is refused, since the
     tree it names is what the vendor pass binds into a cage that runs upstream's
     own `debian/rules clean`.
+- `patches` — patch files applied over the resolved source tree, in the order
+  given. Optional; see [Patches](#patches) below.
 - `extra-build-deps` — extra build-dependency package names beyond those
   `debian/control` declares. Rarely needed; most build-dependencies are
   discovered from the control file. Reach for it when a component's build needs
@@ -171,6 +200,90 @@ Each `[[components]]` entry is one buildable component: a source tree with a
 
 src2deb computes the build order from the components' declared dependencies, so
 they may be listed in any order.
+
+## Patches
+
+A component may carry local fixes upstream has not taken. Declare them per
+component, in the order they apply:
+
+```toml
+[[components]]
+name = "cosmic-comp"
+source.git = "https://github.com/pop-os/cosmic-comp"
+patches = [
+  "patches/cosmic-comp/0001-fix-build-on-trixie.patch",
+  "patches/cosmic-comp/0002-relax-a-dependency.patch",
+]
+```
+
+Each path is relative to the recipe's own directory, as `source.path` is, so a
+recipe carries its patches alongside it. Keeping them under a directory named
+for the component is a convention, not a requirement.
+
+The series is applied to the tree src2deb resolved — a git checkout, or its copy
+of a `source.path` tree — and never to anything of yours. It is applied before
+anything reads the tree, so a patch may change `debian/control` and the build
+order follows the patched file.
+
+### What a patch may be
+
+Anything `git apply` accepts: a plain unified diff, a `git format-patch` output,
+a patch that adds or deletes files, one that changes a file's mode. Paths are
+read at `-p1` — the `a/` and `b/` prefixes git writes — and must stay inside the
+tree.
+
+Patches apply to either kind of source, and to a `subdir` component they apply
+relative to the subdirectory that holds `debian/`.
+
+### A patch either applies or the component fails
+
+There is no fuzz, no three-way merge, and no `.rej` file left behind. A patch
+that no longer matches the source it was written against fails the component,
+naming the patch:
+
+```text
+src2deb: FAILED cosmic-comp: resolving source for cosmic-comp: patch
+recipes/cosmic-epoch/patches/cosmic-comp/0001-fix-build-on-trixie.patch does not
+apply to /work/sources/cosmic-comp: error: patch failed: src/shell/mod.rs:412
+```
+
+A partly-patched tree is not something to build a package from, so the component
+stops rather than continuing with whatever did apply. Under `--keep-going` the
+rest of the run carries on without it, as with any other resolve failure.
+
+### Patches are part of what a package was built from
+
+The series is a pinned input to the component's fingerprint, identified by a
+digest over its members' contents in order. That has three consequences:
+
+- The version carries it, after the source revision:
+  `1.0.0-1+deb13.20260731.abc1234.5f2e1a9`. A patched package and an unpatched
+  one built from the same revision on the same day are therefore distinct, and
+  ordered.
+- The manifest records it as an input of kind `patches`. See [The provenance
+  manifest](provenance.md).
+- `--skip-published` rebuilds the component when the series changes. Editing a
+  patch, adding one, removing one, or reordering them all count; renaming a
+  patch file does not, since the same patches in the same order produce the same
+  tree.
+
+Removing a patch removes its effect, including any file it added. A source
+checkout persists between runs and a patch's new files are untracked, so this is
+not something a re-checkout would do on its own — src2deb clears what the last
+run's series left, so a component always builds the tree its recipe currently
+describes.
+
+### What this is not
+
+`patches` applies a series and nothing more. It does not manage one: there is no
+command to add, refresh, or rebase a patch, and none to record one from a
+modified tree. Use git for that, on a branch of the upstream source, and export
+with `git format-patch`.
+
+Nor is it `debian/patches`. src2deb applies the series directly to the tree, so
+it works whatever format the source is in and whether or not the packaging uses
+quilt. A component whose upstream `debian/patches` you want to extend is
+better served by patching `debian/patches/series` itself with one of these.
 
 ## Recipes in this repository
 

@@ -61,7 +61,7 @@ applies to that recipe's own `suite`. See
 
 ### `invalid selection`
 
-Three forms, all settled before a single source is cloned or a root provisioned.
+Two forms, both settled before a single source is cloned or a root provisioned.
 
 A selection naming a component the recipe does not have:
 
@@ -70,19 +70,6 @@ src2deb: invalid selection: --only names unknown component "cosmic-osdd"
 ```
 
 Check the name against `recipe.toml`, where component names are free-form.
-
-A selection that leaves out a producer of something it selected:
-
-```text
-src2deb: invalid selection: --only builds "cosmic-osd", which build-depends on
-  "libcosmic-randr-dev"; that package is produced by component "cosmic-randr",
-  which --only leaves out and the pool does not hold. Select "cosmic-randr" as
-  well, or build it first
-```
-
-Add the named component to the selection, or build it into the pool first — a
-pool that already holds the package satisfies the build-dependency, which is why
-this is refused only when the pool cannot cover it.
 
 And a `--from` whose own source failed:
 
@@ -93,6 +80,43 @@ not resolve, so the components after it in the build order cannot be identified
 
 `--from` names a position in the build order, and a component with no resolved
 source has none. Fix the source, or name a different starting component.
+
+### `unsatisfiable build-dependency`
+
+A component this run builds needs a package that another component of the recipe
+produces, and the run neither builds that component nor finds its package in the
+pool. Refused before anything is provisioned, where it would otherwise surface as
+a resolver failure deep inside the consumer's build root.
+
+The message names why the producer is absent, because that decides the fix. The
+selection left it out:
+
+```text
+src2deb: unsatisfiable build-dependency: this run builds "cosmic-osd", which
+  build-depends on "libcosmic-randr-dev"; that package is produced by component
+  "cosmic-randr", which --only leaves out, and the pool does not hold it. Select
+  "cosmic-randr" as well, or build it first
+```
+
+Add the named component to the selection, or build it into the pool first — a
+pool that already holds the package satisfies the build-dependency, which is why
+this is refused only when the pool cannot cover it.
+
+Or the producer's every binary package is `Architecture: all`, and the recipe
+leaves those to another architecture:
+
+```text
+src2deb: unsatisfiable build-dependency: this run builds "cosmic-osd", which
+  build-depends on "cosmic-icons"; that package is produced by component
+  "cosmic-icons", which produces only Architecture: all packages, left to
+  "amd64" by this recipe, and the pool does not hold it. Build for "amd64"
+  first, or stop naming an arch-indep owner
+```
+
+Build the owning architecture into the same pool first, or drop
+`arch-indep-owner` so every architecture produces its own. See [Who builds the
+`Architecture: all`
+packages](cross-architecture.md#who-builds-the-architecture-all-packages).
 
 ## While sources resolve
 
@@ -108,8 +132,8 @@ and credentials for a private repository.
 
 A resolve failure is a failure of that component rather than of the run, on the
 same terms as a failed build: `--keep-going` carries the run past it, records the
-component as failed with an empty commit, and folds it into the summary and the
-manifest.
+component as failed with no source recorded, and folds it into the summary and
+the manifest.
 
 ### `is stored with Git LFS, but git lfs is not available`
 
@@ -146,6 +170,89 @@ here
 was unreachable, the objects it should hold are gone, or the repository needs
 credentials for LFS that the clone did not have. Both messages list up to five
 pointer paths, then a count of the rest.
+
+### `is a Git LFS pointer; run git lfs pull in X`
+
+```text
+src2deb: FAILED pop-icon-theme: resolving source for pop-icon-theme:
+src/assets/wallpaper.png is a Git LFS pointer; run `git lfs pull` in
+/home/someone/pop-icon-theme so the build gets the real content instead of the
+pointer stub standing in for it. Building against a pointer produces a package
+that installs cleanly and fails at runtime, so the build stops here
+```
+
+The same substitution, found in a `source.path` tree. Run the command the message
+names, in the directory it names, and build again:
+
+```sh
+git -C /home/someone/pop-icon-theme lfs pull
+```
+
+src2deb does not fetch on your behalf here, as it does for a checkout it made
+itself. The tree is yours, and a build is not the moment to change it.
+
+### `source.path X cannot be read`
+
+```text
+src2deb: FAILED cosmic-comp: resolving source for cosmic-comp:
+source.path ../../checkouts/cosmic-comp cannot be read: No such file or
+directory (os error 2)
+```
+
+The path is wrong, or it is relative to somewhere other than you expected. A
+relative `source.path` resolves against the *recipe's* directory — the one
+holding `recipe.toml` — not against the directory you ran src2deb from. The
+message shows the joined path, so compare it with where the tree actually is.
+
+### `source.path X would be copied into itself`
+
+```text
+src2deb: FAILED cosmic-comp: resolving source for cosmic-comp:
+source.path /home/someone/build would be copied into itself
+(/home/someone/build/work/sources/cosmic-comp); point it at a tree outside the
+work directory
+```
+
+The tree a path source names contains the work directory, or lies inside it. The
+copy would either walk into its own output or be deleted by the wipe that
+precedes it, so the component is refused. Move `--work` outside the source tree,
+or point the source somewhere else.
+
+### `patch X does not apply`
+
+```text
+src2deb: FAILED cosmic-comp: resolving source for cosmic-comp: patch
+recipes/cosmic-epoch/patches/cosmic-comp/0001-fix-build.patch does not apply to
+/work/sources/cosmic-comp: error: patch failed: src/shell/mod.rs:412
+error: src/shell/mod.rs: patch does not apply
+```
+
+The source moved out from under the patch, which is what happens when a
+component tracks a branch. src2deb does not fuzz a patch or fall back to a
+three-way merge, so a patch that no longer matches has to be brought up to date
+or dropped:
+
+```sh
+# See what the patch expects against what the source now holds.
+cd work/sources/cosmic-comp
+git apply --check -v ../../../recipes/cosmic-epoch/patches/cosmic-comp/0001-fix-build.patch
+```
+
+Rebase the patch against the current source and export it again with `git
+format-patch`, or pin `source.git-ref` to the commit the patch was written
+against. See [Patches](recipes.md#patches).
+
+### `patch X cannot be read`
+
+```text
+src2deb: FAILED cosmic-comp: resolving source for cosmic-comp: patch
+recipes/cosmic-epoch/patches/fix.patch cannot be read: No such file or
+directory (os error 2)
+```
+
+A patch path is relative to the *recipe's* directory — the one holding
+`recipe.toml` — not to the directory you ran src2deb from. The message shows the
+joined path, so compare it with where the file actually is.
 
 ### `skipping X (not selected); its source did not resolve`
 
@@ -292,11 +399,16 @@ Components that finished stay built, published, and recorded. Re-run with
 ### A re-run rebuilds everything
 
 `--skip-published` reads the manifest for the recipe, suite, and architecture the
-run targets, and skips a component whose source resolves to the commit recorded
-as built. A run that rebuilds everything is reading a different manifest or a
-different commit: check that `--work`, `--suite`, and `--architecture` match the
+run targets, and skips a component whose source resolves to what is recorded as
+built. A run that rebuilds everything is reading a different manifest or a
+different source: check that `--work`, `--suite`, and `--architecture` match the
 earlier run, and that the component's `git-ref` is a pinned commit rather than a
 branch that has since moved.
+
+A `source.path` component is rebuilt every run by design, whatever the manifest
+records. A path says where a tree was read from and not what it held, so nothing
+about it establishes that the source has not moved. See [Resume
+state](provenance.md#resume-state).
 
 ### A build root is rebuilt when nothing changed
 

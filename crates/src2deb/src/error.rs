@@ -43,6 +43,9 @@ pub enum Error {
         /// The suite with no known tag.
         suite: String,
     },
+    /// The run's build date could not be settled: it was to be taken from a
+    /// prior manifest, and none records one.
+    BuildDate(String),
     /// A `debian/changelog` file could not be read or parsed.
     Changelog {
         /// The component whose changelog was being read.
@@ -54,10 +57,17 @@ pub enum Error {
     /// contains a cycle).
     Plan(String),
     /// A `--only` or `--from` selection cannot be built: it named a component
-    /// the recipe does not contain, it named one whose source did not resolve,
-    /// or it left out a component that produces a build-dependency of one it
-    /// selected.
+    /// the recipe does not contain, or it named one whose source did not
+    /// resolve.
     Selection(String),
+    /// A component build-depends on a package another component of the recipe
+    /// produces, and this run neither builds that component nor finds its
+    /// package already in the pool.
+    ///
+    /// Raised before anything is provisioned, where the graph, the run's
+    /// contents, and the pool's index all settle it — rather than deep inside
+    /// the consumer's provision, phrased as a resolver failure.
+    BuildDependency(String),
     /// Configuring the Debian provisioner failed.
     Debian(DebianError),
     /// Provisioning a build root failed.
@@ -134,11 +144,15 @@ impl fmt::Display for Error {
                 "suite {suite:?} is not a numbered Debian release, so it has no \
                  known version tag; name the tag builds for it should carry"
             ),
+            Error::BuildDate(reason) => write!(f, "cannot settle the build date: {reason}"),
             Error::Changelog { component, reason } => {
                 write!(f, "reading debian/changelog for {component}: {reason}")
             }
             Error::Plan(reason) => write!(f, "cannot order the build: {reason}"),
             Error::Selection(reason) => write!(f, "invalid selection: {reason}"),
+            Error::BuildDependency(reason) => {
+                write!(f, "unsatisfiable build-dependency: {reason}")
+            }
             Error::Debian(err) => write!(f, "the Debian provisioner: {err}"),
             Error::Provision(err) => write!(f, "provisioning a build root: {err}"),
             Error::Cage(err) => write!(f, "the build sandbox: {err}"),

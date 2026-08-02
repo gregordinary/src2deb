@@ -77,6 +77,11 @@ pub fn output_dir(work_dir: &Path, suite: &str, architecture: &str) -> PathBuf {
 /// the revision it came from. `just` runs recipe lines under `sh -cu`, so a
 /// component that reads it unguarded fails outright when it is unset rather
 /// than merely building without the stamp.
+///
+/// It is a commit hash and nothing else, so it is set only for a source that
+/// has one. Packaging that reads it is packaging written against a git
+/// checkout, and handing it a value of some other shape would be worse than
+/// handing it nothing.
 const SOURCE_GIT_HASH: &str = "SOURCE_GIT_HASH";
 
 /// How often a running pass checks whether the run has been cancelled.
@@ -109,14 +114,51 @@ cp -a /src /build/tree
 cd /build/tree
 "#;
 
-/// The build script tail (pass 2): build a binary package offline and copy the
+/// The build script tail (pass 2): build binary packages offline and copy the
 /// artifacts to the output bind.
 ///
 /// `-nc` skips the pre-build clean, so the vendoring step is not re-triggered
 /// inside the isolated cage; the build consumes the `vendor.tar` from pass 1.
-const BUILD_TAIL: &str = r#"dpkg-buildpackage -us -uc -b -nc
-find /build -maxdepth 1 -type f \( -name '*.deb' -o -name '*.ddeb' -o -name '*.changes' -o -name '*.buildinfo' \) -exec cp -p {} /out/ \;
-"#;
+/// `binaries` selects which binary packages are built; see [`Binaries`].
+///
+/// The `.changes` and `.buildinfo` travel with the packages: the first is the
+/// authoritative list of what the build produced, and the second is what it was
+/// built against. See [`BuildInfo`].
+fn build_tail(binaries: Binaries) -> String {
+    format!(
+        "dpkg-buildpackage -us -uc {} -nc\n\
+         find /build -maxdepth 1 -type f \\( -name '*.deb' -o -name '*.ddeb' -o \
+         -name '*.changes' -o -name '*.buildinfo' \\) -exec cp -p {{}} /out/ \\;\n",
+        binaries.flag(),
+    )
+}
+
+/// Which of a component's binary packages a build produces.
+///
+/// An `Architecture: all` package's file name carries no architecture and its
+/// stamped version does not vary with one, so a recipe built for two
+/// architectures produces it twice — the same name and version over different
+/// bytes. Which architecture makes it is the recipe's to settle; see
+/// [`Recipe::owns_arch_indep`](crate::Recipe::owns_arch_indep).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binaries {
+    /// Every binary package the component declares, architecture-dependent and
+    /// `Architecture: all` alike.
+    All,
+    /// Only the architecture-dependent packages, leaving `Architecture: all`
+    /// output to the architecture that owns it.
+    ArchitectureDependent,
+}
+
+impl Binaries {
+    /// The `dpkg-buildpackage` build-type flag that selects this set.
+    fn flag(self) -> &'static str {
+        match self {
+            Binaries::All => "-b",
+            Binaries::ArchitectureDependent => "-B",
+        }
+    }
+}
 
 /// The heredoc delimiter the stamp step writes the changelog entry with.
 ///
@@ -162,8 +204,12 @@ pub struct Target<'a> {
     pub component: &'a str,
     /// The host path of the resolved source tree.
     pub tree: &'a Path,
-    /// The commit the tree is checked out at.
-    pub commit: &'a str,
+    /// The commit the tree is checked out at, for a source that is a git
+    /// repository, or `None` for a source that has no commit.
+    ///
+    /// Passed to both passes as `SOURCE_GIT_HASH`. A target with none sets no
+    /// such variable, rather than one holding a value that is not a commit.
+    pub commit: Option<&'a str>,
     /// The `debian/changelog` entry that stamps this build's version, prepended
     /// to the build's own copy of the tree, or `None` to build the version
     /// upstream's changelog already declares.
@@ -173,10 +219,14 @@ pub struct Target<'a> {
     /// finished text rather than the means to compose it. Any well-formed entry
     /// does; a missing trailing newline is supplied when the entry is written.
     pub changelog_entry: Option<&'a str>,
+    /// Which of the component's binary packages the build produces. Only the
+    /// build pass reads this; the vendor pass builds nothing.
+    pub binaries: Binaries,
 }
 
-/// What a build pass produced: its artifacts, and the inputs the sandbox
-/// applied while producing them.
+/// What a build pass produced: its artifacts, the `.buildinfo` recording what
+/// they were built from, and the inputs the sandbox applied while producing
+/// them.
 ///
 /// The inputs come from the cage that actually ran, not from a second
 /// description of it, so they cannot drift from what the build saw — which is
@@ -185,8 +235,29 @@ pub struct Target<'a> {
 pub struct BuildOutcome {
     /// The artifacts written to the output directory.
     pub artifacts: Vec<Artifact>,
+    /// The `.buildinfo` the build wrote, when it wrote one.
+    pub buildinfo: Option<BuildInfo>,
     /// The environment and mounts the build cage applied.
     pub inputs: ResolvedInputs,
+}
+
+/// The `.buildinfo` a build wrote, and its checksum.
+///
+/// `dpkg-buildpackage` writes one per build, recording the exact package set
+/// installed in the build root, the build environment, and the checksums of the
+/// binaries produced. It is Debian's own artefact for the question the
+/// provenance manifest otherwise answers in src2deb's own vocabulary — what a
+/// package was built against — and it is the file a rebuild is compared with.
+///
+/// src2deb records it and carries it alongside the packages. It does not read
+/// it: what it holds is dpkg's to define.
+#[derive(Debug, Clone)]
+pub struct BuildInfo {
+    /// The path to the `.buildinfo` on the host, under the output directory.
+    pub path: PathBuf,
+    /// Its SHA-256, in lowercase hexadecimal, measured from the file as the
+    /// build left it.
+    pub sha256: String,
 }
 
 /// A built package artifact.
@@ -254,7 +325,9 @@ impl Builder {
         let script = format!("{}{VENDOR_BODY}", self.toolchain_prelude());
         let cage = build_cage(root)
             .bind(target.tree, SOURCE_DEST)
-            .env(SOURCE_GIT_HASH, target.commit)
+            // An `Option` iterates once or not at all, so a source with no
+            // commit sets no variable rather than an empty one.
+            .envs(target.commit.map(|commit| (SOURCE_GIT_HASH, commit)))
             .network(Network::Host)
             .command("/bin/sh")
             .args(["-e", "-u", "-c", script.as_str()])
@@ -298,13 +371,14 @@ impl Builder {
 
         let stamp = target.changelog_entry.map(stamp_step).unwrap_or_default();
         let script = format!(
-            "{}{BUILD_HEAD}{stamp}{BUILD_TAIL}",
-            self.toolchain_prelude()
+            "{}{BUILD_HEAD}{stamp}{}",
+            self.toolchain_prelude(),
+            build_tail(target.binaries),
         );
         let cage = build_cage(root)
             .bind_ro(target.tree, SOURCE_DEST)
             .bind(out_dir, OUTPUT_DEST)
-            .env(SOURCE_GIT_HASH, target.commit)
+            .envs(target.commit.map(|commit| (SOURCE_GIT_HASH, commit)))
             .network(Network::Isolated)
             .command("/bin/sh")
             .args(["-e", "-u", "-c", script.as_str()])
@@ -325,6 +399,7 @@ impl Builder {
 
         Ok(BuildOutcome {
             artifacts: collect_artifacts(out_dir)?,
+            buildinfo: collect_buildinfo(out_dir)?,
             inputs,
         })
     }
@@ -446,14 +521,59 @@ fn collect_artifacts(out_dir: &Path) -> Result<Vec<Artifact>> {
 
 /// Finds the first `.changes` file in the output directory.
 fn find_changes(out_dir: &Path) -> Result<Option<PathBuf>> {
-    for entry in std::fs::read_dir(out_dir).map_err(|err| io_error("reading", out_dir, err))? {
-        let entry = entry.map_err(|err| io_error("reading", out_dir, err))?;
+    first_with_extension(out_dir, "changes")
+}
+
+/// Collects the `.buildinfo` from the output directory, checksummed.
+///
+/// A build that wrote none is reported as `None` rather than as a failure: the
+/// packages are what the build was for, and the record says what there was to
+/// record. Every `dpkg-buildpackage` in a suite src2deb targets writes one, so
+/// in practice this is present.
+fn collect_buildinfo(out_dir: &Path) -> Result<Option<BuildInfo>> {
+    let Some(path) = first_with_extension(out_dir, "buildinfo")? else {
+        return Ok(None);
+    };
+    let sha256 = sha256_file(&path)?;
+    Ok(Some(BuildInfo { path, sha256 }))
+}
+
+/// Finds the first file in `dir` with the given extension.
+///
+/// One build writes one `.changes` and one `.buildinfo`, and the output
+/// directory is emptied before the build, so "first" is "the one".
+fn first_with_extension(dir: &Path, extension: &str) -> Result<Option<PathBuf>> {
+    for entry in std::fs::read_dir(dir).map_err(|err| io_error("reading", dir, err))? {
+        let entry = entry.map_err(|err| io_error("reading", dir, err))?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("changes") {
+        if path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
             return Ok(Some(path));
         }
     }
     Ok(None)
+}
+
+/// The SHA-256 of a file, in lowercase hexadecimal.
+///
+/// Read in chunks rather than into one buffer, so the cost does not follow the
+/// size of the file.
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|err| io_error("opening", path, err))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| io_error("reading", path, err))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(crate::fingerprint::hex(&hasher.finalize()))
 }
 
 /// Extracts the `.deb`/`.ddeb` file names from a `.changes` file's `Files:`
@@ -553,7 +673,7 @@ pkg (1.0-1) trixie; urgency=low
         let entry = "\
 pkg (1.0-1+deb13.20260731.abc1234) trixie; urgency=medium
 
-  * Automated build from source revision abc1234.
+  * Automated build from source: abc1234.
 
  -- Upstream <up@example.invalid>  Fri, 31 Jul 2026 00:00:00 +0000
 
@@ -604,7 +724,7 @@ pkg (1.0-1+deb13.20260731.abc1234) trixie; urgency=medium
         let entry = "\
 pkg (1.0-1+deb13.20260731.abc1234) trixie; urgency=medium
 
-  * Automated build from source revision abc1234.
+  * Automated build from source: abc1234.
 
  -- Upstream <up@example.invalid>  Fri, 31 Jul 2026 00:00:00 +0000";
         run_in(&dir, &stamp_step(entry));
@@ -622,12 +742,13 @@ pkg (1.0-1+deb13.20260731.abc1234) trixie; urgency=medium
         let target = Target {
             component: "pkg",
             tree: Path::new("/src"),
-            commit: "abc1234",
+            commit: Some("abc1234"),
             changelog_entry: None,
+            binaries: Binaries::All,
         };
         let stamp = target.changelog_entry.map(stamp_step).unwrap_or_default();
         assert!(stamp.is_empty());
-        let script = format!("{BUILD_HEAD}{stamp}{BUILD_TAIL}");
+        let script = format!("{BUILD_HEAD}{stamp}{}", build_tail(target.binaries));
         assert!(!script.contains("debian/changelog"));
         assert!(script.contains("dpkg-buildpackage"));
     }
@@ -696,6 +817,87 @@ pkg (1.0-1+deb13.20260731.abc1234) trixie; urgency=medium
         assert_eq!(names, ["foo", "foo-dbgsym"]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_buildinfo_is_collected_with_its_checksum() {
+        let dir = scratch("buildinfo");
+        std::fs::write(dir.join("foo_1.0_amd64.changes"), CHANGES).unwrap();
+        std::fs::write(dir.join("foo_1.0_amd64.deb"), b"").unwrap();
+        std::fs::write(dir.join("foo_1.0_amd64.buildinfo"), b"abc").unwrap();
+
+        let buildinfo = collect_buildinfo(&dir)
+            .unwrap()
+            .expect("the build wrote one");
+        assert_eq!(buildinfo.path, dir.join("foo_1.0_amd64.buildinfo"));
+        // Measured from the file rather than taken from the `.changes` that
+        // also names it, so the record describes the bytes on disk.
+        assert_eq!(
+            buildinfo.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_that_wrote_no_buildinfo_records_none_rather_than_failing() {
+        // The packages are what the build was for; the record says what there
+        // was to record.
+        let dir = scratch("no-buildinfo");
+        std::fs::write(dir.join("foo_1.0_amd64.deb"), b"").unwrap();
+        assert!(collect_buildinfo(&dir).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_larger_than_one_read_hashes_the_same_as_its_contents() {
+        // The hash is taken in chunks, so a file past the buffer boundary must
+        // still agree with the digest of the whole.
+        let dir = scratch("chunked");
+        let path = dir.join("big.buildinfo");
+        std::fs::write(&path, vec![b'x'; 200_000]).unwrap();
+        let digest = sha256_file(&path).unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // The same bytes written in one go hash identically, which is the
+        // property chunking must not disturb.
+        let same = dir.join("same.buildinfo");
+        std::fs::write(&same, vec![b'x'; 200_000]).unwrap();
+        assert_eq!(sha256_file(&same).unwrap(), digest);
+        // ...and one byte more is a different file.
+        let longer = dir.join("longer.buildinfo");
+        std::fs::write(&longer, vec![b'x'; 200_001]).unwrap();
+        assert_ne!(sha256_file(&longer).unwrap(), digest);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_build_type_flag_follows_which_binaries_the_run_produces() {
+        // `-b` builds every binary package, `-B` only the architecture-dependent
+        // ones. The whole of arch-indep ownership comes down to this one flag,
+        // so the mapping is asserted rather than assumed.
+        assert!(build_tail(Binaries::All).contains("dpkg-buildpackage -us -uc -b -nc"));
+        assert!(
+            build_tail(Binaries::ArchitectureDependent)
+                .contains("dpkg-buildpackage -us -uc -B -nc")
+        );
+    }
+
+    #[test]
+    fn the_build_script_copies_the_buildinfo_out_alongside_the_packages() {
+        // The manifest names a file the run has to actually keep, so the copy
+        // step is what makes the reference resolve. `.changes` travels with it,
+        // since it is what names the set.
+        let tail = build_tail(Binaries::All);
+        for suffix in ["*.deb", "*.ddeb", "*.changes", "*.buildinfo"] {
+            assert!(
+                tail.contains(&format!("-name '{suffix}'")),
+                "the build tail must collect {suffix}: {tail}",
+            );
+        }
     }
 
     #[test]

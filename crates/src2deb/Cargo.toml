@@ -1,6 +1,6 @@
 [package]
 name = "src2deb"
-description = "Build Debian .deb packages from git source in an unprivileged sandbox"
+description = "Build Debian .deb packages from source in an unprivileged sandbox"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,7 @@ repository.workspace = true
 ferroday-cage.workspace = true
 rustix.workspace = true
 serde.workspace = true
+sha2.workspace = true
 toml.workspace = true
 
 [lints]

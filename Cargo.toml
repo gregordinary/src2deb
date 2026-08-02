@@ -16,6 +16,10 @@ ferroday-cage = { version = "0.1.2", features = ["debian"] }
 # so the two agree on which builds are foreign.
 rustix = { version = "1.1.4", features = ["system"] }
 serde = { version = "1", features = ["derive"] }
+# Checksums for the artefacts a build produces, recorded in the provenance
+# manifest. Already in the tree through ferroday-cage, which uses it to verify
+# what it downloads.
+sha2 = "0.10"
 # Safe registration of a signal handler that only sets a flag, so the CLI can
 # turn Ctrl-C into a request the run consults rather than a killed process.
 # The library takes the flag as an input and installs nothing itself.

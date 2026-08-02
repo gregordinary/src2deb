@@ -56,6 +56,41 @@ pub fn binary_packages(control: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a `debian/control` declares any binary package that is not
+/// `Architecture: all`.
+///
+/// This decides whether a component has anything to build for an architecture
+/// that does not own the recipe's arch-indep output: a component whose every
+/// binary package is `Architecture: all` has nothing left once those are taken
+/// away, and `dpkg-buildpackage -B` on such a source fails outright rather than
+/// producing an empty result.
+///
+/// Read stanza by stanza, so each `Architecture` is the one belonging to the
+/// `Package` above it rather than to whichever binary happens to be declared
+/// first. A binary stanza with no `Architecture` field at all is malformed
+/// control; it counts as architecture-dependent, because the reading that
+/// builds the component is the one that cannot lose a package.
+pub fn has_architecture_dependent_packages(control: &str) -> bool {
+    let (mut is_binary, mut architecture) = (false, None);
+    // A trailing empty line closes the last stanza, so the judgement is written
+    // once rather than repeated after the loop.
+    for line in control.lines().chain(std::iter::once("")) {
+        if line.trim().is_empty() {
+            if is_binary && architecture != Some("all") {
+                return true;
+            }
+            (is_binary, architecture) = (false, None);
+        } else if line.starts_with("Package:") {
+            // The source stanza has none, so it never judges as a binary: its
+            // fields describe the source and not a package this build emits.
+            is_binary = true;
+        } else if let Some(value) = line.strip_prefix("Architecture:") {
+            architecture = Some(value.trim());
+        }
+    }
+    false
+}
+
 /// A resolved build order over a set of components, with the dependency
 /// structure it was ordered from.
 ///
@@ -223,6 +258,54 @@ mod tests {
         // The source stanza contributes none, whitespace is trimmed, and an empty
         // Package value is skipped.
         assert_eq!(binary_packages(control), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_component_is_architecture_dependent_when_any_binary_package_is() {
+        // The mixed case is the common one: a program plus its data package.
+        assert!(has_architecture_dependent_packages(
+            "Source: s\n\nPackage: p\nArchitecture: any\n\nPackage: p-data\nArchitecture: all\n"
+        ));
+        // Declared order must not decide it: the `all` stanza comes first here,
+        // and the component still has an architecture-dependent package.
+        assert!(has_architecture_dependent_packages(
+            "Source: s\n\nPackage: p-data\nArchitecture: all\n\nPackage: p\nArchitecture: any\n"
+        ));
+        // A restricted architecture list is still architecture-dependent.
+        assert!(has_architecture_dependent_packages(
+            "Source: s\n\nPackage: p\nArchitecture: amd64 arm64\n"
+        ));
+    }
+
+    #[test]
+    fn a_component_of_nothing_but_arch_indep_packages_has_none() {
+        // What the theme, icon, and metapackage recipes look like, and what an
+        // architecture that does not own arch-indep output has nothing to build
+        // of.
+        assert!(!has_architecture_dependent_packages(
+            "Source: s\nBuild-Depends: debhelper-compat (= 13)\n\
+             \n\nPackage: theme\nArchitecture: all\nDepends: x\n\
+             \nPackage: theme-doc\nArchitecture: all\n"
+        ));
+    }
+
+    #[test]
+    fn the_source_stanza_never_decides_architecture_dependence() {
+        // It declares no binary package, so it cannot make the component either
+        // dependent or independent whatever fields it carries.
+        assert!(!has_architecture_dependent_packages(
+            "Source: s\nBuild-Depends: debhelper\nVcs-Git: https://example/s\n"
+        ));
+    }
+
+    #[test]
+    fn a_binary_stanza_with_no_architecture_field_counts_as_dependent() {
+        // Malformed control: `Architecture` is mandatory in a binary stanza. The
+        // reading that builds the component is the one that cannot lose a
+        // package, so this is never skipped as arch-indep.
+        assert!(has_architecture_dependent_packages(
+            "Source: s\n\nPackage: p\nDepends: x\n"
+        ));
     }
 
     #[test]

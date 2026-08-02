@@ -968,10 +968,10 @@ mod tests {
         Component {
             name: name.to_string(),
             source: Source {
-                git: "https://example.invalid/repo.git".to_string(),
-                git_ref: None,
-                subdir: None,
+                git: Some("https://example.invalid/repo.git".to_string()),
+                ..Source::default()
             },
+            patches: Vec::new(),
             extra_build_deps: Vec::new(),
         }
     }

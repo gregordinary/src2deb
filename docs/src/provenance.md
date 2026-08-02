@@ -1,8 +1,8 @@
 # The provenance manifest
 
 Every run writes a manifest to the work directory, tying the run's inputs to its
-outputs: the commit each component's source resolved to, the sandbox its builds
-ran in, and the package versions each build produced. It is the basis of a
+outputs: what each component's source resolved to, the sandbox its builds ran in,
+and the package versions each build produced. It is the basis of a
 reproducibility story — the manifest names the revisions to check out and the
 conditions they were built under.
 
@@ -26,23 +26,33 @@ architecture.
 
 ## Contents
 
-The manifest records the recipe's identity, the sandbox the run's builds ran in,
-and one entry per component, in build order. A component that built carries its
-produced packages and their versions; a component that failed carries the failure
-reason. Both carry the commit their source resolved to, so a run that stops
-partway still records the exact inputs it reached.
+The manifest records the recipe's identity, the date the run's versions were
+stamped with, the sandbox the run's builds ran in, and one entry per component,
+in build order. A component that built carries its produced packages and their
+versions; a component that failed carries the failure reason. Both carry what
+their source resolved to, so a run that stops partway still records the exact
+inputs it reached.
 
 ```toml
 recipe = "cosmic-epoch"
 suite = "trixie"
 architecture = "amd64"
+build-date = "2026-07-31"
 
 # The [sandbox] section goes here; see below.
 
 [[component]]
 name = "cosmic-randr"
-commit = "1f3a9c2e5b7d..."
 status = "built"
+
+  [component.buildinfo]
+  path = "out/trixie/amd64/cosmic-randr/cosmic-randr_1.0.0-1+deb13.20260731.1f3a9c2_amd64.buildinfo"
+  sha256 = "4c1a0f..."
+
+  [[component.source]]
+  kind = "git"
+  value = "1f3a9c2e5b7d..."
+  pinned = true
 
   [[component.package]]
   name = "cosmic-randr"
@@ -54,21 +64,114 @@ status = "built"
 
 [[component]]
 name = "cosmic-osd"
-commit = "9b2e4d6a8c1f..."
 status = "failed"
 error = "building cosmic-osd: dpkg-buildpackage exited with status 2"
+
+  [[component.source]]
+  kind = "git"
+  value = "9b2e4d6a8c1f..."
+  pinned = true
 ```
 
-A component's resolved commit is the exact `HEAD` its source was checked out at,
-so a branch or default-branch ref is recorded as the concrete revision it
-resolved to, not the moving ref that named it. A component that failed before it
-had one — its source would not clone, or its `debian/control` would not read —
-records an empty `commit`, which is the manifest saying it never got that far
-rather than naming a revision it did not reach.
+## The source record
+
+Each `[[component.source]]` entry is one input the component was built from. It
+names three things:
+
+- `kind` — what sort of input it is. A git checkout is `git`; a tree on disk is
+  `path`; a component's patch series is `patches`.
+- `value` — what identifies it. For `git`, the exact `HEAD` the tree was checked
+  out at, so a branch or default-branch ref is recorded as the concrete revision
+  it resolved to, not the moving ref that named it. For `path`, the canonical
+  directory the tree was read from, so the record names one path however the
+  recipe reached it. For `patches`, a SHA-256 over the series' members in the
+  order they were applied.
+- `pinned` — whether the value names the exact content that went into the build.
+  A hash does. A value that only says where a tree was read from does not, since
+  the tree may be anything by the time the record is read.
+
+A build from a tree on disk therefore records:
+
+```toml
+  [[component.source]]
+  kind = "path"
+  value = "/home/someone/checkouts/cosmic-comp"
+  pinned = false
+```
+
+which is the manifest saying plainly that this build cannot be reproduced from
+what it records. Where the tree was is worth keeping — it is the only trace of
+what was built — but it is not a revision, and the record does not let it pass
+for one.
+
+A component carrying [patches](recipes.md#patches) records two inputs, the
+upstream revision and the series applied over it:
+
+```toml
+  [[component.source]]
+  kind = "git"
+  value = "1f3a9c2e5b7d..."
+  pinned = true
+
+  [[component.source]]
+  kind = "patches"
+  value = "5f2e1a9c3b8d..."
+  pinned = true
+```
+
+The digest covers the series' members in the order they were applied, so it
+changes when a patch is edited, added, removed, or reordered — and not when one
+is merely renamed. The recipe remains the authority for *which* patches were
+applied; this records *what* they were.
+
+`pinned` follows from the kind, and is written out so that a reproducible build
+can be told from one that only looks like one without knowing which kinds are
+which. It is what `--skip-published` rests on: see [Resume
+state](#resume-state).
+
+A component can have more than one input, and its record then carries one entry
+per input. A component that failed before it resolved anything — its source
+would not clone, or its `debian/control` would not read — carries no entry at
+all, which is the manifest saying it never got that far rather than naming an
+input it never reached.
 
 The recorded versions are the stamped ones the packages actually carry, so the
-suite, the build date, and the abbreviated revision are legible from the manifest
+suite, the build date, and the abbreviated source are legible from the manifest
 as well as from `apt policy`. See [Package versions](package-versions.md).
+
+## The build date
+
+`build-date` is the date the run stamped into every version it produced, as
+`YYYY-MM-DD`. Passing it back as `--build-date` reproduces that run's versions
+and hands the build the same `SOURCE_DATE_EPOCH`; `--build-date manifest` reads
+it from here rather than making you transcribe it. See [Pinning the
+date](package-versions.md#pinning-the-date).
+
+Like the sandbox record, it is carried forward: a run that builds nothing keeps
+the date of the run that produced the packages this manifest still calls built.
+Overwriting it with the date of a run that produced nothing would make a later
+reproduction build against the wrong clock.
+
+## The `.buildinfo` reference
+
+`dpkg-buildpackage` writes a `.buildinfo` for every build, and src2deb keeps it
+alongside the packages in the output tree. A component that built names it:
+
+- `path` — where the file is, relative to the work directory, so a work directory
+  that is moved or copied keeps a manifest whose references still resolve.
+- `sha256` — the file's checksum, measured from the bytes on disk, so the
+  recorded file can be told from one that has since changed.
+
+`.buildinfo` is Debian's own record of what a package was built against: the
+exact set of packages installed in the build root, the build environment, and the
+checksums of the binaries produced. The `[sandbox]` section below records the
+environment and the filesystem a build saw, but not the installed package set —
+`.buildinfo` is what carries that, in the format the rest of Debian's tooling
+already reads.
+
+The manifest names the file rather than restating what it holds, so there is one
+authority for it instead of two that can disagree. src2deb writes it and carries
+it; it does not interpret it.
 
 ## The sandbox record
 
@@ -135,10 +238,18 @@ says nothing about what the packages were built from. See
 ## Resume state
 
 The manifest is also the build-state record `--skip-published` reads: a component
-is skipped when its source resolves to the commit the manifest already records as
-`built`. Each run folds the prior manifest forward — a component this run did not
-build keeps its earlier record — so the manifest always describes the whole
-recipe, and a chain of selective runs stays consistent.
+is skipped when its source resolves to what the manifest already records as
+`built`. Every input has to match, so a component gains a rebuild the moment any
+one of them moves. Each run folds the prior manifest forward — a component this
+run did not build keeps its earlier record — so the manifest always describes the
+whole recipe, and a chain of selective runs stays consistent.
+
+A source that is not pinned is never skipped, however exactly it matches the
+record. An unpinned value says where a tree was read from and not what it held,
+so a run agreeing with the record establishes nothing about whether the source
+moved; skipping on that basis would publish an earlier build as though it were
+this one. In practice that means a `source.path` component is rebuilt on every
+run, which is the right answer for a tree someone is editing.
 
 A run reads only the manifest of its own recipe, suite, and architecture, so
 retargeting a recipe starts from a clean slate rather than skipping components on

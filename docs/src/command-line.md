@@ -21,11 +21,12 @@ one recipe serves every target it builds against.
 | `--work DIR` | The working directory for sources, build roots, the package cache, the pool, and output. Defaults to `./work` |
 | `--suite SUITE` | Build for a Debian suite such as `trixie` or `forky`, superseding the recipe's `suite` and the `version-tag` that described it |
 | `--architecture ARCH` | Build for a Debian architecture such as `amd64` or `arm64`. A recipe naming none builds for the host |
+| `--arch-indep-owner ARCH` | Leave the recipe's `Architecture: all` packages to `ARCH`. Unset, every run produces its own |
 | `--version-tag TAG` | Stamp built versions with `TAG`, such as `deb13`, overriding both the recipe's `version-tag` and the tag derived from the suite |
 
-`--suite`, `--architecture`, and `--version-tag` are validated as they are
-parsed, so a malformed value is a usage error against the flag rather than a
-failure partway into the run. Each suite and architecture pair gets its own pool,
+`--suite`, `--architecture`, `--arch-indep-owner`, and `--version-tag` are
+validated as they are parsed, so a malformed value is a usage error against the
+flag rather than a failure partway into the run. Each suite and architecture pair gets its own pool,
 output tree, and manifest, so runs for several targets share one `--work`
 directory. See [Cross-architecture builds](cross-architecture.md) and
 [Package versions](package-versions.md).
@@ -38,7 +39,8 @@ directory. See [Cross-architecture builds](cross-architecture.md) and
 | `--jobs N` | Build up to `N` components concurrently, respecting the dependency order. Defaults to `1` |
 | `--only C` | Build only component `C`. Repeatable |
 | `--from C` | Build component `C` and every component after it in the build order |
-| `--skip-published` | Skip a component whose source resolves to the commit a prior run recorded as built |
+| `--skip-published` | Skip a component whose source resolves to what a prior run recorded as built. A source that is not pinned to exact content is always rebuilt |
+| `--build-date DATE` | Stamp every version with `DATE` (`YYYY-MM-DD`) instead of today, and hand the build the same `SOURCE_DATE_EPOCH`. `--build-date manifest` takes the date the prior run recorded |
 
 `--only` and `--from` are mutually exclusive, and `--jobs` takes an integer of 1
 or more.

@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Condvar, Mutex};
 
-use crate::build::{Artifact, BuildOutcome, Builder, Target};
+use crate::build::{Artifact, Binaries, BuildInfo, BuildOutcome, Builder, Target};
 use crate::cancel::Cancel;
 use crate::error::{Error, Result, io_error};
+use crate::fingerprint::Fingerprint;
 use crate::lock::WorkLock;
 use crate::manifest::{self, Manifest, SandboxRecord};
 use crate::observer::Stream;
@@ -34,6 +35,14 @@ pub enum Progress<'a> {
     /// otherwise a rejected run states that it is building and is then
     /// contradicted.
     Started,
+    /// The run's versions carry a pinned date rather than today's. Reported
+    /// once, before anything resolves, whenever the date was given or taken
+    /// from a prior manifest — so a reproduction says which date it settled on
+    /// rather than leaving it to be read off the packages afterwards.
+    BuildDate {
+        /// The date, as `YYYY-MM-DD`.
+        date: &'a str,
+    },
     /// A component's source is being resolved.
     Resolving {
         /// The component name.
@@ -65,6 +74,19 @@ pub enum Progress<'a> {
         target: &'a str,
         /// The host's Debian architecture.
         host: &'a str,
+    },
+    /// The recipe hands its `Architecture: all` packages to another
+    /// architecture, so a build here produces none of them. Reported once,
+    /// before provisioning, only when the target architecture is not the owner —
+    /// by [`plan`](Engine::plan) as well as [`run`](Engine::run), since it is
+    /// something to know before committing a machine to a build.
+    ///
+    /// Worth saying out loud: the pool ends up holding fewer packages than the
+    /// recipe declares, which is right when several architectures feed one
+    /// published archive and wrong when that pool is served as it stands.
+    ArchIndepElsewhere {
+        /// The architecture that produces the recipe's arch-indep packages.
+        owner: &'a str,
     },
     /// Layered provisioning was selected: a shared base is bootstrapped once and
     /// each component's build-deps are staged into a disposable overlay upper.
@@ -213,6 +235,7 @@ pub enum Progress<'a> {
 /// draining thread by [`report_to`](OwnedProgress::report_to).
 enum OwnedProgress {
     Started,
+    BuildDate(String),
     Resolving(String),
     Unresolved {
         component: String,
@@ -222,6 +245,9 @@ enum OwnedProgress {
     ForeignArchitecture {
         target: String,
         host: String,
+    },
+    ArchIndepElsewhere {
+        owner: String,
     },
     Layered,
     OverlayUnavailable(String),
@@ -290,6 +316,7 @@ impl OwnedProgress {
     fn report_to(&self, reporter: &mut dyn FnMut(Progress)) {
         match self {
             OwnedProgress::Started => reporter(Progress::Started),
+            OwnedProgress::BuildDate(date) => reporter(Progress::BuildDate { date }),
             OwnedProgress::Resolving(component) => reporter(Progress::Resolving { component }),
             OwnedProgress::Unresolved { component, error } => {
                 reporter(Progress::Unresolved { component, error })
@@ -297,6 +324,9 @@ impl OwnedProgress {
             OwnedProgress::Ordered(order) => reporter(Progress::Ordered { order }),
             OwnedProgress::ForeignArchitecture { target, host } => {
                 reporter(Progress::ForeignArchitecture { target, host })
+            }
+            OwnedProgress::ArchIndepElsewhere { owner } => {
+                reporter(Progress::ArchIndepElsewhere { owner })
             }
             OwnedProgress::Layered => reporter(Progress::Layered),
             OwnedProgress::OverlayUnavailable(reason) => {
@@ -390,6 +420,7 @@ impl From<&Progress<'_>> for OwnedProgress {
     fn from(event: &Progress) -> OwnedProgress {
         match event {
             Progress::Started => OwnedProgress::Started,
+            Progress::BuildDate { date } => OwnedProgress::BuildDate(date.to_string()),
             Progress::Resolving { component } => OwnedProgress::Resolving(component.to_string()),
             Progress::Unresolved { component, error } => OwnedProgress::Unresolved {
                 component: component.to_string(),
@@ -399,6 +430,9 @@ impl From<&Progress<'_>> for OwnedProgress {
             Progress::ForeignArchitecture { target, host } => OwnedProgress::ForeignArchitecture {
                 target: target.to_string(),
                 host: host.to_string(),
+            },
+            Progress::ArchIndepElsewhere { owner } => OwnedProgress::ArchIndepElsewhere {
+                owner: owner.to_string(),
             },
             Progress::Layered => OwnedProgress::Layered,
             Progress::OverlayUnavailable { reason } => {
@@ -508,12 +542,48 @@ pub struct RunOptions {
     pub jobs: usize,
     /// Which components to build. Defaults to [`Selection::All`].
     pub selection: Selection,
-    /// Skip a component whose source resolves to the commit a prior run recorded
-    /// as built, so a re-run rebuilds only what changed.
+    /// Skip a component whose source resolves to what a prior run recorded as
+    /// built, so a re-run rebuilds only what changed. A component whose source
+    /// is unpinned is never skipped, since there is nothing to compare; see
+    /// [`ComponentRecord::is_built_at`](crate::manifest::ComponentRecord::is_built_at).
     pub skip_published: bool,
+    /// The date every version this run stamps carries. Defaults to
+    /// [`BuildDate::Now`].
+    pub build_date: BuildDate,
     /// The signal that stops the run. The default is never set, so a caller
     /// that wants no cancellation supplies nothing.
     pub cancel: Cancel,
+}
+
+/// The date a run stamps into every version it produces.
+///
+/// `dpkg-buildpackage` derives `SOURCE_DATE_EPOCH` from the changelog entry
+/// src2deb writes, so this settles not only how the packages are versioned but
+/// the clock the build itself sees. Pinning it is what makes two runs from the
+/// same sources comparable; leaving it at [`Now`](Self::Now) is what makes a
+/// rebuild supersede its predecessor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BuildDate {
+    /// The moment the run starts, in UTC.
+    ///
+    /// The default, and what an ordinary build wants: a rebuild of unchanged
+    /// pinned sources still sorts above the build before it, so it reaches a
+    /// machine that already installed that one. See [`crate::version`].
+    #[default]
+    Now,
+    /// A fixed instant, in seconds since the Unix epoch.
+    ///
+    /// Two runs given the same instant stamp the same versions and hand
+    /// `dpkg-buildpackage` the same `SOURCE_DATE_EPOCH`, which is what a
+    /// verification rebuild needs.
+    At(i64),
+    /// The date the prior manifest records for this recipe, suite, and
+    /// architecture.
+    ///
+    /// Reproduces a recorded build without transcribing its date. Fails with
+    /// [`Error::BuildDate`] when no manifest records one — a work directory
+    /// this recipe has never built in, or one whose runs never built anything.
+    Recorded,
 }
 
 /// Which components a run builds.
@@ -617,8 +687,8 @@ impl Selection {
 pub struct Skipped {
     /// The component name.
     pub component: String,
-    /// The commit its source resolved to.
-    pub commit: String,
+    /// What its source resolved to.
+    pub source: Fingerprint,
     /// Why it was skipped.
     pub reason: SkipReason,
 }
@@ -626,21 +696,36 @@ pub struct Skipped {
 /// Why a component was not built this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    /// It was already built at this commit in a prior run (`--skip-published`).
+    /// It was already built from this source in a prior run
+    /// (`--skip-published`).
     AlreadyBuilt,
     /// It was outside the run's `--only`/`--from` selection.
     NotSelected,
+    /// Every binary package it declares is `Architecture: all`, and the recipe
+    /// hands arch-indep output to another architecture, so this run has nothing
+    /// of it to build. See
+    /// [`Recipe::owns_arch_indep`](crate::Recipe::owns_arch_indep).
+    ArchIndepElsewhere,
     /// The run was cancelled before it finished the component — either before
     /// it was reached at all, or partway through its build.
     Cancelled,
 }
 
 impl SkipReason {
+    /// Every reason, so a caller tallying them cannot leave one out.
+    pub const ALL: [SkipReason; 4] = [
+        SkipReason::AlreadyBuilt,
+        SkipReason::NotSelected,
+        SkipReason::ArchIndepElsewhere,
+        SkipReason::Cancelled,
+    ];
+
     /// A short human-readable phrase for the reason.
     pub fn label(self) -> &'static str {
         match self {
             SkipReason::AlreadyBuilt => "already built",
             SkipReason::NotSelected => "not selected",
+            SkipReason::ArchIndepElsewhere => "arch-indep owned elsewhere",
             SkipReason::Cancelled => "cancelled",
         }
     }
@@ -660,10 +745,15 @@ pub struct Package {
 pub struct Built {
     /// The component name.
     pub component: String,
-    /// The commit the component's source resolved to.
-    pub commit: String,
-    /// How many artifacts the build produced.
-    pub artifacts: usize,
+    /// What the component's source resolved to.
+    pub source: Fingerprint,
+    /// The files the build produced, under the run's output tree. One package
+    /// contributes more than one — a `.deb` and its `.ddeb` debug companion —
+    /// so this is longer than [`packages`](Self::packages).
+    pub artifacts: Vec<Artifact>,
+    /// The `.buildinfo` the build wrote, recording what the packages were built
+    /// against. Absent when the build wrote none.
+    pub buildinfo: Option<BuildInfo>,
     /// The distinct packages the build produced, with their versions.
     pub packages: Vec<Package>,
 }
@@ -674,11 +764,11 @@ pub struct Built {
 pub struct Failed {
     /// The component name.
     pub component: String,
-    /// The commit the component's source resolved to, recorded even though the
-    /// build failed so the manifest can name the exact input. Empty for a
-    /// component that failed before it had one — resolving its source, or
-    /// reading its `debian/control`.
-    pub commit: String,
+    /// What the component's source resolved to, recorded even though the build
+    /// failed so the manifest can name the exact input. Empty for a component
+    /// that failed before it had one — resolving its source, or reading its
+    /// `debian/control`.
+    pub source: Fingerprint,
     /// The error that ended the component.
     pub error: Error,
 }
@@ -736,7 +826,7 @@ impl RunReport {
     /// skipped everything produced nothing, while the tree still holds whatever
     /// the runs before it built.
     pub fn artifact_count(&self) -> usize {
-        self.built.iter().map(|built| built.artifacts).sum()
+        self.built.iter().map(|built| built.artifacts.len()).sum()
     }
 
     /// How many components were skipped for `reason`.
@@ -753,7 +843,7 @@ impl RunReport {
 }
 
 /// The result of [`Engine::plan`]: the build order and each component's
-/// resolved commit and build-dependencies, with nothing built.
+/// resolved source and build-dependencies, with nothing built.
 #[derive(Debug)]
 pub struct PlanReport {
     /// The build order.
@@ -767,8 +857,8 @@ pub struct PlanReport {
 pub struct PlannedComponent {
     /// The component name.
     pub name: String,
-    /// The commit the component's source resolved to.
-    pub commit: String,
+    /// What the component's source resolved to.
+    pub source: Fingerprint,
     /// The build-dependency package names, from `debian/control` plus the
     /// recipe's `extra-build-deps`.
     pub build_deps: Vec<String>,
@@ -783,7 +873,10 @@ pub struct PlannedComponent {
 /// fail to resolve and leave the list.
 struct Resolved<'a> {
     component: &'a Component,
-    source: ResolvedSource,
+    /// The tree that holds the component's `debian/` directory.
+    tree: PathBuf,
+    /// What the tree was resolved from.
+    source: Fingerprint,
     control: String,
 }
 
@@ -890,22 +983,42 @@ impl Engine {
         reporter(Progress::Started);
 
         // 1. Settle everything the run's own arguments decide, before it spends
-        //    anything on the network or the archive. Both are usage errors — a
-        //    `--only` naming a component the recipe does not have, or a target
-        //    suite with no version tag — and both are answerable from
-        //    `recipe.toml` alone, so neither costs the run a single clone.
+        //    anything on the network or the archive. Each is a usage error — a
+        //    `--only` naming a component the recipe does not have, a target
+        //    suite with no version tag, a build date to be taken from a manifest
+        //    that records none — and each is answerable from `recipe.toml` and a
+        //    file already on disk, so none costs the run a single clone.
         options.selection.validate(recipe)?;
+        // A prior run's manifest carries the state `--skip-published` consults,
+        // the date `BuildDate::Recorded` reproduces, and the records this run
+        // folds forward so untouched components stay recorded. The manifest is
+        // the one for this recipe at this suite and architecture, so a work
+        // directory shared with another recipe — or with the same recipe
+        // targeted elsewhere — neither loses its provenance nor offers records
+        // of packages that were never built for this target.
+        let manifest_path = manifest::manifest_path(
+            &self.work_dir,
+            &recipe.name,
+            &recipe.suite,
+            &recipe.architecture,
+        );
+        let prior = Manifest::load(&manifest_path)?;
         // One stamp for the whole run, so every package it produces carries the
         // same build date however long the run takes or however many components
         // build at once. A validated recipe always resolves a tag, but a caller
         // may replace the suite after that validation, so this is checked and not
         // assumed.
-        let stamp =
-            crate::version::BuildStamp::now(recipe.resolved_version_tag().ok_or_else(|| {
-                Error::VersionTag {
-                    suite: recipe.suite.clone(),
-                }
-            })?);
+        let tag = recipe
+            .resolved_version_tag()
+            .ok_or_else(|| Error::VersionTag {
+                suite: recipe.suite.clone(),
+            })?;
+        let stamp = build_stamp(tag, options.build_date, prior.as_ref())?;
+        if options.build_date != BuildDate::Now {
+            reporter(Progress::BuildDate {
+                date: &stamp.calendar_date(),
+            });
+        }
 
         // 2. Resolve each component's source, read its control, and order the
         //    build. A component that will not resolve ends the run only when the
@@ -925,7 +1038,7 @@ impl Engine {
             failed: unresolved,
             excused,
         } = self.resolve_and_order(recipe, &decide, &options.cancel, reporter)?;
-        report_foreign_architecture(recipe, reporter);
+        report_architecture(recipe, reporter);
         let resolved: BTreeMap<&str, &Resolved> =
             trees.iter().map(|entry| (entry.name(), entry)).collect();
 
@@ -955,21 +1068,13 @@ impl Engine {
             recipe.architecture.clone(),
         );
 
-        // 4. Decide which components to build. A prior run's manifest carries the
-        //    state `--skip-published` consults and is folded back into this run's
-        //    manifest so untouched components stay recorded. The manifest is the
-        //    one for this recipe at this suite and architecture, so a work
-        //    directory shared with another recipe — or with the same recipe
-        //    targeted elsewhere — neither loses its provenance nor offers records
-        //    of packages that were never built for this target.
-        let manifest_path = manifest::manifest_path(
-            &self.work_dir,
-            &recipe.name,
-            &recipe.suite,
-            &recipe.architecture,
-        );
-        let (prior_sandbox, prior_records) = match Manifest::load(&manifest_path)? {
+        // 4. Decide which components to build, from the prior manifest read at
+        //    the start of the run: it is what `--skip-published` consults, and
+        //    what this run's manifest folds forward so untouched components stay
+        //    recorded.
+        let (prior_build_date, prior_sandbox, prior_records) = match prior {
             Some(manifest) => (
+                manifest.build_date,
                 manifest.sandbox,
                 manifest
                     .components
@@ -977,7 +1082,11 @@ impl Engine {
                     .map(|record| (record.name.clone(), record))
                     .collect(),
             ),
-            None => (None, BTreeMap::<String, manifest::ComponentRecord>::new()),
+            None => (
+                None,
+                None,
+                BTreeMap::<String, manifest::ComponentRecord>::new(),
+            ),
         };
 
         let builder = Builder::new(
@@ -986,16 +1095,26 @@ impl Engine {
         );
         let out_root =
             crate::build::output_dir(&self.work_dir, &recipe.suite, &recipe.architecture);
+        // Which binary packages each component's build produces. Unless the
+        // recipe hands its arch-indep output to another architecture, that is
+        // all of them, which is what a single-architecture build wants.
+        let owns_arch_indep = recipe.owns_arch_indep();
+        let binaries = if owns_arch_indep {
+            Binaries::All
+        } else {
+            Binaries::ArchitectureDependent
+        };
         let mut items: Vec<WorkItem> = Vec::new();
         let mut skipped: Vec<Skipped> = excused;
         for name in graph.order() {
             let entry = resolved[name.as_str()];
             if let Some(reason) = skip_reason(
                 name,
-                &entry.source.commit,
+                &entry.source,
                 options,
                 &selected,
                 &prior_records,
+                owns_arch_indep || plan::has_architecture_dependent_packages(&entry.control),
             ) {
                 reporter(Progress::Skipped {
                     component: name,
@@ -1003,7 +1122,7 @@ impl Engine {
                 });
                 skipped.push(Skipped {
                     component: name.clone(),
-                    commit: entry.source.commit.clone(),
+                    source: entry.source.clone(),
                     reason,
                 });
                 continue;
@@ -1014,8 +1133,9 @@ impl Engine {
             items.push(WorkItem {
                 name,
                 component,
-                tree: &entry.source.tree,
-                commit: &entry.source.commit,
+                tree: &entry.tree,
+                source: &entry.source,
+                binaries,
                 build_deps,
                 stamp: &stamp,
                 suite: &recipe.suite,
@@ -1023,12 +1143,19 @@ impl Engine {
             });
         }
 
-        // 5. The last thing the run's own arguments can get wrong, and the last
-        //    that costs nothing to check: a selection that leaves out a component
-        //    producing a build-dependency of one it selected. The pool answers it
+        // 5. The last thing the run's own arrangement can get wrong, and the last
+        //    that costs nothing to check: a component the run leaves out that
+        //    produces a build-dependency of one it builds. The pool answers it
         //    from a file, where provisioning would answer it only after the
         //    shared base is bootstrapped, in the provisioner's vocabulary.
-        refuse_unbuildable_selection(&items, &graph, &selected, &options.selection, &pool)?;
+        refuse_unbuildable_run(
+            &items,
+            &graph,
+            &skipped,
+            &options.selection,
+            recipe.resolved_arch_indep_owner(),
+            &pool,
+        )?;
 
         // 6. Provisioner. Prefer layered provisioning — one shared base plus a
         //    disposable per-component overlay — when the host supports an
@@ -1131,13 +1258,13 @@ impl Engine {
 
         // A cancelled run stops before reaching every component it selected.
         // Record those, and the one it stopped partway through, so the manifest
-        // keeps the commit each resolved to and the summary accounts for them
-        // rather than passing over them in silence.
+        // keeps what each resolved to and the summary accounts for them rather
+        // than passing over them in silence.
         let cancelled = options.cancel.requested();
         if cancelled {
             reporter(Progress::Cancelled);
-            let selected: Vec<(&str, &str)> =
-                items.iter().map(|item| (item.name, item.commit)).collect();
+            let selected: Vec<(&str, &Fingerprint)> =
+                items.iter().map(|item| (item.name, item.source)).collect();
             skipped.extend(unfinished(&selected, &built, &failed));
         }
         // The skipped were collected in three passes — the components that never
@@ -1158,8 +1285,17 @@ impl Engine {
         };
         // Record the run's provenance last, once every outcome is known, folding
         // in prior records for components this run did not touch.
-        manifest_for_run(recipe, &report, &prior_records)
+        // The run's own date when it built something, and the prior one when it
+        // did not — the same carry-forward the sandbox record gets, and for the
+        // same reason: the packages this manifest still calls built were stamped
+        // with that date.
+        let build_date = match report.built.is_empty() {
+            false => Some(stamp.calendar_date()),
+            true => prior_build_date,
+        };
+        manifest_for_run(recipe, &report, &prior_records, &self.work_dir)
             .with_sandbox(sandbox)
+            .with_build_date(build_date)
             .write(&report.manifest_path)?;
         reporter(Progress::Manifest {
             path: &report.manifest_path,
@@ -1169,7 +1305,7 @@ impl Engine {
 
     /// Resolves sources and computes the build order without building anything,
     /// returning a [`PlanReport`] of the order and each component's resolved
-    /// commit and build-dependencies.
+    /// source and build-dependencies.
     ///
     /// Like the start of [`run`](Self::run), this clones or fetches every
     /// component's source, because the build order is read from each
@@ -1194,7 +1330,7 @@ impl Engine {
         reporter(Progress::Started);
         let Resolution { trees, graph, .. } =
             self.resolve_and_order(recipe, &|_| OnUnresolved::Fatal, cancel, reporter)?;
-        report_foreign_architecture(recipe, reporter);
+        report_architecture(recipe, reporter);
         let resolved: BTreeMap<&str, &Resolved> =
             trees.iter().map(|entry| (entry.name(), entry)).collect();
 
@@ -1207,7 +1343,7 @@ impl Engine {
                 build_deps.extend(entry.component.extra_build_deps.iter().cloned());
                 PlannedComponent {
                     name: name.clone(),
-                    commit: entry.source.commit.clone(),
+                    source: entry.source.clone(),
                     build_deps,
                 }
             })
@@ -1240,7 +1376,9 @@ impl Engine {
         cancel: &Cancel,
         reporter: &mut dyn FnMut(Progress),
     ) -> Result<Resolution<'a>> {
-        let resolver = SourceResolver::new(self.work_dir.join("sources"));
+        // The recipe's own directory, so a relative `source.path` resolves
+        // against the recipe rather than against wherever src2deb was invoked.
+        let resolver = SourceResolver::new(self.work_dir.join("sources"), recipe.dir());
 
         let mut trees: Vec<Resolved> = Vec::new();
         let mut failed: Vec<Failed> = Vec::new();
@@ -1254,14 +1392,15 @@ impl Engine {
             reporter(Progress::Resolving {
                 component: &component.name,
             });
-            let outcome = resolver.resolve(component).and_then(|source| {
-                let control = plan::read_control(&component.name, &source.tree)?;
-                Ok((source, control))
+            let outcome = resolver.resolve(component).and_then(|resolved| {
+                let control = plan::read_control(&component.name, &resolved.tree)?;
+                Ok((resolved, control))
             });
             let error = match outcome {
-                Ok((source, control)) => {
+                Ok((ResolvedSource { tree, source }, control)) => {
                     trees.push(Resolved {
                         component,
+                        tree,
                         source,
                         control,
                     });
@@ -1278,9 +1417,9 @@ impl Engine {
                     });
                     failed.push(Failed {
                         component: component.name.clone(),
-                        // No commit: the failure is that there is no checkout to
-                        // read one from.
-                        commit: String::new(),
+                        // No source: the failure is that there is no resolved
+                        // tree to name one from.
+                        source: Fingerprint::none(),
                         error,
                     });
                 }
@@ -1291,7 +1430,7 @@ impl Engine {
                     });
                     excused.push(Skipped {
                         component: component.name.clone(),
-                        commit: String::new(),
+                        source: Fingerprint::none(),
                         reason: SkipReason::NotSelected,
                     });
                 }
@@ -1586,7 +1725,12 @@ struct WorkItem<'a> {
     name: &'a str,
     component: &'a Component,
     tree: &'a Path,
-    commit: &'a str,
+    source: &'a Fingerprint,
+    /// Which of the component's binary packages this run builds. Run-level, not
+    /// per component: it follows from which architecture owns the recipe's
+    /// arch-indep output, and a component with nothing left to build under it is
+    /// skipped rather than given a different setting.
+    binaries: Binaries,
     build_deps: Vec<String>,
     /// The run's build stamp and the suite it targets, from which this
     /// component's `debian/changelog` entry is rendered when its build starts.
@@ -1612,7 +1756,7 @@ impl WorkItem<'_> {
     /// not open with a well-formed entry, which is a failure of this component
     /// and not of the run: the error travels the same path a build failure does.
     fn changelog_entry(&self) -> Result<String> {
-        crate::version::stamped_entry(self.name, self.tree, self.stamp, self.suite, self.commit)
+        crate::version::stamped_entry(self.name, self.tree, self.stamp, self.suite, self.source)
     }
 
     /// What the build passes need to know about this component, given the
@@ -1621,18 +1765,20 @@ impl WorkItem<'_> {
         Target {
             component: self.name,
             tree: self.tree,
-            commit: self.commit,
+            commit: self.source.git_commit(),
             changelog_entry: Some(changelog_entry),
+            binaries: self.binaries,
         }
     }
 
-    /// The [`Built`] record for this component from its produced artifacts.
-    fn built(&self, artifacts: &[Artifact]) -> Built {
+    /// The [`Built`] record for this component from what its build produced.
+    fn built(&self, artifacts: Vec<Artifact>, buildinfo: Option<BuildInfo>) -> Built {
         Built {
             component: self.name.to_string(),
-            commit: self.commit.to_string(),
-            artifacts: artifacts.len(),
-            packages: packages_of(artifacts),
+            source: self.source.clone(),
+            packages: packages_of(&artifacts),
+            artifacts,
+            buildinfo,
         }
     }
 
@@ -1640,7 +1786,7 @@ impl WorkItem<'_> {
     fn failed(&self, error: Error) -> Failed {
         Failed {
             component: self.name.to_string(),
-            commit: self.commit.to_string(),
+            source: self.source.clone(),
             error,
         }
     }
@@ -1667,7 +1813,8 @@ impl Outcomes {
     /// Records a component's successful build at build-order `position`.
     fn keep(&mut self, position: usize, item: &WorkItem, outcome: BuildOutcome) {
         self.keep_sandbox(position, SandboxRecord::of(item.name, &outcome.inputs));
-        self.built.push(item.built(&outcome.artifacts));
+        self.built
+            .push(item.built(outcome.artifacts, outcome.buildinfo));
     }
 
     /// Keeps `record` when `position` is earlier in build order than whatever
@@ -1687,16 +1834,67 @@ impl Outcomes {
     }
 }
 
-/// Reports [`Progress::ForeignArchitecture`] when the recipe's target does not
-/// run natively on the host, so a cross-architecture build is announced before
-/// provisioning rather than surfacing only as a binfmt error deep in the
-/// bootstrap. ferroday-cage still enforces the actual binfmt requirement.
-fn report_foreign_architecture(recipe: &Recipe, reporter: &mut dyn FnMut(Progress)) {
+/// The stamp a run's versions carry: `tag`, dated as `date` asks.
+///
+/// [`BuildDate::Recorded`] takes the date from `prior`, the manifest for this
+/// recipe, suite, and architecture. A manifest that records none — no run
+/// against this work directory has built anything for this target — is
+/// [`Error::BuildDate`] rather than a silent fall back to today, which would
+/// produce a build that looks like a reproduction and is not.
+fn build_stamp(
+    tag: &str,
+    date: BuildDate,
+    prior: Option<&Manifest>,
+) -> Result<crate::version::BuildStamp> {
+    use crate::version::BuildStamp;
+
+    match date {
+        BuildDate::Now => Ok(BuildStamp::now(tag)),
+        BuildDate::At(seconds) => Ok(BuildStamp::at(tag, seconds)),
+        BuildDate::Recorded => {
+            let recorded = prior.and_then(|manifest| manifest.build_date.as_deref());
+            let Some(recorded) = recorded else {
+                return Err(Error::BuildDate(
+                    "the build date was to be taken from the prior manifest, and none \
+                     records one; the work directory holds no build of this recipe for \
+                     this suite and architecture"
+                        .to_string(),
+                ));
+            };
+            // Written by a `BuildStamp`, so it parses — but the manifest is a
+            // file on disk that anything may have edited, and a date that does
+            // not parse must not be rounded off to today.
+            let seconds = crate::version::epoch_at_date(recorded).ok_or_else(|| {
+                Error::BuildDate(format!(
+                    "the prior manifest records build-date {recorded:?}, which is not a \
+                     YYYY-MM-DD date"
+                ))
+            })?;
+            Ok(BuildStamp::at(tag, seconds))
+        }
+    }
+}
+
+/// Reports what the run's target architecture means for it, before anything is
+/// provisioned.
+///
+/// [`Progress::ForeignArchitecture`] when the target does not run natively on
+/// the host, so a cross-architecture build is announced rather than surfacing
+/// only as a binfmt error deep in the bootstrap; ferroday-cage still enforces
+/// the actual binfmt requirement. [`Progress::ArchIndepElsewhere`] when the
+/// recipe hands its `Architecture: all` packages to another architecture, so a
+/// run that will produce fewer packages than its recipe declares says so first.
+fn report_architecture(recipe: &Recipe, reporter: &mut dyn FnMut(Progress)) {
     let host = crate::arch::host_architecture();
     if crate::arch::is_foreign(&host, &recipe.architecture) {
         reporter(Progress::ForeignArchitecture {
             target: &recipe.architecture,
             host: &host,
+        });
+    }
+    if !recipe.owns_arch_indep() {
+        reporter(Progress::ArchIndepElsewhere {
+            owner: recipe.resolved_arch_indep_owner(),
         });
     }
 }
@@ -1731,9 +1929,13 @@ fn in_build_order<T>(
 ///
 /// That covers both the components the run never reached and the one it stopped
 /// partway through — from the outside they are the same thing, a selected
-/// component with no outcome, and both are recorded with the commit their
-/// source resolved to so the manifest keeps naming the exact input.
-fn unfinished(selected: &[(&str, &str)], built: &[Built], failed: &[Failed]) -> Vec<Skipped> {
+/// component with no outcome, and both are recorded with what their source
+/// resolved to so the manifest keeps naming the exact input.
+fn unfinished(
+    selected: &[(&str, &Fingerprint)],
+    built: &[Built],
+    failed: &[Failed],
+) -> Vec<Skipped> {
     let reached: BTreeSet<&str> = built
         .iter()
         .map(|built| built.component.as_str())
@@ -1742,98 +1944,131 @@ fn unfinished(selected: &[(&str, &str)], built: &[Built], failed: &[Failed]) -> 
     selected
         .iter()
         .filter(|(name, _)| !reached.contains(name))
-        .map(|(name, commit)| Skipped {
+        .map(|(name, source)| Skipped {
             component: name.to_string(),
-            commit: commit.to_string(),
+            source: (*source).clone(),
             reason: SkipReason::Cancelled,
         })
         .collect()
 }
 
-/// Refuses a selection that leaves out a component producing a
-/// build-dependency of one it selected, when the pool does not already hold that
+/// Refuses a run that builds a component whose build-dependency is produced by
+/// a component the run leaves out, when the pool does not already hold that
 /// package.
 ///
-/// `--only` and `--from` both narrow a run to part of its recipe, and both carry
-/// the same condition: whatever the selected components build-depend on has to
-/// come from somewhere. An archive package comes from the archive; a package
-/// another component of the recipe produces comes from the pool, and is there
-/// only because an earlier run put it there. Left unchecked, the mismatch
-/// surfaces when the consumer's build root is provisioned — after a shared base
-/// of several hundred packages, and phrased as a resolver failure rather than as
-/// the selection error it is.
+/// Whatever the components being built depend on has to come from somewhere. An
+/// archive package comes from the archive; a package another component of the
+/// recipe produces comes from the pool, and is there only because an earlier run
+/// put it there. Left unchecked, the mismatch surfaces when the consumer's build
+/// root is provisioned — after a shared base of several hundred packages, and
+/// phrased as a resolver failure rather than as the arrangement error it is.
 ///
 /// Everything the check needs is settled before any of that: the graph knows
-/// which component produces the package, the selection knows it was left out,
-/// and the pool's index is a file on disk.
+/// which component produces the package, `skipped` knows the run left it out and
+/// why, and the pool's index is a file on disk.
 ///
-/// Only components excluded by the *selection* are grounds for refusal. A
-/// producer that is selected but skipped as already built has its packages in
-/// the pool — that is what made it skippable — and one that failed to resolve
-/// produces nothing the graph knows about, so neither reaches this check. That
-/// keeps a `--keep-going` run's tolerance intact: a component the run has
-/// already given up on cannot then end it.
-fn refuse_unbuildable_selection(
+/// Two reasons for a producer's absence are grounds for refusal, and each names
+/// its own remedy: the selection left it out, or the recipe leaves its
+/// `Architecture: all` output to another architecture. A producer skipped as
+/// already built is not, because its packages are in the pool — that is what
+/// made it skippable — and one that failed to resolve produces nothing the graph
+/// knows about, so it never reaches here. That keeps a `--keep-going` run's
+/// tolerance intact: a component the run has already given up on cannot then end
+/// it.
+fn refuse_unbuildable_run(
     items: &[WorkItem],
     graph: &BuildGraph,
-    selected: &BTreeSet<&str>,
+    skipped: &[Skipped],
     selection: &Selection,
+    arch_indep_owner: &str,
     pool: &LocalPool,
 ) -> Result<()> {
-    // (consumer, build-dependency, producer) for every in-set dependency this
-    // run's selection leaves nothing to produce.
-    let unselected: Vec<(&str, &str, &str)> = items
+    let absent: BTreeMap<&str, SkipReason> = skipped
+        .iter()
+        .map(|skipped| (skipped.component.as_str(), skipped.reason))
+        .collect();
+    // (consumer, build-dependency, producer, why the producer is absent) for
+    // every in-set dependency this run leaves nothing to produce.
+    let unproduced: Vec<(&str, &str, &str, SkipReason)> = items
         .iter()
         .flat_map(|item| {
-            item.build_deps.iter().filter_map(move |dep| {
+            item.build_deps.iter().filter_map(|dep| {
                 let producer = graph.producer(dep)?;
-                (producer != item.name && !selected.contains(producer)).then_some((
-                    item.name,
-                    dep.as_str(),
-                    producer,
-                ))
+                if producer == item.name {
+                    return None;
+                }
+                let reason = absent.get(producer).copied()?;
+                matches!(
+                    reason,
+                    SkipReason::NotSelected | SkipReason::ArchIndepElsewhere
+                )
+                .then_some((item.name, dep.as_str(), producer, reason))
             })
         })
         .collect();
-    if unselected.is_empty() {
+    if unproduced.is_empty() {
         return Ok(());
     }
 
     // Read the index only once something might be missing from it, so an
     // ordinary run never touches it.
     let indexed = pool.indexed_packages()?;
-    let Some((consumer, dep, producer)) = unselected
+    let Some((consumer, dep, producer, reason)) = unproduced
         .into_iter()
-        .find(|(_, dep, _)| !indexed.contains(*dep))
+        .find(|(_, dep, _, _)| !indexed.contains(*dep))
     else {
         return Ok(());
     };
-    Err(Error::Selection(format!(
-        "{flag} builds {consumer:?}, which build-depends on {dep:?}; that package is \
-         produced by component {producer:?}, which {flag} leaves out and the pool does \
-         not hold. Select {producer:?} as well, or build it first",
-        flag = selection.flag(),
+    // Why the producer is absent, and what settles it — the two halves that
+    // differ by reason, in a sentence that is otherwise the same either way.
+    let (absence, remedy) = match reason {
+        SkipReason::ArchIndepElsewhere => (
+            format!(
+                "produces only Architecture: all packages, left to \
+                 {arch_indep_owner:?} by this recipe"
+            ),
+            format!("Build for {arch_indep_owner:?} first, or stop naming an arch-indep owner"),
+        ),
+        _ => (
+            format!("{flag} leaves out", flag = selection.flag()),
+            format!("Select {producer:?} as well, or build it first"),
+        ),
+    };
+    Err(Error::BuildDependency(format!(
+        "this run builds {consumer:?}, which build-depends on {dep:?}; that package is \
+         produced by component {producer:?}, which {absence}, and the pool does not hold \
+         it. {remedy}"
     )))
 }
 
-/// Why `name` (resolved to `commit`) should be skipped this run, or `None` to
-/// build it. A component outside the selection is skipped; a selected one is
-/// skipped only under `--skip-published` when a prior run recorded it as built at
-/// the same commit.
+/// Why `name` (resolved to `source`) should be skipped this run, or `None` to
+/// build it.
+///
+/// A component outside the selection is skipped. So is one with `nothing_to
+/// _build` — a component whose every binary package is `Architecture: all`
+/// where the recipe hands arch-indep output elsewhere — which outranks
+/// `--skip-published`, because it is a property of the run's target rather than
+/// of what a prior run happened to do. Otherwise a selected component is skipped
+/// only under `--skip-published`, and only when a prior run recorded it as built
+/// from the same source.
 fn skip_reason(
     name: &str,
-    commit: &str,
+    source: &Fingerprint,
     options: &RunOptions,
     selected: &BTreeSet<&str>,
     prior: &BTreeMap<String, manifest::ComponentRecord>,
+    has_anything_to_build: bool,
 ) -> Option<SkipReason> {
     if !selected.contains(name) {
         return Some(SkipReason::NotSelected);
     }
+    if !has_anything_to_build {
+        return Some(SkipReason::ArchIndepElsewhere);
+    }
     if options.skip_published
         && prior
             .get(name)
-            .is_some_and(|record| record.is_built_at(commit))
+            .is_some_and(|record| record.is_built_at(source))
     {
         return Some(SkipReason::AlreadyBuilt);
     }
@@ -1844,10 +2079,14 @@ fn skip_reason(
 /// this run's outcome, or carried forward from `prior` when the run did not
 /// touch it — so a built component stays recorded as built across selective runs
 /// and the manifest describes the whole recipe, not just what this run built.
+///
+/// `work_dir` anchors the paths the manifest names, which are recorded relative
+/// to it.
 fn manifest_for_run(
     recipe: &Recipe,
     report: &RunReport,
     prior: &BTreeMap<String, manifest::ComponentRecord>,
+    work_dir: &Path,
 ) -> Manifest {
     let built: BTreeMap<&str, &Built> = report
         .built
@@ -1873,8 +2112,13 @@ fn manifest_for_run(
             if let Some(built) = built.get(key) {
                 manifest::ComponentRecord {
                     name: name.clone(),
-                    commit: built.commit.clone(),
                     status: manifest::STATUS_BUILT.to_string(),
+                    error: None,
+                    buildinfo: built
+                        .buildinfo
+                        .as_ref()
+                        .map(|buildinfo| manifest::BuildInfoRecord::of(buildinfo, work_dir)),
+                    source: built.source.clone(),
                     packages: built
                         .packages
                         .iter()
@@ -1883,15 +2127,16 @@ fn manifest_for_run(
                             version: package.version.clone(),
                         })
                         .collect(),
-                    error: None,
                 }
             } else if let Some(failed) = failed.get(key) {
                 manifest::ComponentRecord {
                     name: name.clone(),
-                    commit: failed.commit.clone(),
                     status: manifest::STATUS_FAILED.to_string(),
-                    packages: Vec::new(),
                     error: Some(failed.error.to_string()),
+                    // A failed build produced no packages to record one for.
+                    buildinfo: None,
+                    source: failed.source.clone(),
+                    packages: Vec::new(),
                 }
             } else if let Some(prior) = prior.get(name) {
                 // Skipped, but recorded before: keep the prior record so a
@@ -1901,13 +2146,14 @@ fn manifest_for_run(
                 // Skipped and never recorded (for example `--only` on a fresh pool).
                 manifest::ComponentRecord {
                     name: name.clone(),
-                    commit: skipped
-                        .get(key)
-                        .map(|s| s.commit.clone())
-                        .unwrap_or_default(),
                     status: manifest::STATUS_SKIPPED.to_string(),
-                    packages: Vec::new(),
                     error: None,
+                    buildinfo: None,
+                    source: skipped
+                        .get(key)
+                        .map(|skipped| skipped.source.clone())
+                        .unwrap_or_default(),
+                    packages: Vec::new(),
                 }
             }
         })
@@ -1960,6 +2206,7 @@ mod tests {
     fn describe(event: &Progress) -> String {
         match event {
             Progress::Started => "Started".to_string(),
+            Progress::BuildDate { date } => format!("BuildDate {date}"),
             Progress::Resolving { component } => format!("Resolving {component}"),
             Progress::Unresolved { component, error } => {
                 format!("Unresolved {component} {error}")
@@ -1968,6 +2215,7 @@ mod tests {
             Progress::ForeignArchitecture { target, host } => {
                 format!("ForeignArchitecture {target} {host}")
             }
+            Progress::ArchIndepElsewhere { owner } => format!("ArchIndepElsewhere {owner}"),
             Progress::Layered => "Layered".to_string(),
             Progress::OverlayUnavailable { reason } => format!("OverlayUnavailable {reason}"),
             Progress::Provisioning { component } => {
@@ -2040,6 +2288,7 @@ mod tests {
     fn every_progress_event_survives_the_owned_round_trip() {
         let order = order(&["a", "b"]);
         assert_round_trips(Progress::Started);
+        assert_round_trips(Progress::BuildDate { date: "2026-07-31" });
         assert_round_trips(Progress::Resolving { component: "a" });
         assert_round_trips(Progress::Unresolved {
             component: "a",
@@ -2050,6 +2299,7 @@ mod tests {
             target: "arm64",
             host: "amd64",
         });
+        assert_round_trips(Progress::ArchIndepElsewhere { owner: "amd64" });
         assert_round_trips(Progress::Layered);
         assert_round_trips(Progress::OverlayUnavailable { reason: "no idmap" });
         // Both roots a provisioning event can name: the shared base, and a
@@ -2134,14 +2384,31 @@ mod tests {
     fn built_record(name: &str, commit: &str) -> ComponentRecord {
         ComponentRecord {
             name: name.to_string(),
-            commit: commit.to_string(),
             status: STATUS_BUILT.to_string(),
+            error: None,
+            buildinfo: None,
+            source: git(commit),
             packages: vec![PackageRecord {
                 name: name.to_string(),
                 version: "1.0".to_string(),
             }],
-            error: None,
         }
+    }
+
+    /// A git source at `commit`, the shape the resolver produces.
+    fn git(commit: &str) -> Fingerprint {
+        Fingerprint::of(crate::fingerprint::SourceInput::git(commit))
+    }
+
+    /// `count` stand-in artifacts, for a report whose test only counts them.
+    fn artifacts(count: usize) -> Vec<Artifact> {
+        (0..count)
+            .map(|n| Artifact {
+                package: format!("pkg-{n}"),
+                version: "1.0".to_string(),
+                path: PathBuf::from(format!("/out/pkg-{n}_1.0_amd64.deb")),
+            })
+            .collect()
     }
 
     #[test]
@@ -2234,34 +2501,84 @@ mod tests {
         .unwrap();
         let stamp = crate::version::BuildStamp::at("deb13", 0);
         let out_root = PathBuf::from("/out");
+        let source = git("abc");
         let items = [WorkItem {
             name: "pkg-b",
             component: &recipe.components[1],
             tree: Path::new("/sources/pkg-b"),
-            commit: "abc",
+            source: &source,
+            binaries: Binaries::All,
             build_deps: vec!["debhelper".to_string(), "liba-dev".to_string()],
             stamp: &stamp,
             suite: "trixie",
             out_root: &out_root,
         }];
         let selection = Selection::Only(vec!["pkg-b".to_string()]);
-        let only_b: BTreeSet<&str> = ["pkg-b"].into_iter().collect();
+        // pkg-a is the producer the run leaves out, and why decides the remedy
+        // the message offers.
+        let left_out = |reason| {
+            vec![Skipped {
+                component: "pkg-a".to_string(),
+                source: git("abc"),
+                reason,
+            }]
+        };
 
         // An empty pool: nothing supplies liba-dev, so the run is refused —
         // and the message names the component to add rather than the package
         // the provisioner would later fail to resolve.
         let empty = LocalPool::new(scratch("empty-pool"), "trixie", "main", "amd64");
-        let err =
-            refuse_unbuildable_selection(&items, &graph, &only_b, &selection, &empty).unwrap_err();
+        let err = refuse_unbuildable_run(
+            &items,
+            &graph,
+            &left_out(SkipReason::NotSelected),
+            &selection,
+            "amd64",
+            &empty,
+        )
+        .unwrap_err();
         let message = format!("{err}");
-        assert!(matches!(err, Error::Selection(_)));
+        assert!(matches!(err, Error::BuildDependency(_)));
         for expected in ["--only", "\"pkg-b\"", "\"liba-dev\"", "\"pkg-a\""] {
             assert!(message.contains(expected), "{message}");
         }
 
-        // Selecting the producer as well settles it.
-        let both: BTreeSet<&str> = ["pkg-a", "pkg-b"].into_iter().collect();
-        assert!(refuse_unbuildable_selection(&items, &graph, &both, &selection, &empty).is_ok());
+        // The same gap reached another way: the producer declares only
+        // `Architecture: all` packages and this architecture does not own them.
+        // The remedy is a different one, so the message names that instead of
+        // pointing at a selection flag nobody passed.
+        let err = refuse_unbuildable_run(
+            &items,
+            &graph,
+            &left_out(SkipReason::ArchIndepElsewhere),
+            &Selection::All,
+            "amd64",
+            &empty,
+        )
+        .unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("Architecture: all"), "{message}");
+        assert!(message.contains("\"amd64\""), "{message}");
+        assert!(!message.contains("--only"), "{message}");
+
+        // Building the producer settles it: nothing is skipped, so nothing is
+        // missing.
+        assert!(refuse_unbuildable_run(&items, &graph, &[], &selection, "amd64", &empty).is_ok());
+
+        // So does a producer skipped as already built, whose packages are in the
+        // pool — that is what made it skippable, and a `--keep-going` run must
+        // not be ended by a component it has already accounted for.
+        assert!(
+            refuse_unbuildable_run(
+                &items,
+                &graph,
+                &left_out(SkipReason::AlreadyBuilt),
+                &selection,
+                "amd64",
+                &empty,
+            )
+            .is_ok()
+        );
 
         // So does a pool that already holds the package, which is the state a
         // prior run leaves behind and what makes a narrow re-run work at all.
@@ -2270,7 +2587,17 @@ mod tests {
         std::fs::create_dir_all(&index).unwrap();
         std::fs::write(index.join("Packages"), "Package: liba-dev\nVersion: 1.0\n").unwrap();
         let warm = LocalPool::new(&dir, "trixie", "main", "amd64");
-        assert!(refuse_unbuildable_selection(&items, &graph, &only_b, &selection, &warm).is_ok());
+        assert!(
+            refuse_unbuildable_run(
+                &items,
+                &graph,
+                &left_out(SkipReason::NotSelected),
+                &selection,
+                "amd64",
+                &warm,
+            )
+            .is_ok()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2296,45 +2623,123 @@ mod tests {
 
         // Outside the selection: skipped regardless of the flag.
         assert_eq!(
-            skip_reason("b", "abc", &skip, &selected, &prior),
+            skip_reason("b", &git("abc"), &skip, &selected, &prior, true),
             Some(SkipReason::NotSelected)
         );
-        // Selected, --skip-published, prior built at the same commit: skipped.
+        // Selected, --skip-published, prior built from the same source: skipped.
         assert_eq!(
-            skip_reason("a", "abc", &skip, &selected, &prior),
+            skip_reason("a", &git("abc"), &skip, &selected, &prior, true),
             Some(SkipReason::AlreadyBuilt)
         );
         // Selected but the source moved: built.
-        assert_eq!(skip_reason("a", "moved", &skip, &selected, &prior), None);
+        assert_eq!(
+            skip_reason("a", &git("moved"), &skip, &selected, &prior, true),
+            None
+        );
         // Selected, no --skip-published: built even though the prior matches.
-        assert_eq!(skip_reason("a", "abc", &no_skip, &selected, &prior), None);
+        assert_eq!(
+            skip_reason("a", &git("abc"), &no_skip, &selected, &prior, true),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unpinned_source_is_built_every_run_even_under_skip_published() {
+        // There is nothing to compare: the record names where the tree was read
+        // from, not what it held. A prior record that matches exactly is still
+        // not evidence the source stood still.
+        let selected: BTreeSet<&str> = ["a"].into_iter().collect();
+        let working_tree =
+            Fingerprint::of(crate::fingerprint::SourceInput::path("/home/someone/a"));
+        let mut prior = BTreeMap::new();
+        prior.insert(
+            "a".to_string(),
+            ComponentRecord {
+                source: working_tree.clone(),
+                ..built_record("a", "unused")
+            },
+        );
+        let skip = RunOptions {
+            skip_published: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            skip_reason("a", &working_tree, &skip, &selected, &prior, true),
+            None
+        );
+    }
+
+    #[test]
+    fn a_component_with_nothing_but_arch_indep_packages_is_skipped_for_a_non_owner() {
+        // Its every binary package belongs to another architecture, so this run
+        // has nothing of it to build — and `dpkg-buildpackage -B` on such a
+        // source fails outright rather than producing an empty result.
+        let selected: BTreeSet<&str> = ["a"].into_iter().collect();
+        let mut prior = BTreeMap::new();
+        prior.insert("a".to_string(), built_record("a", "abc"));
+        let skip = RunOptions {
+            skip_published: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            skip_reason("a", &git("abc"), &skip, &selected, &prior, false),
+            Some(SkipReason::ArchIndepElsewhere),
+        );
+        // It outranks `--skip-published`, which would otherwise claim the
+        // component was skipped because a prior run had built it — a reason that
+        // says nothing about why this run could never build it.
+        assert_eq!(
+            skip_reason(
+                "a",
+                &git("abc"),
+                &RunOptions::default(),
+                &selected,
+                &prior,
+                false
+            ),
+            Some(SkipReason::ArchIndepElsewhere),
+        );
+        // Outside the selection still outranks both: it was never asked for.
+        assert_eq!(
+            skip_reason("z", &git("abc"), &skip, &selected, &prior, false),
+            Some(SkipReason::NotSelected),
+        );
     }
 
     #[test]
     fn a_cancelled_run_accounts_for_every_component_it_did_not_finish() {
-        let selected = [("a", "aaa"), ("b", "bbb"), ("c", "ccc"), ("d", "ddd")];
+        let sources: Vec<(&str, Fingerprint)> = ["aaa", "bbb", "ccc", "ddd"]
+            .iter()
+            .zip(["a", "b", "c", "d"])
+            .map(|(commit, name)| (name, git(commit)))
+            .collect();
+        let selected: Vec<(&str, &Fingerprint)> = sources
+            .iter()
+            .map(|(name, source)| (*name, source))
+            .collect();
         let built = vec![Built {
             component: "a".to_string(),
-            commit: "aaa".to_string(),
-            artifacts: 1,
+            source: git("aaa"),
+            artifacts: artifacts(1),
+            buildinfo: None,
             packages: Vec::new(),
         }];
         let failed = vec![Failed {
             component: "b".to_string(),
-            commit: "bbb".to_string(),
+            source: git("bbb"),
             error: Error::Plan("boom".to_string()),
         }];
 
         // `c` was the component the cancel stopped partway through and `d` was
         // never reached; neither has an outcome, so both are recorded as
-        // cancelled, in build order and keeping their resolved commits.
+        // cancelled, in build order and keeping the source each resolved to.
         let unfinished = unfinished(&selected, &built, &failed);
         let names: Vec<&str> = unfinished
             .iter()
             .map(|skipped| skipped.component.as_str())
             .collect();
         assert_eq!(names, ["c", "d"]);
-        assert_eq!(unfinished[0].commit, "ccc");
+        assert_eq!(unfinished[0].source, git("ccc"));
         assert!(
             unfinished
                 .iter()
@@ -2357,8 +2762,9 @@ mod tests {
             .iter()
             .map(|name| Built {
                 component: name.to_string(),
-                commit: "abc".to_string(),
-                artifacts: 1,
+                source: git("abc"),
+                artifacts: artifacts(1),
+                buildinfo: None,
                 packages: Vec::new(),
             })
             .collect();
@@ -2372,7 +2778,7 @@ mod tests {
             .iter()
             .map(|name| Failed {
                 component: name.to_string(),
-                commit: "abc".to_string(),
+                source: git("abc"),
                 error: Error::Plan("boom".to_string()),
             })
             .collect();
@@ -2421,11 +2827,12 @@ mod tests {
     fn a_run_that_finished_everything_has_nothing_to_account_for() {
         let built = vec![Built {
             component: "a".to_string(),
-            commit: "aaa".to_string(),
-            artifacts: 1,
+            source: git("aaa"),
+            artifacts: artifacts(1),
+            buildinfo: None,
             packages: Vec::new(),
         }];
-        assert!(unfinished(&[("a", "aaa")], &built, &[]).is_empty());
+        assert!(unfinished(&[("a", &git("aaa"))], &built, &[]).is_empty());
     }
 
     #[test]
@@ -2444,8 +2851,9 @@ mod tests {
             order: order(&["a", "b"]),
             built: vec![Built {
                 component: "b".to_string(),
-                commit: "def".to_string(),
-                artifacts: 1,
+                source: git("def"),
+                artifacts: artifacts(1),
+                buildinfo: None,
                 packages: vec![Package {
                     name: "b".to_string(),
                     version: "2.0".to_string(),
@@ -2454,7 +2862,7 @@ mod tests {
             failed: Vec::new(),
             skipped: vec![Skipped {
                 component: "a".to_string(),
-                commit: "abc".to_string(),
+                source: git("abc"),
                 reason: SkipReason::NotSelected,
             }],
             cancelled: false,
@@ -2462,14 +2870,87 @@ mod tests {
             manifest_path: PathBuf::from("/m"),
         };
 
-        let manifest = manifest_for_run(&recipe, &report, &prior);
+        let manifest = manifest_for_run(&recipe, &report, &prior, Path::new("/w"));
         let records = manifest.records_by_name();
         // a is carried forward from the prior run: still built at abc.
-        assert!(records["a"].is_built_at("abc"));
+        assert!(records["a"].is_built_at(&git("abc")));
         // b is recorded fresh from this run.
         assert_eq!(records["b"].status, STATUS_BUILT);
-        assert_eq!(records["b"].commit, "def");
+        assert_eq!(records["b"].source, git("def"));
         assert_eq!(records["b"].packages[0].version, "2.0");
+    }
+
+    #[test]
+    fn a_run_dates_its_versions_as_it_was_told_to() {
+        let seconds = crate::version::epoch_at_date("2026-07-31").unwrap();
+        // An explicit date is used as given.
+        let stamp = build_stamp("deb13", BuildDate::At(seconds), None).unwrap();
+        assert_eq!(stamp.date(), "20260731");
+
+        // A recorded date is taken from the manifest for this target, in the
+        // form that manifest writes it.
+        let prior = Manifest::new("r", "trixie", "amd64", Vec::new())
+            .with_build_date(Some("2026-07-31".to_string()));
+        let stamp = build_stamp("deb13", BuildDate::Recorded, Some(&prior)).unwrap();
+        assert_eq!(stamp.date(), "20260731");
+        assert_eq!(stamp.calendar_date(), "2026-07-31");
+    }
+
+    #[test]
+    fn a_recorded_date_that_is_not_there_fails_rather_than_falling_back_to_today() {
+        // Falling back would produce a build that looks like a reproduction of a
+        // recorded one and is not.
+        for prior in [
+            None,
+            // A manifest whose runs never built anything records no date.
+            Some(Manifest::new("r", "trixie", "amd64", Vec::new())),
+        ] {
+            let err = build_stamp("deb13", BuildDate::Recorded, prior.as_ref()).unwrap_err();
+            assert!(matches!(err, Error::BuildDate(_)), "{err}");
+            assert!(format!("{err}").contains("build date"), "{err}");
+        }
+
+        // Nor is a manifest edited to hold something that is not a date rounded
+        // off to one.
+        let prior = Manifest::new("r", "trixie", "amd64", Vec::new())
+            .with_build_date(Some("yesterday".to_string()));
+        let err = build_stamp("deb13", BuildDate::Recorded, Some(&prior)).unwrap_err();
+        assert!(format!("{err}").contains("YYYY-MM-DD"), "{err}");
+    }
+
+    #[test]
+    fn the_manifest_names_the_buildinfo_a_component_produced() {
+        let recipe: Recipe = toml::from_str(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"a\"\nsource.git = \"x\"\n",
+        )
+        .unwrap();
+        let report = RunReport {
+            order: order(&["a"]),
+            built: vec![Built {
+                component: "a".to_string(),
+                source: git("abc"),
+                artifacts: artifacts(1),
+                buildinfo: Some(BuildInfo {
+                    path: PathBuf::from("/w/out/trixie/amd64/a/a_1.0_amd64.buildinfo"),
+                    sha256: "abc123".to_string(),
+                }),
+                packages: Vec::new(),
+            }],
+            failed: Vec::new(),
+            skipped: Vec::new(),
+            cancelled: false,
+            out_dir: PathBuf::from("/w/out/trixie/amd64"),
+            manifest_path: PathBuf::from("/m"),
+        };
+
+        let manifest = manifest_for_run(&recipe, &report, &BTreeMap::new(), Path::new("/w"));
+        let buildinfo = manifest.records_by_name()["a"]
+            .buildinfo
+            .clone()
+            .expect("the record names the buildinfo");
+        assert_eq!(buildinfo.path, "out/trixie/amd64/a/a_1.0_amd64.buildinfo");
+        assert_eq!(buildinfo.sha256, "abc123");
     }
 
     #[test]
@@ -2484,7 +2965,7 @@ mod tests {
             built: Vec::new(),
             failed: vec![Failed {
                 component: "a".to_string(),
-                commit: "abc".to_string(),
+                source: git("abc"),
                 error: Error::Plan("boom".to_string()),
             }],
             skipped: Vec::new(),
@@ -2492,7 +2973,7 @@ mod tests {
             out_dir: PathBuf::from("/out"),
             manifest_path: PathBuf::from("/m"),
         };
-        let manifest = manifest_for_run(&recipe, &report, &BTreeMap::new());
+        let manifest = manifest_for_run(&recipe, &report, &BTreeMap::new(), Path::new("/w"));
         let records = manifest.records_by_name();
         assert_eq!(records["a"].status, STATUS_FAILED);
         assert!(records["a"].error.as_deref().unwrap().contains("boom"));

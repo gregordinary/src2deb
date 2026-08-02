@@ -1,8 +1,9 @@
 //! A build recipe: the components to build, and where their source comes from.
 //!
 //! A recipe is a TOML file, `recipe.toml`, in a recipe directory. It names a
-//! suite and architecture and lists components, each with a git source. See
-//! `recipes/cosmic-epoch/` for a worked example.
+//! suite and architecture and lists components, each with a source: a git
+//! repository to clone, or a tree already on disk. See `recipes/cosmic-epoch/`
+//! for a worked example.
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,15 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Recipe {
+    /// The directory the recipe was loaded from, which a relative
+    /// [`Source::path`] resolves against. See [`dir`](Self::dir).
+    ///
+    /// Set by [`load`](Self::load) rather than read from the file, so a recipe
+    /// cannot declare a directory other than the one it lives in. A recipe
+    /// deserialized directly carries none, and a relative `source.path` then
+    /// resolves against the process's working directory.
+    #[serde(skip)]
+    dir: PathBuf,
     /// The recipe name (for example `cosmic-epoch`).
     pub name: String,
     /// The Debian suite to build for (for example `trixie` or `forky`).
@@ -39,6 +49,22 @@ pub struct Recipe {
     /// natively wherever it runs; naming a foreign one builds through qemu.
     #[serde(default = "default_architecture")]
     pub architecture: String,
+    /// The architecture that produces this recipe's `Architecture: all`
+    /// packages, when one is named.
+    ///
+    /// An `Architecture: all` package's file name carries no architecture and
+    /// its stamped version does not vary with one, so building the recipe for
+    /// two architectures produces that package twice: the same name and version
+    /// over different bytes. Naming an owner settles which architecture makes
+    /// it, and every other one builds only its architecture-dependent packages.
+    ///
+    /// Unset, every run owns its own arch-indep output, which is the behaviour
+    /// a single-architecture build wants: its pool holds every package the
+    /// recipe produces and can be served as it stands. Name an owner when
+    /// several architectures feed one published archive. See
+    /// [`owns_arch_indep`](Self::owns_arch_indep).
+    #[serde(default)]
+    pub arch_indep_owner: Option<String>,
     /// The primary archive mirror. Defaults to the Debian CDN inside the
     /// provisioner when unset.
     #[serde(default)]
@@ -146,7 +172,25 @@ pub struct Component {
     /// The component name, unique within the recipe.
     pub name: String,
     /// Where the component's source comes from.
+    ///
+    /// Defaulted rather than required so that a component naming no origin is
+    /// refused by [`Recipe::load`] with the two settings that would fix it,
+    /// instead of by the parser with the name of a table.
+    #[serde(default)]
     pub source: Source,
+    /// Patch files applied over the resolved source tree, in the order given.
+    ///
+    /// Each is relative to the recipe's own directory ([`Recipe::dir`]), as
+    /// [`Source::path`] is, so a recipe carries its patches alongside it. The
+    /// series is applied before anything reads the tree, so a patch may change
+    /// `debian/control` and the build order follows the patched file.
+    ///
+    /// The series is a pinned input to the component's fingerprint: editing,
+    /// adding, removing, or reordering a patch changes what the component was
+    /// built from, so it is stamped into the version and triggers a rebuild
+    /// under `--skip-published`. See [`crate::fingerprint`].
+    #[serde(default)]
+    pub patches: Vec<PathBuf>,
     /// Extra build-dependency package names beyond those `debian/control`
     /// declares, given in the recipe as `extra-build-deps`. Rarely needed; most
     /// build-deps are discovered from control.
@@ -154,21 +198,78 @@ pub struct Component {
     pub extra_build_deps: Vec<String>,
 }
 
-/// A component's git source.
-#[derive(Debug, Clone, Deserialize)]
+/// Where a component's source comes from.
+///
+/// A component names exactly one origin — [`git`](Self::git) or
+/// [`path`](Self::path) — which [`Recipe::load`] enforces, so
+/// [`origin`](Self::origin) answers for a validated recipe. The remaining
+/// fields qualify whichever was named.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Source {
-    /// The git repository URL to clone.
-    pub git: String,
+    /// The git repository URL to clone. Exclusive with [`path`](Self::path).
+    #[serde(default)]
+    pub git: Option<String>,
     /// The branch, tag, or commit to check out. Defaults to the remote's
-    /// default branch when unset.
+    /// default branch when unset, and applies only to [`git`](Self::git).
     #[serde(default)]
     pub git_ref: Option<String>,
-    /// A subdirectory within the checkout that holds the `debian/` tree, for a
+    /// A tree already on disk, built without being cloned. Exclusive with
+    /// [`git`](Self::git).
+    ///
+    /// Relative to the recipe's own directory ([`Recipe::dir`]), so a recipe
+    /// kept beside the trees it builds names them relatively and moves with
+    /// them. An absolute path is used as it stands.
+    ///
+    /// A path is not a pinned input: it says where a tree was read from and
+    /// nothing about what it held. Builds from one are recorded as
+    /// unreproducible and are never skipped by `--skip-published`. See
+    /// [`crate::fingerprint`].
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// A subdirectory within the source that holds the `debian/` tree, for a
     /// component that lives inside a larger superproject or monorepo. The whole
-    /// checkout is the source tree when unset.
+    /// source is the tree when unset.
     #[serde(default)]
     pub subdir: Option<PathBuf>,
+}
+
+/// Where a component's source comes from, as a single choice rather than a set
+/// of fields that could contradict each other.
+///
+/// Produced by [`Source::origin`] once a recipe has been validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin<'a> {
+    /// A git repository, cloned under the work directory and checked out.
+    Git {
+        /// The repository URL.
+        url: &'a str,
+        /// The branch, tag, or commit to check out, or `None` to track the
+        /// remote's default branch.
+        git_ref: Option<&'a str>,
+    },
+    /// A tree already on disk, copied under the work directory as it stands.
+    Path(&'a Path),
+}
+
+impl Source {
+    /// Where this source comes from, or `None` when it names neither a git
+    /// repository nor a path.
+    ///
+    /// Never `None` for a validated recipe: [`Recipe::load`] refuses a
+    /// component that names no origin, and refuses one that names both, so
+    /// exactly one arm applies. A caller that builds a [`Source`] itself is
+    /// outside that guarantee, which is why this reports rather than asserts.
+    pub fn origin(&self) -> Option<Origin<'_>> {
+        match (&self.git, &self.path) {
+            (Some(url), None) => Some(Origin::Git {
+                url,
+                git_ref: self.git_ref.as_deref(),
+            }),
+            (None, Some(path)) => Some(Origin::Path(path)),
+            (Some(_), Some(_)) | (None, None) => None,
+        }
+    }
 }
 
 impl Recipe {
@@ -179,12 +280,25 @@ impl Recipe {
             path: path.clone(),
             reason: err.to_string(),
         })?;
-        let recipe: Recipe = toml::from_str(&text).map_err(|err| Error::Recipe {
+        let mut recipe: Recipe = toml::from_str(&text).map_err(|err| Error::Recipe {
             path: path.clone(),
             reason: err.to_string(),
         })?;
+        // Recorded from where the file was found rather than from anything in
+        // it, so a relative `source.path` resolves against the recipe's own
+        // directory. See [`Source::path`].
+        recipe.dir = dir.as_ref().to_path_buf();
         recipe.validate(&path)?;
         Ok(recipe)
+    }
+
+    /// The directory the recipe was loaded from.
+    ///
+    /// A relative [`Source::path`] resolves against it, so a recipe kept beside
+    /// the trees it builds names them relatively and moves with them. Empty for
+    /// a recipe that was not loaded from disk.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The version tag builds from this recipe carry: the explicit
@@ -203,11 +317,32 @@ impl Recipe {
             .or_else(|| crate::version::suite_tag(&self.suite))
     }
 
+    /// The architecture that produces this recipe's `Architecture: all`
+    /// packages: the declared [`arch_indep_owner`](Self::arch_indep_owner), or
+    /// the recipe's own architecture when none is declared.
+    pub fn resolved_arch_indep_owner(&self) -> &str {
+        self.arch_indep_owner
+            .as_deref()
+            .unwrap_or(&self.architecture)
+    }
+
+    /// Whether the architecture this recipe targets produces its
+    /// `Architecture: all` packages.
+    ///
+    /// True unless the recipe hands arch-indep output to another architecture,
+    /// so an ordinary single-architecture build produces every package its
+    /// recipe declares.
+    pub fn owns_arch_indep(&self) -> bool {
+        self.resolved_arch_indep_owner() == self.architecture
+    }
+
     /// Rejects a structurally invalid recipe: no components; an unsafe recipe
     /// name, suite, architecture, or component name; a duplicate component or
-    /// repository name; a component whose git URL or ref would be read as an
-    /// option, or whose `subdir` leaves the checkout; a rustup toolchain missing
-    /// its version; or a signed repository missing its keyring.
+    /// repository name; a component naming no source or two, whose git URL or
+    /// ref would be read as an option, whose `git-ref` qualifies a source that
+    /// is not a repository, or whose `subdir` leaves the source; a rustup
+    /// toolchain missing its version; or a signed repository missing its
+    /// keyring.
     ///
     /// Recipes are trusted input, so the checks on values that become paths or
     /// subprocess arguments are defense in depth: they keep a typo from doing
@@ -263,6 +398,13 @@ impl Recipe {
                 self.architecture
             )));
         }
+        // The owner is compared against the target architecture, and a name
+        // that could never be one would hand arch-indep output to nothing.
+        if let Some(owner) = &self.arch_indep_owner
+            && let Some(reason) = crate::arch::architecture_name_error(owner)
+        {
+            return Err(bad(format!("arch-indep-owner {owner:?} {reason}")));
+        }
 
         let mut seen = std::collections::BTreeSet::new();
         for component in &self.components {
@@ -278,29 +420,82 @@ impl Recipe {
                     component.name
                 )));
             }
+            // A component has one source. Naming both would leave which one it
+            // is built from to whichever the resolver happened to look at
+            // first, and naming neither leaves nothing to build.
+            match (&component.source.git, &component.source.path) {
+                (Some(_), Some(_)) => {
+                    return Err(bad(format!(
+                        "component {:?} declares both source.git and source.path; \
+                         a component is built from one source",
+                        component.name
+                    )));
+                }
+                (None, None) => {
+                    return Err(bad(format!(
+                        "component {:?} declares no source; set source.git to clone \
+                         a repository, or source.path to build a tree on disk",
+                        component.name
+                    )));
+                }
+                _ => {}
+            }
             // The git URL and ref are passed to git as positional arguments, so
             // an option-like value would be read as a flag rather than as what
             // it names.
-            if let Some(reason) = argument_error(&component.source.git) {
-                return Err(bad(format!(
-                    "component {:?} source.git {:?} {reason}",
-                    component.name, component.source.git
-                )));
-            }
-            if let Some(git_ref) = &component.source.git_ref
-                && let Some(reason) = argument_error(git_ref)
+            if let Some(git) = &component.source.git
+                && let Some(reason) = argument_error(git)
             {
                 return Err(bad(format!(
-                    "component {:?} source.git-ref {:?} {reason}",
-                    component.name, git_ref
+                    "component {:?} source.git {:?} {reason}",
+                    component.name, git
                 )));
             }
-            // The subdir is joined onto the checkout to give the source tree,
-            // which the vendor pass binds read-write into a cage that runs the
-            // component's own `debian/rules clean` with the host network. An
-            // absolute subdir would not extend the checkout path but replace it,
-            // and a `..` would climb out of it, so either would hand that pass a
-            // tree outside the work directory.
+            if let Some(git_ref) = &component.source.git_ref {
+                if let Some(reason) = argument_error(git_ref) {
+                    return Err(bad(format!(
+                        "component {:?} source.git-ref {:?} {reason}",
+                        component.name, git_ref
+                    )));
+                }
+                // A ref selects a revision of a repository, so it says nothing
+                // about a tree on disk. Refused rather than ignored: a recipe
+                // switched from git to a path keeps its ref, and silently
+                // dropping it would build something other than what it reads as
+                // building.
+                if component.source.git.is_none() {
+                    return Err(bad(format!(
+                        "component {:?} sets source.git-ref, which applies only to \
+                         source.git",
+                        component.name
+                    )));
+                }
+            }
+            // The path is joined onto the recipe's directory and then copied
+            // into the work directory, so an empty one would name the recipe
+            // directory itself rather than a source tree.
+            if let Some(path) = &component.source.path
+                && path.as_os_str().is_empty()
+            {
+                return Err(bad(format!(
+                    "component {:?} source.path is empty",
+                    component.name
+                )));
+            }
+            // A patch path is joined onto the recipe's directory the same way,
+            // where an empty one would name that directory rather than a file.
+            if component.patches.iter().any(|p| p.as_os_str().is_empty()) {
+                return Err(bad(format!(
+                    "component {:?} lists an empty patch path",
+                    component.name
+                )));
+            }
+            // The subdir is joined onto the resolved source to give the tree the
+            // vendor pass binds read-write into a cage that runs the component's
+            // own `debian/rules clean` with the host network. An absolute subdir
+            // would not extend that path but replace it, and a `..` would climb
+            // out of it, so either would hand that pass a tree outside the work
+            // directory.
             if let Some(subdir) = &component.source.subdir
                 && let Some(reason) = subdir_error(subdir)
             {
@@ -437,16 +632,17 @@ fn argument_error(value: &str) -> Option<&'static str> {
     }
 }
 
-/// Reports why a component's `subdir` is unsafe to join onto its checkout, or
-/// `None` when it is safe.
+/// Reports why a component's `subdir` is unsafe to join onto its resolved
+/// source, or `None` when it is safe.
 ///
-/// The subdir names a tree *within* the checkout, and the result is what the
-/// vendor pass binds read-write into a cage that runs upstream's own
-/// `debian/rules clean` with the host network. [`Path::join`] replaces the whole
-/// path when given an absolute one rather than extending it, so an absolute
-/// subdir would silently redirect that bind to anywhere on the host; a `..`
-/// component would climb out of the checkout to the same effect. Both are
-/// refused, leaving a subdir that can only descend.
+/// The subdir names a tree *within* the resolved source — a git checkout, or the
+/// work directory's copy of a path source — and the result is what the vendor
+/// pass binds read-write into a cage that runs upstream's own `debian/rules
+/// clean` with the host network. [`Path::join`] replaces the whole path when
+/// given an absolute one rather than extending it, so an absolute subdir would
+/// silently redirect that bind to anywhere on the host; a `..` component would
+/// climb out of the source to the same effect. Both are refused, leaving a
+/// subdir that can only descend.
 fn subdir_error(subdir: &Path) -> Option<&'static str> {
     use std::path::Component;
 
@@ -780,6 +976,210 @@ mod tests {
     }
 
     #[test]
+    fn a_component_names_one_source_and_reports_which() {
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             source.git-ref = \"master\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.components[0].source.origin(),
+            Some(Origin::Git {
+                url: "https://example/c",
+                git_ref: Some("master"),
+            }),
+        );
+
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.path = \"../cosmic-comp\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.components[0].source.origin(),
+            Some(Origin::Path(Path::new("../cosmic-comp"))),
+        );
+    }
+
+    #[test]
+    fn a_component_naming_no_source_or_two_is_rejected() {
+        // Two would leave which one it is built from to whichever the resolver
+        // looked at first; none leaves nothing to build.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             source.path = \"/home/someone/c\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("declares both source.git and source.path"),
+            "{err}"
+        );
+
+        let err =
+            load("name = \"r\"\nsuite = \"trixie\"\n[[components]]\nname = \"c\"\n").unwrap_err();
+        assert!(format!("{err}").contains("declares no source"), "{err}");
+    }
+
+    #[test]
+    fn a_git_ref_on_a_path_source_is_rejected_rather_than_ignored() {
+        // The shape a recipe takes on when it is switched from git to a path and
+        // the ref is left behind. Ignoring it would build something other than
+        // what the recipe reads as building.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.path = \"/home/someone/c\"\n\
+             source.git-ref = \"master\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("applies only to source.git"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_source_path_is_rejected() {
+        // It would name the recipe's own directory rather than a source tree.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.path = \"\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("source.path is empty"), "{err}");
+    }
+
+    #[test]
+    fn a_source_path_may_climb_out_of_the_recipe_directory() {
+        // Unlike `subdir`, which names a tree inside the resolved source, a path
+        // names one anywhere on the host: a recipe kept beside the trees it
+        // builds reaches them with `..`.
+        for path in ["../cosmic-comp", "/home/someone/cosmic-comp", "./tree"] {
+            load(&format!(
+                "name = \"r\"\nsuite = \"trixie\"\n\
+                 [[components]]\nname = \"c\"\nsource.path = \"{path}\"\n"
+            ))
+            .unwrap_or_else(|err| panic!("{path:?} should be accepted: {err}"));
+        }
+    }
+
+    #[test]
+    fn a_subdir_applies_to_a_path_source_as_it_does_to_a_checkout() {
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.path = \"../superproject\"\n\
+             source.subdir = \"members/cosmic-comp\"\n",
+        )
+        .expect("a subdir inside a path source is safe");
+        assert_eq!(
+            recipe.components[0].source.subdir.as_deref(),
+            Some(Path::new("members/cosmic-comp")),
+        );
+
+        // ...and it is bounded the same way, since it names a tree within the
+        // copy the vendor pass binds.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.path = \"../superproject\"\n\
+             source.subdir = \"../elsewhere\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("source.subdir"), "{err}");
+    }
+
+    #[test]
+    fn a_component_carries_its_patch_series_in_the_order_declared() {
+        // The order is the applying order, so it is part of what the recipe
+        // says rather than a set the loader is free to rearrange.
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             patches = [\"patches/0002-second.patch\", \"patches/0001-first.patch\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.components[0].patches,
+            [
+                PathBuf::from("patches/0002-second.patch"),
+                PathBuf::from("patches/0001-first.patch"),
+            ],
+        );
+        // A component that declares none carries none, which is what makes the
+        // whole series step a no-op for the ordinary case.
+        let recipe = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap();
+        assert!(recipe.components[0].patches.is_empty());
+    }
+
+    #[test]
+    fn an_empty_patch_path_is_rejected() {
+        // Joined onto the recipe's directory, it would name that directory
+        // rather than a file.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             patches = [\"fix.patch\", \"\"]\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("empty patch path"), "{err}");
+    }
+
+    #[test]
+    fn patches_apply_to_either_kind_of_source() {
+        for source in [
+            "source.git = \"https://example/c\"",
+            "source.path = \"../tree\"",
+        ] {
+            load(&format!(
+                "name = \"r\"\nsuite = \"trixie\"\n\
+                 [[components]]\nname = \"c\"\n{source}\n\
+                 patches = [\"patches/fix.patch\"]\n"
+            ))
+            .unwrap_or_else(|err| panic!("{source} with patches should load: {err}"));
+        }
+    }
+
+    #[test]
+    fn a_recipe_loaded_from_disk_records_the_directory_it_came_from() {
+        // What a relative `source.path` resolves against, taken from where the
+        // file was found rather than from anything the file says.
+        let dir = std::env::temp_dir().join(format!("src2deb-recipe-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("recipe.toml"),
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.path = \"../tree\"\n",
+        )
+        .unwrap();
+
+        let recipe = Recipe::load(&dir).expect("the recipe loads");
+        assert_eq!(recipe.dir(), dir);
+        // A recipe that was never loaded carries none, and says so.
+        let bare: Recipe = toml::from_str(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap();
+        assert_eq!(bare.dir(), Path::new(""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recipe_may_not_declare_its_own_directory() {
+        // The field is set from where the file was found, so a file naming one
+        // is refused rather than believed.
+        let err = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\ndir = \"/elsewhere\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap_err();
+        assert!(format!("{err}").contains("unknown field"), "{err}");
+    }
+
+    #[test]
     fn ordinary_git_urls_and_refs_are_accepted() {
         load(
             "name = \"r\"\nsuite = \"trixie\"\n\
@@ -825,6 +1225,49 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(recipe.architecture, crate::arch::host_architecture());
+    }
+
+    #[test]
+    fn every_run_owns_its_own_arch_indep_output_unless_an_owner_is_named() {
+        // The default a single-architecture build wants: its pool holds every
+        // package the recipe declares and can be served as it stands.
+        let recipe = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\narchitecture = \"arm64\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap();
+        assert_eq!(recipe.resolved_arch_indep_owner(), "arm64");
+        assert!(recipe.owns_arch_indep());
+
+        // Named elsewhere, this architecture builds only its own packages.
+        let recipe = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\narchitecture = \"arm64\"\n\
+             arch-indep-owner = \"amd64\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap();
+        assert_eq!(recipe.resolved_arch_indep_owner(), "amd64");
+        assert!(!recipe.owns_arch_indep());
+
+        // Naming this architecture as the owner is the same as naming none.
+        let recipe = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\narchitecture = \"amd64\"\n\
+             arch-indep-owner = \"amd64\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap();
+        assert!(recipe.owns_arch_indep());
+    }
+
+    #[test]
+    fn an_unsafe_arch_indep_owner_is_rejected() {
+        // It is compared against an architecture name, so a value that could
+        // never be one would hand arch-indep output to nothing.
+        let err = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\narch-indep-owner = \"../evil\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("arch-indep-owner \"../evil\" contains \"..\""),
+            "{err}"
+        );
     }
 
     #[test]

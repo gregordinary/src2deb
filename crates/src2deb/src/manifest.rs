@@ -2,11 +2,15 @@
 //! produced.
 //!
 //! A run writes a manifest under the work directory, mapping every component to
-//! the commit its source resolved to and, for a component that built, the exact
-//! package versions it produced. It ties a run's inputs (pinned source
-//! revisions, and the sandbox the builds ran in) to its outputs (versioned
+//! what its source resolved to and, for a component that built, the exact
+//! package versions it produced. It ties a run's inputs (the source
+//! fingerprints, and the sandbox the builds ran in) to its outputs (versioned
 //! `.debs`), which is the basis of a reproducibility story: the same manifest
 //! names the revisions to check out and the conditions they were built under.
+//!
+//! Each component's inputs are recorded by kind and value, and each says whether
+//! it is pinned, so a build from a source that cannot be reproduced is not
+//! mistaken for one that can. See [`crate::fingerprint`].
 //!
 //! The manifest also carries a run's state forward. A component built this run is
 //! recorded fresh; one skipped because it was already built keeps its prior
@@ -28,6 +32,7 @@ use ferroday_cage::{ResolvedInputs, ResolvedMount};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, io_error};
+use crate::fingerprint::Fingerprint;
 
 /// The directory within the work directory that holds every manifest.
 pub const MANIFEST_DIR: &str = "manifests";
@@ -85,6 +90,20 @@ pub struct Manifest {
     pub suite: String,
     /// The architecture built for.
     pub architecture: String,
+    /// The date the run's versions were stamped with, as `YYYY-MM-DD`, absent
+    /// when the run built nothing.
+    ///
+    /// Carried forward like the sandbox record, and for the same reason: a run
+    /// that builds nothing keeps the date of the one that produced the packages
+    /// this manifest still calls built. Overwriting it with the date of a run
+    /// that produced nothing would make a later reproduction rebuild against the
+    /// wrong clock.
+    #[serde(
+        rename = "build-date",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub build_date: Option<String>,
     /// The sandbox inputs the run's builds ran under, absent when the run built
     /// nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,22 +301,40 @@ fn text(value: &std::ffi::OsStr) -> String {
     value.to_string_lossy().into_owned()
 }
 
-/// One component's record: its resolved commit, its status, and either the
-/// packages it produced or the reason it failed.
+/// One component's record: what its source resolved to, its status, and either
+/// the packages it produced or the reason it failed.
+///
+/// Field order is the serialized order, and TOML admits no scalar after a table:
+/// every plain field is declared before [`source`](Self::source) and
+/// [`packages`](Self::packages), which are written as arrays of tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentRecord {
     /// The component name.
     pub name: String,
-    /// The commit the component's source resolved to.
-    pub commit: String,
     /// The status: [`STATUS_BUILT`], [`STATUS_FAILED`], or [`STATUS_SKIPPED`].
     pub status: String,
-    /// The packages the component produced, present only when it built.
-    #[serde(rename = "package", default, skip_serializing_if = "Vec::is_empty")]
-    pub packages: Vec<PackageRecord>,
     /// The failure reason, present only when the component failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The `.buildinfo` the component's build wrote, present only when it built
+    /// and wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buildinfo: Option<BuildInfoRecord>,
+    /// What the component's source resolved to: one entry per input, each
+    /// naming its kind, its value, and whether it is pinned.
+    ///
+    /// Empty for a component that failed before it resolved anything, which is
+    /// the record saying it never got that far rather than naming an input it
+    /// never reached.
+    #[serde(
+        rename = "source",
+        default,
+        skip_serializing_if = "Fingerprint::is_empty"
+    )]
+    pub source: Fingerprint,
+    /// The packages the component produced, present only when it built.
+    #[serde(rename = "package", default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<PackageRecord>,
 }
 
 /// One produced package: its name and version.
@@ -309,12 +346,56 @@ pub struct PackageRecord {
     pub version: String,
 }
 
+/// A reference to the `.buildinfo` a component's build wrote.
+///
+/// The manifest names the file and its checksum rather than restating what it
+/// holds. `.buildinfo` is Debian's own record of what a package was built
+/// against — the installed package set of the build root above all, which the
+/// `[sandbox]` section does not carry — and it is what a rebuild is compared
+/// with. Naming it keeps one authority for that rather than two that can
+/// disagree, and the checksum makes it possible to tell the recorded file from
+/// one that has since changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildInfoRecord {
+    /// The path to the `.buildinfo`, relative to the work directory, or the
+    /// full path when it lies outside one.
+    pub path: String,
+    /// Its SHA-256, in lowercase hexadecimal.
+    pub sha256: String,
+}
+
+impl BuildInfoRecord {
+    /// Records `buildinfo`, naming its path relative to `work_dir`.
+    ///
+    /// Relative because the manifest lives under the same work directory, so a
+    /// work directory that is moved or copied keeps a manifest whose references
+    /// still resolve. A path outside the work directory — which the output tree
+    /// never is — is recorded whole rather than made into a relative path that
+    /// climbs out of it.
+    pub fn of(buildinfo: &crate::build::BuildInfo, work_dir: &Path) -> BuildInfoRecord {
+        let path = buildinfo
+            .path
+            .strip_prefix(work_dir)
+            .unwrap_or(&buildinfo.path);
+        BuildInfoRecord {
+            path: path.to_string_lossy().into_owned(),
+            sha256: buildinfo.sha256.clone(),
+        }
+    }
+}
+
 impl ComponentRecord {
-    /// Whether this record marks the component as built at `commit`, so a
-    /// `--skip-published` run may skip it when its source resolves to the same
-    /// commit. A failed or skipped record is not a reason to skip.
-    pub fn is_built_at(&self, commit: &str) -> bool {
-        self.status == STATUS_BUILT && self.commit == commit
+    /// Whether this record marks the component as built from `source`, so a
+    /// `--skip-published` run may skip it. A failed or skipped record is not a
+    /// reason to skip.
+    ///
+    /// An unpinned source is never skippable, however exactly it matches. Its
+    /// value names where the tree was read from and not what the tree held, so
+    /// two runs agreeing on it establishes nothing about whether the source
+    /// moved — and skipping on that basis would quietly publish yesterday's
+    /// package as today's build.
+    pub fn is_built_at(&self, source: &Fingerprint) -> bool {
+        self.status == STATUS_BUILT && source.is_pinned() && &self.source == source
     }
 }
 
@@ -330,6 +411,7 @@ impl Manifest {
             recipe: recipe.into(),
             suite: suite.into(),
             architecture: architecture.into(),
+            build_date: None,
             sandbox: None,
             components: records,
         }
@@ -339,6 +421,13 @@ impl Manifest {
     /// nothing has none to record.
     pub fn with_sandbox(mut self, sandbox: Option<SandboxRecord>) -> Manifest {
         self.sandbox = sandbox;
+        self
+    }
+
+    /// Records the date the run's versions were stamped with. A run that built
+    /// nothing has none of its own to record.
+    pub fn with_build_date(mut self, build_date: Option<String>) -> Manifest {
+        self.build_date = build_date;
         self
     }
 
@@ -412,16 +501,24 @@ impl Manifest {
 mod tests {
     use super::*;
 
+    use crate::fingerprint::SourceInput;
+
+    /// A git source at `commit`, the shape the resolver produces.
+    fn git(commit: &str) -> Fingerprint {
+        Fingerprint::of(SourceInput::git(commit))
+    }
+
     fn built(name: &str, commit: &str, version: &str) -> ComponentRecord {
         ComponentRecord {
             name: name.to_string(),
-            commit: commit.to_string(),
             status: STATUS_BUILT.to_string(),
+            error: None,
+            buildinfo: None,
+            source: git(commit),
             packages: vec![PackageRecord {
                 name: name.to_string(),
                 version: version.to_string(),
             }],
-            error: None,
         }
     }
 
@@ -435,10 +532,11 @@ mod tests {
                 built("cosmic-randr", "abc123", "1.0-1"),
                 ComponentRecord {
                     name: "cosmic-osd".to_string(),
-                    commit: "def456".to_string(),
                     status: STATUS_FAILED.to_string(),
-                    packages: Vec::new(),
                     error: Some("boom".to_string()),
+                    buildinfo: None,
+                    source: git("def456"),
+                    packages: Vec::new(),
                 },
             ],
         );
@@ -446,11 +544,119 @@ mod tests {
         let parsed = Manifest::load_from_str(&toml);
         assert_eq!(parsed.recipe, "cosmic-epoch");
         assert_eq!(parsed.components.len(), 2);
-        assert!(parsed.components[0].is_built_at("abc123"));
-        assert!(!parsed.components[0].is_built_at("other"));
+        assert!(parsed.components[0].is_built_at(&git("abc123")));
+        assert!(!parsed.components[0].is_built_at(&git("other")));
         assert_eq!(parsed.components[0].packages[0].version, "1.0-1");
         assert_eq!(parsed.components[1].status, STATUS_FAILED);
         assert_eq!(parsed.components[1].error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn a_component_records_its_source_by_kind_value_and_pinned_ness() {
+        // What a reader has to be able to tell apart without knowing src2deb's
+        // table of kinds: an input that names exactly what was built, and one
+        // that only names where it was read from.
+        let manifest = Manifest::new(
+            "r",
+            "trixie",
+            "amd64",
+            vec![ComponentRecord {
+                name: "c".to_string(),
+                status: STATUS_BUILT.to_string(),
+                error: None,
+                buildinfo: None,
+                source: Fingerprint::over(vec![
+                    SourceInput::git("abc123"),
+                    SourceInput::path("/home/someone/packaging"),
+                ]),
+                packages: Vec::new(),
+            }],
+        );
+        let toml = manifest.to_toml();
+        assert!(toml.contains("[[component.source]]"), "{toml}");
+        assert!(toml.contains("kind = \"git\""), "{toml}");
+        assert!(toml.contains("value = \"abc123\""), "{toml}");
+        assert!(toml.contains("pinned = true"), "{toml}");
+        assert!(toml.contains("kind = \"path\""), "{toml}");
+        assert!(toml.contains("pinned = false"), "{toml}");
+        assert_eq!(
+            Manifest::load_from_str(&toml).components[0].source,
+            manifest.components[0].source,
+        );
+    }
+
+    #[test]
+    fn a_buildinfo_is_recorded_relative_to_the_work_directory() {
+        // The manifest lives under the same work directory, so a relative
+        // reference survives that directory being moved or copied.
+        let buildinfo = crate::build::BuildInfo {
+            path: PathBuf::from("/work/out/trixie/amd64/cosmic-randr/r_1.0_amd64.buildinfo"),
+            sha256: "abc123".to_string(),
+        };
+        let record = BuildInfoRecord::of(&buildinfo, Path::new("/work"));
+        assert_eq!(
+            record.path,
+            "out/trixie/amd64/cosmic-randr/r_1.0_amd64.buildinfo"
+        );
+        assert_eq!(record.sha256, "abc123");
+
+        // A path outside the work directory is recorded whole, rather than made
+        // into a relative path that climbs out of it.
+        let outside = BuildInfoRecord::of(&buildinfo, Path::new("/elsewhere"));
+        assert_eq!(
+            outside.path,
+            "/work/out/trixie/amd64/cosmic-randr/r_1.0_amd64.buildinfo"
+        );
+    }
+
+    #[test]
+    fn a_manifest_carries_a_components_buildinfo_reference_through_toml() {
+        let manifest = Manifest::new(
+            "r",
+            "trixie",
+            "amd64",
+            vec![ComponentRecord {
+                buildinfo: Some(BuildInfoRecord {
+                    path: "out/trixie/amd64/c/c_1.0_amd64.buildinfo".to_string(),
+                    sha256: "abc123".to_string(),
+                }),
+                ..built("c", "abc", "1.0-1")
+            }],
+        );
+        let toml = manifest.to_toml();
+        assert!(toml.contains("[component.buildinfo]"), "{toml}");
+        let parsed = Manifest::load_from_str(&toml);
+        assert_eq!(
+            parsed.components[0].buildinfo,
+            manifest.components[0].buildinfo
+        );
+        // A component with none omits the section rather than writing an empty
+        // one, so the manifest never names a file that is not there.
+        let none = Manifest::new("r", "trixie", "amd64", vec![built("c", "abc", "1.0-1")]);
+        assert!(!none.to_toml().contains("buildinfo"), "{}", none.to_toml());
+    }
+
+    #[test]
+    fn a_component_that_never_resolved_records_no_source_at_all() {
+        // The record says it never got that far, rather than naming an input it
+        // never reached.
+        let manifest = Manifest::new(
+            "r",
+            "trixie",
+            "amd64",
+            vec![ComponentRecord {
+                name: "c".to_string(),
+                status: STATUS_FAILED.to_string(),
+                error: Some("no such repository".to_string()),
+                buildinfo: None,
+                source: Fingerprint::none(),
+                packages: Vec::new(),
+            }],
+        );
+        let toml = manifest.to_toml();
+        assert!(!toml.contains("component.source"), "{toml}");
+        let parsed = Manifest::load_from_str(&toml);
+        assert!(parsed.components[0].source.is_empty());
     }
 
     /// A cage built the way a build pass builds one, so the sandbox record is
@@ -514,7 +720,7 @@ mod tests {
         // renamed through is gone — a leftover would accumulate one per run, and
         // a manifest left half-written would fail every later `load`.
         let loaded = Manifest::load(&path).unwrap().expect("a manifest is there");
-        assert!(loaded.components[0].is_built_at("def"));
+        assert!(loaded.components[0].is_built_at(&git("def")));
         let siblings: Vec<String> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -693,7 +899,7 @@ mod tests {
             .expect("the first survives");
         assert_eq!(first.recipe, "cosmic-epoch");
         assert_eq!(first.components.len(), 1);
-        assert!(first.components[0].is_built_at("abc123"));
+        assert!(first.components[0].is_built_at(&git("abc123")));
 
         let second = Manifest::load(&theme)
             .unwrap()
@@ -753,17 +959,58 @@ mod tests {
     }
 
     #[test]
-    fn only_a_built_record_at_the_same_commit_is_skippable() {
+    fn only_a_built_record_of_the_same_source_is_skippable() {
         let record = built("c", "abc", "1.0");
-        assert!(record.is_built_at("abc"));
+        assert!(record.is_built_at(&git("abc")));
         // A different commit, or a non-built status, is not skippable.
-        assert!(!record.is_built_at("xyz"));
+        assert!(!record.is_built_at(&git("xyz")));
         let mut failed = record.clone();
         failed.status = STATUS_FAILED.to_string();
-        assert!(!failed.is_built_at("abc"));
+        assert!(!failed.is_built_at(&git("abc")));
         let mut skipped = record;
         skipped.status = STATUS_SKIPPED.to_string();
-        assert!(!skipped.is_built_at("abc"));
+        assert!(!skipped.is_built_at(&git("abc")));
+    }
+
+    #[test]
+    fn an_unpinned_source_is_never_skippable_however_well_it_matches() {
+        // A path names where a tree was read from, not what it held, so a run
+        // agreeing with the record establishes nothing about whether the source
+        // moved. Skipping here would publish a stale package as a fresh build.
+        let working_tree = Fingerprint::of(SourceInput::path("/home/someone/cosmic-comp"));
+        let record = ComponentRecord {
+            name: "c".to_string(),
+            status: STATUS_BUILT.to_string(),
+            error: None,
+            buildinfo: None,
+            source: working_tree.clone(),
+            packages: Vec::new(),
+        };
+        assert_eq!(record.source, working_tree);
+        assert!(!record.is_built_at(&working_tree));
+
+        // One unpinned input among pinned ones is enough: whatever else the
+        // build consumed, part of it cannot be compared.
+        let overlaid = Fingerprint::over(vec![
+            SourceInput::git("abc"),
+            SourceInput::path("/home/someone/packaging"),
+        ]);
+        let record = ComponentRecord {
+            source: overlaid.clone(),
+            ..record
+        };
+        assert!(!record.is_built_at(&overlaid));
+    }
+
+    #[test]
+    fn a_source_that_gained_an_input_is_not_the_source_that_was_built() {
+        // Adding a patch series or a packaging overlay to a component makes it
+        // a different source, so a prior run's record does not excuse a build.
+        let record = built("c", "abc", "1.0");
+        assert!(!record.is_built_at(&Fingerprint::over(vec![
+            SourceInput::git("abc"),
+            SourceInput::sha256("9f8e7d6"),
+        ])));
     }
 
     impl Manifest {

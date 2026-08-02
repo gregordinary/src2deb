@@ -4,10 +4,12 @@ A build is driven by the engine over a recipe. For each recipe, in order:
 
 ## 1. Resolve
 
-Every component's git source is cloned or updated, its ref checked out, and its
-submodules initialized — so a submodule superproject such as cosmic-epoch
-resolves its members. The result is the source tree that holds the component's
-`debian/` directory.
+Every component's source is put under the work directory. A git source is cloned
+or updated, its ref checked out, and its submodules initialized — so a submodule
+superproject such as cosmic-epoch resolves its members. A `source.path` tree is
+copied under the work directory as it stands, afresh each run, so nothing writes
+into the tree the recipe named. Either way the result is the source tree that
+holds the component's `debian/` directory, and it is one src2deb owns.
 
 Every component is resolved, whatever the run was asked to build, because the
 build order derives from all of them: which component produces a package is read
@@ -37,6 +39,19 @@ unrelated component's assets elsewhere in a superproject do not concern it; and
 within that, the files git tracks, which is the only place a pointer can come
 from. That second bound also keeps it off a previous build's vendored crates,
 which stay in the tree between runs and are not the component's assets.
+
+A `source.path` tree is scanned on the same terms but never fetched for: a
+pointer there fails the component with the command that fixes it, and src2deb
+leaves the tree alone. A path that is not part of a git working tree carries no
+pointers, and is passed over.
+
+Last, a component's declared patch series is applied over the resolved tree, in
+the order the recipe lists it. This happens inside resolve, before any
+`debian/control` is read, so a patch may change what a component build-depends
+on or what it produces and the build order follows the patched file. A patch
+that does not apply fails the component; the series is a pinned input of the
+component's fingerprint, so changing it rebuilds. See
+[Patches](recipes.md#patches).
 
 ## 2. Plan
 
@@ -106,8 +121,8 @@ job (the default) reproduces the sequential order exactly.
 
 The run writes a provenance manifest to
 `<work>/manifests/<recipe>/<suite>/<architecture>.toml`, mapping every component
-to the commit its source resolved to and the package versions it produced. See
-[The provenance manifest](provenance.md).
+to what its source resolved to, the `.buildinfo` its build wrote, and the package
+versions it produced. See [The provenance manifest](provenance.md).
 
 ## Provisioning progress
 
@@ -211,7 +226,7 @@ Everything the next run can pick up from:
 - **Components that finished** are built, published to the pool, and recorded in
   the manifest as built. A later `--skip-published` run skips them.
 - **The component the cancel interrupted, and any it never reached,** are
-  recorded as skipped, with the commit their source resolved to. Nothing claims
+  recorded as skipped, with what their source resolved to. Nothing claims
   they were built.
 - **A partly-provisioned build root** is removed rather than left half-made, so
   it can never be mistaken for a usable one. The next run provisions it from

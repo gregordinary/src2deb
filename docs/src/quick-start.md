@@ -129,13 +129,35 @@ src2deb plan recipes/cosmic-epoch
 src2deb plan recipes/cosmic-epoch --build-deps
 ```
 
-It prints the order to standard output, one component per line with its resolved
-commit; `--build-deps` adds each component's build-dependencies. Planning still
+It prints the order to standard output, one component per line with the source it
+resolved to; `--build-deps` adds each component's build-dependencies. Planning still
 clones each source, because the order is read from every `debian/control`.
 
 `plan` takes the same exclusive lock on its work directory that `build` does, for
 the same reason — it writes to `<work>/sources/`. To inspect a recipe's order
 while a long build is running, give the plan a `--work` directory of its own.
+
+## Build from a tree you are editing
+
+A component's source is usually a git repository, which means a change has to be
+committed and pushed before src2deb can build it. Point `source.path` at a tree
+on disk instead and it builds what is there now:
+
+```toml
+[[components]]
+name = "cosmic-comp"
+source.path = "../../checkouts/cosmic-comp"
+```
+
+The path is relative to the recipe's own directory. src2deb copies the tree into
+the work directory and builds from the copy, so nothing is written into the tree
+you are editing — which matters, because the build runs the component's own
+`debian/rules clean` in whatever tree it is given.
+
+Packages built this way are marked. The version carries `local` where a git build
+carries a commit, the manifest records the input as unpinned, and
+`--skip-published` never skips the component. See [Building from a tree on
+disk](sources-and-toolchain.md#building-from-a-tree-on-disk).
 
 ## Resume and selective builds
 
@@ -153,9 +175,9 @@ src2deb build recipes/cosmic-epoch --only cosmic-osd
 src2deb build recipes/cosmic-epoch --from cosmic-osd
 ```
 
-`--skip-published` skips a component whose source resolves to the commit a prior
-run recorded as built in the [manifest](provenance.md), so an interrupted or
-repeated run rebuilds only what changed. `--only` (repeatable) builds just the
+`--skip-published` skips a component whose source resolves to what a prior run
+recorded as built in the [manifest](provenance.md), so an interrupted or repeated
+run rebuilds only what changed. `--only` (repeatable) builds just the
 named components, and `--from` builds a component and everything after it in the
 order; the two are mutually exclusive.
 
@@ -172,10 +194,10 @@ On a pool that has never held them it is not, and src2deb says so before it
 provisions anything:
 
 ```text
-src2deb: invalid selection: --only builds "cosmic-osd", which build-depends on
-  "libcosmic-randr-dev"; that package is produced by component "cosmic-randr",
-  which --only leaves out and the pool does not hold. Select "cosmic-randr" as
-  well, or build it first
+src2deb: unsatisfiable build-dependency: this run builds "cosmic-osd", which
+  build-depends on "libcosmic-randr-dev"; that package is produced by component
+  "cosmic-randr", which --only leaves out, and the pool does not hold it. Select
+  "cosmic-randr" as well, or build it first
 ```
 
 A selection naming a component the recipe does not have is refused the same way,
@@ -216,7 +238,8 @@ what lets a rebuild reach a machine that already installed the previous one. See
 
 Each run also writes a provenance manifest to
 `<work>/manifests/<recipe>/<suite>/<architecture>.toml`, mapping every component
-to the commit its source resolved to and the package versions it produced.
+to what its source resolved to, the `.buildinfo` its build wrote, and the package
+versions it produced.
 
 Those three are what a run is *for*. The work directory holds a good deal more
 besides — the sources, the package cache, and the build roots, which are where
