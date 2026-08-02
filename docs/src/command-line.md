@@ -1,15 +1,17 @@
 # Command line
 
-Four subcommands: `build` runs a recipe, `plan` resolves and orders one without
-building, `export` copies what a work directory holds out for an archive, and
-`prune` removes what the pool no longer serves. All four take a recipe directory
-and the same target options.
+Five subcommands: `build` runs a recipe, `plan` resolves and orders one without
+building, `export` copies what a work directory holds out for an archive, `prune`
+removes what the pool no longer serves, and `check` reports whether the pool's
+packages can be installed. All five take a recipe directory and the same target
+options.
 
 ```sh
 src2deb build  RECIPE_DIR [options]
 src2deb plan   RECIPE_DIR [options]
 src2deb export RECIPE_DIR --to DIR [options]
 src2deb prune  RECIPE_DIR [options]
+src2deb check  RECIPE_DIR [options]
 ```
 
 `RECIPE_DIR` is a directory containing a `recipe.toml`. Exactly one is required,
@@ -27,14 +29,15 @@ it builds against.
 | --- | --- | --- |
 | `--work DIR` | all | The working directory for sources, build roots, the package cache, the pool, and output. Defaults to `./work` |
 | `--suite SUITE` | all | Build for a Debian suite such as `trixie` or `forky`, superseding the recipe's `suite` and the `version-tag` that described it |
-| `--architecture ARCH` | all | Build for a Debian architecture such as `amd64` or `arm64`. A recipe naming none builds for the host. For `export` and `prune` it narrows what is read rather than retargeting anything |
+| `--architecture ARCH` | all | Build for a Debian architecture such as `amd64` or `arm64`. A recipe naming none builds for the host. For `export`, `prune`, and `check` it narrows what is read rather than retargeting anything |
 | `--arch-indep-owner ARCH` | `build`, `plan`, `export` | Leave the recipe's `Architecture: all` packages to `ARCH`. Unset, every run produces its own |
 | `--version-tag TAG` | `build`, `plan` | Stamp built versions with `TAG`, such as `deb13`, overriding both the recipe's `version-tag` and the tag derived from the suite |
 
 The last two are not accepted where they would do nothing: an `export` carries
-packages a run already stamped and a `prune` reads a pool, so neither has a
-version to tag, and a prune has no arch-indep output to hand anywhere. Naming
-one there is a usage error rather than a silently ignored flag.
+packages a run already stamped, and a `prune` and a `check` read a pool, so none
+of them has a version to tag, and neither a prune nor a check has arch-indep
+output to hand anywhere. Naming one there is a usage error rather than a
+silently ignored flag.
 
 Every value is validated as it is parsed, so a malformed one is a usage error
 against the flag rather than a failure partway into the run. Each suite and
@@ -106,6 +109,18 @@ in the same directory. See [Publishing to an archive](publishing.md).
 Pruning covers the pool for a suite, which is shared by every recipe built into
 the work directory for it. See [Pruning the pool](using-the-pool.md#pruning-the-pool).
 
+## Check options
+
+| Option | Effect |
+| --- | --- |
+| `--architecture ARCH` | Check only `ARCH`'s pool. By default every pool the suite holds is checked |
+
+A check resolves each pool package's `Depends` and `Pre-Depends` against the
+target suite, the recipe's repositories, and the pool, and reports what nothing
+satisfies. It exits non-zero when anything is unsatisfiable, so it gates a
+publish; a build ends with the same check as a note that does not fail the run.
+See [Checking installability](installability.md).
+
 ## Verbosity
 
 | Option | Prints |
@@ -145,8 +160,8 @@ spaces. Under `--jobs N` each line also carries its component's name. See
 
 | Status | Meaning |
 | --- | --- |
-| `0` | Every selected component built, or was skipped as already built; or an export or prune finished |
-| `1` | A component failed, or the run stopped before the build phase |
+| `0` | Every selected component built, or was skipped as already built; an export or prune finished; or a check found every dependency satisfiable |
+| `1` | A component failed, the run stopped before the build phase, or a check found a dependency nothing satisfies |
 | `2` | A usage error: an unknown option, a malformed value, a missing `--to`, or a selection naming a component the recipe does not have |
 | `130` | The run was cancelled with Ctrl-C or `SIGTERM` |
 

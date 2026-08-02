@@ -1421,6 +1421,34 @@ impl Engine {
         crate::pool::prune(&self.work_dir, &recipe.suite, options)
     }
 
+    /// Resolves the runtime dependencies of every package the recipe's suite
+    /// holds a pool of, and reports the ones nothing available satisfies.
+    ///
+    /// Where [`run`](Self::run) validates that each component *builds*, this
+    /// validates that what it produced can be *installed*: a package whose
+    /// `Depends` names something neither the target suite nor the pool has
+    /// builds perfectly and is refused by apt. See [`crate::check`] for how a
+    /// dependency is settled.
+    ///
+    /// Scoped to a suite rather than to a recipe, like
+    /// [`prune`](Self::prune) and for the same reason: a pool is one archive
+    /// whichever recipe built into it, so what is checked is the archive as it
+    /// stands rather than one recipe's share of it. The recipe names the suite,
+    /// the mirror, and the additional repositories to resolve against, and
+    /// [`CheckOptions`](crate::check::CheckOptions) narrows the architectures.
+    ///
+    /// Takes the work-directory lock: the pool it reads is the one a build
+    /// publishes into.
+    pub fn check(
+        &self,
+        recipe: &Recipe,
+        options: &crate::check::CheckOptions,
+        reporter: &mut dyn FnMut(crate::check::CheckProgress),
+    ) -> Result<crate::check::CheckReport> {
+        let _lock = self.lock_work_dir()?;
+        crate::check::check(&self.work_dir, recipe, options, reporter)
+    }
+
     /// Resolves every component's source, reads its `debian/control`, and
     /// computes the build order over the components that resolved. The shared
     /// front half of [`run`](Self::run) and [`plan`](Self::plan).

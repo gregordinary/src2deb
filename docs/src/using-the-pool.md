@@ -164,9 +164,12 @@ architecture is one archive whoever built it.
 
 ## Before serving a pool to anything but the next build
 
-Two properties of the pool matter more once something other than src2deb is
-reading it, and both are covered in [How a build runs](how-a-build-runs.md):
+Three things matter more once something other than src2deb is reading the pool:
 
+- **Its packages may not install.** A component builds without anything
+  guaranteeing that its runtime dependencies exist in the suite it was built
+  for. `src2deb check` resolves them and reports what nothing satisfies; see
+  [Checking installability](installability.md).
 - [Publishing is incremental and
   forward-only](how-a-build-runs.md#publishing-is-incremental-and-forward-only):
   a lower version does not publish, and there is no unpublish.

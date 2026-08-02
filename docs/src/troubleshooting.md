@@ -401,8 +401,10 @@ severity.
 
 ## Notes that are not failures
 
-Two things report at every verbosity above `-q`, because they change what a run
-guarantees rather than what it is doing.
+A run reports these whatever it was asked to print, because each changes what
+the run *guarantees* rather than what it is doing. The first two report at every
+verbosity above `-q`; an unsatisfiable dependency reports even at `-q`, since it
+is an answer rather than a narrative.
 
 ### `no unprivileged overlay`
 
@@ -428,6 +430,29 @@ Every compiler invocation runs under emulation, which costs roughly an order of
 magnitude in compile time. Expected when you asked for a foreign target;
 otherwise check `--architecture` and the recipe's `architecture` field. See
 [Cross-architecture builds](cross-architecture.md).
+
+### An unsatisfiable dependency after a successful build
+
+```text
+src2deb: arm64: cosmic-initial-setup-casper: Depends: casper
+src2deb: arm64: 67 package(s), 206 dependencies, 1 unsatisfiable
+```
+
+The named package built and published, and apt will refuse to install it:
+nothing in the suite, in the recipe's repositories, or in the pool provides what
+it depends on. The build is not wrong — this is a property of the packaging and
+the suite, not of the run — so it reports rather than fails.
+
+`src2deb check` asks the same question on its own and exits non-zero, which is
+the form to put in front of a publish. See
+[Checking installability](installability.md), which covers what to do about a
+finding.
+
+### `could not check whether the packages install`
+
+The run finished and its closing check could not reach the archive to ask. The
+packages are built and published; only the question went unanswered. Run
+`src2deb check` when the archive is reachable again.
 
 ## Stopping and resuming
 

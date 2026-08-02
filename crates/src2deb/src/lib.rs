@@ -21,11 +21,17 @@
 //!    runs the build ([`build`]), and publishes the results to the local
 //!    [`pool`].
 //!
+//! Beside the loop sit three operations over what it left behind:
+//! [`check`] resolves the pool's packages against the archive to see whether
+//! they can be installed, [`export`] copies them out for an archive tool, and
+//! [`pool::prune`] removes the versions the pool no longer serves.
+//!
 //! # The ferroday-cage seam
 //!
-//! Everything that touches ferroday-cage sits behind [`provision`] and
-//! [`pool`], so the provisioning strategy and the pool writer can change
-//! without touching the engine. [`provision::BuildRootProvider`] has two
+//! Everything that touches ferroday-cage sits behind [`provision`], [`pool`],
+//! and [`check`], so the provisioning strategy, the pool writer, and the
+//! resolver a check asks can change without touching the engine.
+//! [`provision::BuildRootProvider`] has two
 //! implementations: [`provision::LayeredProvision`], which bootstraps one
 //! shared base and stages each component's build-dependency delta into a
 //! disposable overlay, and [`provision::FullReprovision`], which bakes a fresh
@@ -36,6 +42,7 @@
 pub mod arch;
 pub mod build;
 pub mod cancel;
+pub mod check;
 pub mod engine;
 pub mod error;
 pub mod export;
@@ -55,6 +62,7 @@ pub mod version;
 
 pub use build::{Artifact, BuildInfo};
 pub use cancel::Cancel;
+pub use check::{CheckOptions, CheckProgress, CheckReport, CheckedPool, Relationship, Unsatisfied};
 pub use engine::{
     BuildDate, Built, Engine, Failed, Package, PlanReport, PlannedComponent, Progress, RunOptions,
     RunReport, Selection, SkipReason, Skipped,

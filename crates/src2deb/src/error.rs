@@ -112,6 +112,12 @@ pub enum Error {
     Export(String),
     /// Pruning the pool failed.
     Prune(String),
+    /// The pool's packages could not be checked against the archive.
+    ///
+    /// The check finding a dependency nothing satisfies is not this: that is an
+    /// answer, and it is in the report. This is the check being unable to reach
+    /// one — no pool to check, or an archive it could not resolve against.
+    Check(String),
     /// The work directory is already locked by another run.
     WorkLocked {
         /// The lockfile whose presence holds the lock.
@@ -174,6 +180,7 @@ impl fmt::Display for Error {
             Error::Pool(reason) => write!(f, "the local pool: {reason}"),
             Error::Export(reason) => write!(f, "cannot export: {reason}"),
             Error::Prune(reason) => write!(f, "cannot prune the pool: {reason}"),
+            Error::Check(reason) => write!(f, "cannot check the pool: {reason}"),
             Error::WorkLocked { path, holder } => match holder {
                 Some(pid) => write!(
                     f,

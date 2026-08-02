@@ -127,11 +127,18 @@ The whole cycle, as a build host runs it overnight:
 set -eu
 src2deb build recipes/cosmic-epoch --work /mnt/build/work \
     --suite trixie --skip-published --keep 2
+src2deb check recipes/cosmic-epoch --work /mnt/build/work --suite trixie
 src2deb export recipes/cosmic-epoch --work /mnt/build/work \
     --suite trixie --to /srv/drop/rk1
 ```
 
-`--skip-published` builds only what moved, `--keep 2` bounds the pool, and the
-export replaces the drop directory's contents with the archive's current state.
-What the publisher then does with `/srv/drop/rk1/trixie` — ingest, snapshot,
-sign, publish — is outside src2deb.
+`--skip-published` builds only what moved, `--keep 2` bounds the pool, the check
+stops a publish whose packages would not install, and the export replaces the
+drop directory's contents with the archive's current state. What the publisher
+then does with `/srv/drop/rk1/trixie` — ingest, snapshot, sign, publish — is
+outside src2deb.
+
+The check earns its place under `set -eu`: a build validates that every
+component *builds*, and a suite that drops a package overnight makes what built
+yesterday uninstallable today without failing a single build. See
+[Checking installability](installability.md).

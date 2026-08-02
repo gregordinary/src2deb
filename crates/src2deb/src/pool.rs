@@ -175,24 +175,29 @@ impl LocalPool {
         }
     }
 
+    /// The pool's `Packages` index as text, empty when the pool holds nothing
+    /// or does not exist yet.
+    ///
+    /// Read from the index directly rather than through the provisioner,
+    /// because every question asked of it is about the pool as it stands rather
+    /// than about a build root provisioned from it — and one of them, whether
+    /// the pool already carries a package a component the run is not building
+    /// would have produced, has to be settled before anything is provisioned at
+    /// all. See [`Engine::run`](crate::Engine::run).
+    pub fn index_text(&self) -> Result<String> {
+        let path = self.index_path()?;
+        match std::fs::read_to_string(&path) {
+            Ok(index) => Ok(index),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(err) => Err(Error::Pool(format!("reading {}: {err}", path.display()))),
+        }
+    }
+
     /// The binary package names the pool's index lists, empty when the pool
     /// holds nothing or does not exist yet.
-    ///
-    /// Read from the index directly rather than through the provisioner, because
-    /// the question this answers — does the pool already carry the packages a
-    /// component the run is not building would have produced — has to be settled
-    /// before anything is provisioned. See
-    /// [`Engine::run`](crate::Engine::run).
     pub fn indexed_packages(&self) -> Result<std::collections::BTreeSet<String>> {
-        let path = self.index_path()?;
-        let index = match std::fs::read_to_string(&path) {
-            Ok(index) => index,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-            Err(err) => {
-                return Err(Error::Pool(format!("reading {}: {err}", path.display())));
-            }
-        };
-        Ok(index
+        Ok(self
+            .index_text()?
             .lines()
             .filter_map(|line| line.strip_prefix("Package:"))
             .map(|name| name.trim().to_string())
@@ -203,20 +208,10 @@ impl LocalPool {
     /// The pool-relative paths of every file the pool's index names, empty when
     /// the pool holds nothing or does not exist yet.
     ///
-    /// What [`prune`] must not remove. Read from the index directly for the
-    /// same reason as [`indexed_packages`](Self::indexed_packages): the
-    /// question is about the pool as it stands, not about a build root
-    /// provisioned from it.
+    /// What [`prune`] must not remove.
     pub fn indexed_files(&self) -> Result<std::collections::BTreeSet<String>> {
-        let path = self.index_path()?;
-        let index = match std::fs::read_to_string(&path) {
-            Ok(index) => index,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-            Err(err) => {
-                return Err(Error::Pool(format!("reading {}: {err}", path.display())));
-            }
-        };
-        Ok(index
+        Ok(self
+            .index_text()?
             .lines()
             .filter_map(|line| line.strip_prefix("Filename:"))
             .map(|name| name.trim().to_string())
@@ -242,17 +237,26 @@ impl LocalPool {
         if !self.has_packages.load(Ordering::Acquire) {
             return Ok(None);
         }
+        self.repository().map(Some)
+    }
+
+    /// The pool as a trusted `file://` repository, whatever it holds.
+    ///
+    /// [`as_repository`](Self::as_repository) answers `None` for a pool nothing
+    /// has published into, because a build must not declare a repository whose
+    /// `Release` is not there yet. A caller that has read the pool's index
+    /// already knows what it holds and takes the repository directly.
+    pub fn repository(&self) -> Result<Repository> {
         // The pool names its own `file://` URL, so the spelling the provisioner
         // reads and the spelling the writer publishes under come from one place.
         let url = self.writer().mirror_url().map_err(Error::Debian)?;
-        let repository = Repository::builder(self.suite.as_str())
+        Repository::builder(self.suite.as_str())
             .mirror(url)
             .components([self.component.as_str()])
             .trust_unsigned(true)
             .name("src2deb-pool")
             .build()
-            .map_err(Error::Debian)?;
-        Ok(Some(repository))
+            .map_err(Error::Debian)
     }
 }
 

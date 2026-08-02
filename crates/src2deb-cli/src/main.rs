@@ -35,6 +35,7 @@ Usage:
                            [--architecture ARCH] [--arch-indep-owner ARCH]
   src2deb prune RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]
                            [--keep N] [--dry-run]
+  src2deb check RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]
 
 Arguments:
   RECIPE_DIR            A directory containing a recipe.toml
@@ -104,6 +105,17 @@ Prune options:
   file the index names is never removed, and no index is rewritten. The pool is
   shared by every recipe built into the work directory for that suite and
   architecture, so pruning covers all of them.
+
+Check options:
+  --architecture ARCH  Check only ARCH's pool. By default every pool the suite
+                       holds is checked
+
+  A build validates that each component builds; this validates that what it
+  produced can be installed. Every package in the pool has its Depends and
+  Pre-Depends resolved against the target suite, the recipe's repositories, and
+  the pool itself, and whatever nothing satisfies is reported. Exits non-zero
+  when anything is unsatisfiable, so it gates a publish. A build ends with the
+  same check over its own architecture, as a note that does not fail the run.
 
 Common options:
   --suite SUITE        Build for SUITE, a Debian suite name such as trixie or
@@ -197,6 +209,8 @@ enum Command {
     Export(ExportArgs),
     /// Remove superseded packages from the pool.
     Prune(PruneArgs),
+    /// Check that the pool's packages can be installed.
+    Check(CheckArgs),
 }
 
 /// How much a run prints.
@@ -314,12 +328,13 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
 
     let (command, rest) = args
         .split_first()
-        .ok_or_else(|| "a subcommand is required: build, plan, export, prune".to_string())?;
+        .ok_or_else(|| "a subcommand is required: build, plan, export, prune, check".to_string())?;
     let command = match command.as_str() {
         "build" => Command::Build(parse_build(rest)?),
         "plan" => Command::Plan(parse_plan(rest)?),
         "export" => Command::Export(parse_export(rest)?),
         "prune" => Command::Prune(parse_prune(rest)?),
+        "check" => Command::Check(parse_check(rest)?),
         other => return Err(format!("unknown subcommand {other}")),
     };
     Ok(Cli { command })
@@ -626,6 +641,34 @@ fn parse_prune(rest: &[String]) -> Result<PruneArgs, String> {
     })
 }
 
+/// The arguments to the `check` subcommand.
+#[derive(Debug, PartialEq, Eq)]
+struct CheckArgs {
+    /// The directory holding `recipe.toml`.
+    recipe_dir: PathBuf,
+    /// The working directory holding the pool to check.
+    work: PathBuf,
+    /// The target suite, overriding the recipe's own when given.
+    suite: Option<String>,
+    /// The single architecture to check, or `None` for every pool the suite
+    /// holds.
+    architecture: Option<String>,
+    /// How much to print.
+    verbosity: Verbosity,
+}
+
+/// Parses the `check` subcommand's arguments.
+fn parse_check(rest: &[String]) -> Result<CheckArgs, String> {
+    let common = common_args(rest, Retargets::READS, |_flag, _iter| Ok(false))?;
+    Ok(CheckArgs {
+        recipe_dir: common.recipe_dir,
+        work: common.work,
+        suite: common.suite,
+        architecture: common.architecture,
+        verbosity: common.verbosity,
+    })
+}
+
 /// Parses a `--keep N` value: a positive integer.
 ///
 /// Zero is refused here rather than inside the run: a pool kept at nothing is
@@ -693,6 +736,7 @@ fn execute(args: &[String]) -> Result<ExitCode, Fault> {
         Command::Plan(args) => plan(args),
         Command::Export(args) => export(args),
         Command::Prune(args) => prune(args),
+        Command::Check(args) => check(args),
     }
 }
 
@@ -874,6 +918,14 @@ fn build(args: BuildArgs) -> Result<ExitCode, Fault> {
         };
         print_prune(&engine.prune(&recipe, &options)?, args.verbosity);
     }
+    // The run built packages; whether they can be *installed* is a separate
+    // question, and the last one worth asking before they are published. Only
+    // when the run built something: a run that published nothing has nothing
+    // new to say about a pool it did not change, and a cancelled one did not
+    // finish.
+    if !report.built.is_empty() && !report.cancelled {
+        check_after_build(&engine, &recipe, args.verbosity);
+    }
     Ok(ExitCode::from(exit_status(&report)))
 }
 
@@ -1017,6 +1069,137 @@ fn prune(args: PruneArgs) -> Result<ExitCode, Fault> {
     let engine = Engine::new(args.work);
     print_prune(&engine.prune(&recipe, &options)?, args.verbosity);
     Ok(ExitCode::SUCCESS)
+}
+
+/// Runs the `check` subcommand: resolves every pool package's runtime
+/// dependencies against the archive and reports the ones nothing satisfies.
+///
+/// `--architecture` narrows which pools are visited rather than retargeting the
+/// recipe — the same shape `export` and `prune` take, and for the same reason.
+///
+/// Exits non-zero when anything is unsatisfiable, so a script can put this
+/// between a build and a publish and let the status decide. A build runs the
+/// same check as a note that does not fail it; this is the form that gates.
+fn check(args: CheckArgs) -> Result<ExitCode, Fault> {
+    let recipe = load_recipe(&args.recipe_dir, args.suite, None, None, None)?;
+    let options = src2deb::CheckOptions {
+        architectures: args.architecture.into_iter().collect(),
+    };
+    let engine = Engine::new(args.work);
+    let report = engine.check(&recipe, &options, &mut |event| {
+        report_check(&recipe, event, args.verbosity)
+    })?;
+    print_check(&report, args.verbosity);
+    Ok(ExitCode::from(u8::from(!report.is_clean())))
+}
+
+/// Prints one check progress event.
+///
+/// Each announces work about to happen rather than work done, because a check
+/// spends its whole time resolving against the archive and says nothing while
+/// it does. The second event only fires when a check costs more than the one
+/// resolve it usually does, which is what it is for: it says why a check that
+/// is taking longer is taking longer.
+fn report_check(recipe: &Recipe, event: src2deb::CheckProgress, verbosity: Verbosity) {
+    if verbosity == Verbosity::Quiet {
+        return;
+    }
+    match event {
+        src2deb::CheckProgress::Resolving {
+            architecture,
+            packages,
+        } => eprintln!(
+            "src2deb: resolving {packages} package(s) in {}/{architecture} against the archive",
+            recipe.suite,
+        ),
+        src2deb::CheckProgress::ResolvingNames { names } => eprintln!(
+            "src2deb: {names} dependency name(s) the install set did not account for; \
+             resolving them directly"
+        ),
+        // The event type is non-exhaustive, so anything added later is passed
+        // over rather than breaking this build — as the run reporter does.
+        _ => {}
+    }
+}
+
+/// Runs the installability check over the run's own architecture, as a closing
+/// note on a build.
+///
+/// Best-effort: a check that cannot reach the archive says so and leaves the
+/// run's outcome alone. The packages were built and published either way, and
+/// failing to *ask* whether they install is not a failure to build them.
+///
+/// Report-only, likewise. A pool is often built before the packages that
+/// complete it — a recipe supplying a dependency may not have run yet — so a
+/// hard failure here would refuse a legitimate order of work. `src2deb check`
+/// is where the same answer gates.
+fn check_after_build(engine: &Engine, recipe: &Recipe, verbosity: Verbosity) {
+    let options = src2deb::CheckOptions {
+        architectures: vec![recipe.architecture.clone()],
+    };
+    let outcome = engine.check(recipe, &options, &mut |event| {
+        report_check(recipe, event, verbosity)
+    });
+    match outcome {
+        Ok(report) => print_check(&report, verbosity),
+        Err(err) => eprintln!("src2deb: could not check whether the packages install: {err}"),
+    }
+}
+
+/// Prints what a check found: each unsatisfiable dependency, a line per pool,
+/// and then the total.
+///
+/// An unsatisfiable dependency is printed whatever the verbosity, including
+/// quiet: it is the answer the check exists to give, and the one thing a caller
+/// that asked for nothing else still needs.
+fn print_check(report: &src2deb::CheckReport, verbosity: Verbosity) {
+    for pool in &report.pools {
+        for entry in &pool.unsatisfied {
+            eprintln!(
+                "src2deb: {}: {}: {}: {}",
+                pool.architecture,
+                entry.package,
+                entry.relationship.field(),
+                entry.clause,
+            );
+        }
+        if verbosity != Verbosity::Quiet {
+            eprintln!(
+                "src2deb: {}: {} package(s), {} dependencies, {}",
+                pool.architecture,
+                pool.packages,
+                pool.clauses,
+                match pool.unsatisfied.len() {
+                    0 => "all satisfiable".to_string(),
+                    count => format!("{count} unsatisfiable"),
+                },
+            );
+        }
+    }
+    if report.is_clean() {
+        if verbosity != Verbosity::Quiet {
+            eprintln!(
+                "src2deb: {} pool(s) checked: {} package(s), every dependency satisfiable",
+                report.pools.len(),
+                report.packages(),
+            );
+        }
+        return;
+    }
+    // The remedy, not just the count: the packages above name something that is
+    // not in the suite, in the recipe's repositories, or in the pool, and every
+    // way out of that is a change to what is built or to what is depended on.
+    eprintln!(
+        "src2deb: {} unsatisfiable dependenc{} across {} pool(s); apt will refuse those \
+         packages until something provides what they name",
+        report.unsatisfied(),
+        if report.unsatisfied() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        report.pools.len(),
+    );
 }
 
 /// Prints what pruning removed, a line per pool and then the total.
@@ -1588,6 +1771,14 @@ mod tests {
         }
     }
 
+    /// Unwraps a parsed `check` command's arguments.
+    fn check_args(args: &[&str]) -> CheckArgs {
+        match parse(args).unwrap().command {
+            Command::Check(check) => check,
+            other => panic!("expected a check command, got {other:?}"),
+        }
+    }
+
     #[test]
     fn export_requires_a_destination_and_carries_every_architecture_by_default() {
         let args = export_args(&["export", "recipes/cosmic", "--to", "/srv/drop/rk1"]);
@@ -1678,6 +1869,42 @@ mod tests {
                 .unwrap_err()
                 .contains("--keep requires a value")
         );
+    }
+
+    #[test]
+    fn check_visits_every_architecture_unless_narrowed() {
+        let args = check_args(&["check", "r"]);
+        assert_eq!(args.recipe_dir, PathBuf::from("r"));
+        assert_eq!(args.work, PathBuf::from("work"));
+        // Unset, so every pool the suite holds is checked: a package that
+        // installs on one architecture and not on another is exactly what this
+        // is for.
+        assert_eq!(args.architecture, None);
+
+        let args = check_args(&["check", "r", "--work", "/mnt/w", "--suite", "forky", "-q"]);
+        assert_eq!(args.work, PathBuf::from("/mnt/w"));
+        assert_eq!(args.suite.as_deref(), Some("forky"));
+        assert_eq!(args.verbosity, Verbosity::Quiet);
+        assert_eq!(
+            check_args(&["check", "r", "--architecture", "arm64"]).architecture,
+            Some("arm64".to_string()),
+        );
+    }
+
+    #[test]
+    fn check_refuses_a_target_flag_it_could_not_act_on() {
+        // A check reads a pool a run already stamped, so it has no version to
+        // tag and no arch-indep output to hand anywhere. Naming either is a
+        // usage error rather than a flag that is read and ignored.
+        for flag in [
+            ["check", "r", "--version-tag", "deb13"],
+            ["check", "r", "--arch-indep-owner", "arm64"],
+        ] {
+            assert!(
+                parse(&flag).unwrap_err().contains("unrecognized option"),
+                "{flag:?}"
+            );
+        }
     }
 
     #[test]

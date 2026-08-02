@@ -520,7 +520,11 @@ fn read_plan_key(sidecar: &Path) -> Result<Option<String>> {
 /// Adds each recipe [`Repository`](RecipeRepository) to a Debian builder as an
 /// additional archive, resolving its suite and mirror against the recipe's
 /// primary when it leaves them unset.
-fn add_repositories<'a>(
+///
+/// Shared with [`crate::check`], so a runtime dependency is judged available
+/// against exactly the archives a build root is provisioned from rather than
+/// against a second reading of the same recipe fields.
+pub(crate) fn add_repositories<'a>(
     mut builder: DebianBuilder<'a>,
     repositories: &[RecipeRepository],
     default_suite: &str,
