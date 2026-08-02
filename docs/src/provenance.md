@@ -83,17 +83,27 @@ names four things:
 - `role` — what part the input played in assembling the tree. The component's own
   source is `source`; a [packaging overlay](recipes.md#packaging-overlays) is
   `packaging`; a [patch series](recipes.md#patches) is `patches`.
-- `kind` — what sort of input it is. A git checkout is `git`; a tree on disk is
-  `path`; a patch series is `patches`.
+- `kind` — what sort of input it is. A git checkout is `git`; a source tree on
+  disk is `path`; a patch series is `patches`; a packaging directory on disk is
+  `tree`.
 - `value` — what identifies it. For `git`, the exact `HEAD` the tree was checked
   out at, so a branch or default-branch ref is recorded as the concrete revision
   it resolved to, not the moving ref that named it. For `path`, the canonical
   directory the tree was read from, so the record names one path however the
   recipe reached it. For `patches`, a SHA-256 over the series' members in the
-  order they were applied.
+  order they were applied. For `tree`, a SHA-256 over the contents of the
+  `debian/` directory the overlay supplied.
 - `pinned` — whether the value names the exact content that went into the build.
   A hash does. A value that only says where a tree was read from does not, since
   the tree may be anything by the time the record is read.
+
+`tree` and `path` both name a directory on disk and differ in what is recorded
+about it. A [packaging overlay](recipes.md#packaging-overlays) contributes one
+small directory that nothing writes to, so src2deb measures it and records what
+it held; a component's own source is an arbitrarily large tree the build writes
+into, so the record names where it was read from and says plainly that it pins
+nothing. The recipe stays the authority for *where* either was; the manifest is
+the authority for *what* the first held.
 
 A build from a tree on disk therefore records:
 

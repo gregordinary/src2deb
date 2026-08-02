@@ -112,6 +112,20 @@ pub enum SourceKind {
     /// the archive of an upstream release without knowing which digest is
     /// which.
     Patches,
+    /// A directory on disk, valued by a SHA-256 digest over its contents.
+    ///
+    /// What a [packaging overlay](crate::Component::packaging) taken from a
+    /// path records. Only the `debian/` tree the overlay supplied is digested,
+    /// which is exactly what src2deb copied out of it, so the value names what
+    /// reached the build and not what happened to sit beside it.
+    ///
+    /// Pinned, and a kind of its own for the same reason
+    /// [`Patches`](Self::Patches) is: a [`Sha256`](Self::Sha256) is a digest
+    /// something else declared and src2deb verified — the recipe names the
+    /// artefact and the archive still serves it — while this one src2deb
+    /// measured off a directory the recipe pointed at. Both pin content; only
+    /// the first can be fetched again from what the record holds.
+    Tree,
     /// A tree on disk, valued by its path. The only unpinned kind: the path
     /// says where the tree was read from and nothing about what it held.
     Path,
@@ -124,6 +138,7 @@ impl SourceKind {
             SourceKind::Git => "git",
             SourceKind::Sha256 => "sha256",
             SourceKind::Patches => "patches",
+            SourceKind::Tree => "tree",
             SourceKind::Path => "path",
         }
     }
@@ -131,11 +146,11 @@ impl SourceKind {
     /// Whether a value of this kind names the exact content it stood for, so a
     /// later run can tell the same input from a different one.
     ///
-    /// A hash of either sort does. A path does not, and no amount of care at
-    /// the point it is read changes that.
+    /// A hash of any sort does. A path does not, and no amount of care at the
+    /// point it is read changes that.
     pub fn is_pinned(self) -> bool {
         match self {
-            SourceKind::Git | SourceKind::Sha256 | SourceKind::Patches => true,
+            SourceKind::Git | SourceKind::Sha256 | SourceKind::Patches | SourceKind::Tree => true,
             SourceKind::Path => false,
         }
     }
@@ -170,6 +185,18 @@ impl SourceInput {
         SourceInput {
             role,
             kind: SourceKind::Sha256,
+            value: digest.into(),
+        }
+    }
+
+    /// A directory on disk in `role`, given a SHA-256 digest over its contents.
+    ///
+    /// See [`SourceKind::Tree`] for what separates this from
+    /// [`sha256`](Self::sha256), which carries the same shape of value.
+    pub fn tree(role: SourceRole, digest: impl Into<String>) -> SourceInput {
+        SourceInput {
+            role,
+            kind: SourceKind::Tree,
             value: digest.into(),
         }
     }
@@ -223,7 +250,7 @@ impl SourceInput {
     /// none.
     fn short(&self) -> String {
         match self.kind {
-            SourceKind::Git | SourceKind::Sha256 | SourceKind::Patches => {
+            SourceKind::Git | SourceKind::Sha256 | SourceKind::Patches | SourceKind::Tree => {
                 self.value.chars().take(SHORT_HASH).collect()
             }
             SourceKind::Path => LOCAL.to_string(),
@@ -245,7 +272,9 @@ impl SourceInput {
     fn describe(&self) -> String {
         let value = match self.kind {
             SourceKind::Git | SourceKind::Patches => self.value.clone(),
-            SourceKind::Sha256 => format!("{}:{}", self.kind.label(), self.value),
+            SourceKind::Sha256 | SourceKind::Tree => {
+                format!("{}:{}", self.kind.label(), self.value)
+            }
             SourceKind::Path => LOCAL.to_string(),
         };
         format!("{} {value}", self.role.label())
@@ -458,6 +487,30 @@ mod tests {
         // rather than a digest standing in for it.
         assert_eq!(source.git_commit(), None);
         assert!(source.is_pinned());
+    }
+
+    #[test]
+    fn a_digested_directory_is_pinned_and_names_itself_as_one() {
+        // What a packaging overlay taken from a path records. It abbreviates
+        // like any other hash, and its prose names the kind, so a reader is not
+        // left to take a digest for a commit.
+        let source = Fingerprint::over(vec![
+            source(),
+            SourceInput::tree(SourceRole::Packaging, DIGEST),
+        ]);
+        assert_eq!(source.short(), "abc1234.9f8e7d6");
+        assert_eq!(
+            source.describe(),
+            format!("source {COMMIT}, packaging tree:{DIGEST}"),
+        );
+        assert!(source.is_pinned());
+        // ...and it is not the same input as a declared checksum of the same
+        // bytes. One was measured off a directory the recipe pointed at; the
+        // other pins an artefact that can be fetched again.
+        assert_ne!(
+            Fingerprint::of(SourceInput::tree(SourceRole::Packaging, DIGEST)),
+            Fingerprint::of(SourceInput::sha256(SourceRole::Packaging, DIGEST)),
+        );
     }
 
     #[test]

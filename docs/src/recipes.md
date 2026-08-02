@@ -279,10 +279,12 @@ A component with an overlay has two inputs, and both count:
 `SOURCE_GIT_HASH`, which packaging reads to stamp a revision into what it
 builds, is the *source's* commit and never the packaging repository's.
 
-### A worked example
+### Packaging kept beside the recipe
 
-Packaging kept in the same repository as the recipe, under a directory of its
-own:
+The other home for packaging is the recipe itself. Nothing has to be published
+or maintained in a second repository, and the packaging is versioned with the
+recipe that names it — which is what you want for a one-off, or for a component
+whose upstream will never carry a `debian/` of its own.
 
 ```toml
 [[components]]
@@ -292,13 +294,73 @@ packaging.path = "packaging/foo"
 ```
 
 `packaging.path` is relative to the recipe's own directory, as `source.path` and
-`patches` are, so `recipes/mine/packaging/foo/debian/` is what gets overlaid. A
-path is not a pinned input, so a component overlaid from one is recorded as
-unreproducible and is never skipped by `--skip-published` — the same rule
-`source.path` follows, for the same reason.
+`patches` are, so the recipe directory holds:
+
+```text
+recipes/mine/
+├── recipe.toml
+└── packaging/
+    └── foo/
+        └── debian/
+            ├── control
+            ├── rules
+            └── ...
+```
+
+One directory per component under `packaging/`, each holding the `debian/` tree
+to overlay. Nothing enforces that layout — `packaging.path` names any directory
+you like — but a recipe that follows it reads at a glance, and a component's
+packaging sits where someone looking for it will look.
 
 Nothing is ever written to a packaging source, so a path one is read where it
 lies rather than copied into the work directory.
+
+### What a path overlay is recorded as
+
+An overlay from a repository is identified by the revision it was checked out
+at. One from a path is identified by a **digest over the `debian/` tree it
+supplied**:
+
+```toml
+  [[component.source]]
+  role = "packaging"
+  kind = "tree"
+  value = "483b0e8..."
+  pinned = true
+```
+
+The digest covers exactly what src2deb copied — the `debian/` directory and
+nothing beside it — so a `README` next to your packaging never provokes a
+rebuild, and editing `debian/rules` always does. It is over what the directory
+*holds* rather than where it is, so moving the packaging or renaming the recipe
+directory does not republish every component built from it.
+
+That makes local packaging a pinned input, and a component overlaid from one is
+skippable by `--skip-published` exactly as one overlaid from a repository is.
+Note the contrast with `source.path`, which stays unpinned: a component's own
+source is an arbitrarily large tree that src2deb copies and the build writes
+into, while an overlay contributes one small directory that nothing writes to,
+so it can be measured cheaply and exactly.
+
+### Packaging from a repository, with your own changes
+
+There is one overlay per component, not a stack of them. To take a
+distribution's packaging and change part of it, overlay theirs and
+[patch](#patches) the rest:
+
+```toml
+[[components]]
+name = "foo"
+source.git = "https://github.com/example/foo"
+packaging.git = "https://salsa.debian.org/debian/foo"
+patches = ["patches/0001-build-with-our-features.patch"]
+```
+
+The series is applied after the overlay, so a patch reaches the packaging the
+overlay supplied. That is deliberately the only way to do it: a second overlay
+winning per file would let the packaging you layered over drift out from under
+you with no signal at all, while a patch that no longer applies fails the
+component and names itself.
 
 ## Components with no changelog
 

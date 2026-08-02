@@ -68,6 +68,12 @@
 //! upstream tree — the ordinary shape of a distribution's repository —
 //! contributes its packaging and not its idea of the source.
 //!
+//! An overlay from a repository is identified by the revision it was checked out
+//! at, and one from a path by a digest over the `debian/` tree it supplied —
+//! [`SourceKind::Tree`](crate::SourceKind::Tree). Both name what the overlay
+//! held, so a component packaged from a directory beside its recipe is as
+//! comparable from run to run as one packaged from a repository.
+//!
 //! # Path sources
 //!
 //! A path source is never built where it lies. The vendor pass binds the source
@@ -544,6 +550,9 @@ impl<'a> SourceResolver<'a> {
     /// and either is refused if it holds an unmaterialized Git LFS pointer. A
     /// path is read rather than copied because nothing ever writes to it — the
     /// build sees the component's tree, and the overlay reaches it by this copy.
+    /// That is also what makes a path overlay worth digesting where a path
+    /// source is not: the directory it contributes is small, bounded, and the
+    /// same at the end of the run as at the start. See [`tree_digest`].
     ///
     /// See [Packaging overlays](self#packaging-overlays) for what is taken and
     /// what is left.
@@ -587,13 +596,14 @@ impl<'a> SourceResolver<'a> {
                 let tree = source_tree(&origin, subdir);
                 refuse_missing_subdir(component, "packaging", subdir, &tree)?;
                 self.refuse_lfs_pointers(component, &tree)?;
+                // What the overlay held rather than where it was read from. The
+                // recipe already says where — it is the recipe that pointed at
+                // this directory — and a digest is the part a later run cannot
+                // recover for itself. See [`tree_digest`].
+                let digest = tree_digest(&packaging_source(component, &tree)?)?;
                 Ok(ResolvedTree {
                     tree,
-                    // The declared root rather than the subdir within it, as a
-                    // path source records: the recipe is the authority for
-                    // which part of a tree was taken, and the record for where
-                    // the tree was.
-                    input: SourceInput::path(SourceRole::Packaging, origin.to_string_lossy()),
+                    input: SourceInput::tree(SourceRole::Packaging, digest),
                 })
             }
             None => Err(Error::Source {
@@ -628,18 +638,7 @@ impl<'a> SourceResolver<'a> {
                 .map_err(|err| self.fail(component, err))?,
         )?;
 
-        let from = overlay.join(PACKAGING);
-        if !from.is_dir() {
-            return Err(Error::Source {
-                component: component.name.clone(),
-                reason: format!(
-                    "the packaging source at {} has no {PACKAGING} directory; a \
-                     packaging overlay supplies one, and packaging.subdir names \
-                     the directory holding it rather than the directory itself",
-                    overlay.display(),
-                ),
-            });
-        }
+        let from = packaging_source(component, overlay)?;
 
         // Inspected without following, so a `debian` that is a symlink is
         // removed as the link it is rather than reported as a directory that
@@ -1257,6 +1256,134 @@ fn source_tree(checkout: &Path, subdir: Option<&Path>) -> PathBuf {
 /// The directory a packaging overlay supplies, and the one path an overlay
 /// writes into the source tree.
 const PACKAGING: &str = "debian";
+
+/// The `debian/` directory within `overlay`, which is everything a packaging
+/// overlay contributes.
+///
+/// Both the copy that applies an overlay and the digest that identifies a path
+/// one work from this, so an overlay is identified by exactly the directory it
+/// contributes and nothing that happens to sit beside it.
+///
+/// A tree holding none fails the component. The likeliest cause is a
+/// `packaging.subdir` naming the `debian/` directory itself rather than the
+/// directory holding it, so the message names that as well as the absence.
+fn packaging_source(component: &Component, overlay: &Path) -> Result<PathBuf> {
+    let from = overlay.join(PACKAGING);
+    if from.is_dir() {
+        return Ok(from);
+    }
+    Err(Error::Source {
+        component: component.name.clone(),
+        reason: format!(
+            "the packaging source at {} has no {PACKAGING} directory; a \
+             packaging overlay supplies one, and packaging.subdir names the \
+             directory holding it rather than the directory itself",
+            overlay.display(),
+        ),
+    })
+}
+
+/// A SHA-256 over the contents of the directory at `root`: what it holds, and
+/// not where it is.
+///
+/// This is how a [packaging overlay](self#packaging-overlays) taken from a path
+/// is identified. A path says where a tree was read from and nothing about what
+/// it held, which is all a component's own source can offer — that tree is
+/// arbitrarily large, and the build writes into the copy of it — but an
+/// overlay's contribution is one small directory that nothing ever writes to.
+/// Digesting it costs a walk of a `debian/` tree, and in exchange a build from
+/// local packaging is as comparable as one from a repository: the version stamp
+/// names the packaging, the manifest records what it held, and editing it
+/// triggers a rebuild under `--skip-published`.
+///
+/// What reaches the digest is what [`copy_tree`] would carry across, in the same
+/// terms:
+///
+/// - each entry's path relative to `root`, so the digest does not move when the
+///   directory does;
+/// - for a file, whether it is executable, then its contents. That one mode bit
+///   and no more: it is the bit git itself tracks, so packaging that round trips
+///   through a repository digests the same on both sides whatever umask wrote it
+///   out, and it is the only bit that changes what the build does, since
+///   `debian/rules` must be executable;
+/// - for a symlink, the target it is recreated with, which is not followed —
+///   just as the copy does not follow it;
+/// - for a directory, its presence, so an empty one counts.
+///
+/// Anything else — a socket, a fifo, a device node — is passed over exactly as
+/// the copy passes over it: it is not packaging, and it does not reach the
+/// build.
+///
+/// Entries are taken in order of their names, so the walk does not depend on the
+/// order the filesystem hands them back, and every field is length-prefixed and
+/// every entry tagged with its kind, so no two different trees can present the
+/// same bytes: a file named `a` holding `bc` digests apart from a file named
+/// `ab` holding `c`.
+fn tree_digest(root: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hash_directory(root, Path::new(""), &mut hasher)?;
+    Ok(crate::fingerprint::hex(&hasher.finalize()))
+}
+
+/// Feeds the contents of the directory at `dir`, which sits at `relative`
+/// within the tree being digested, to `hasher`. See [`tree_digest`].
+fn hash_directory(dir: &Path, relative: &Path, hasher: &mut sha2::Sha256) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut entries = std::fs::read_dir(dir)
+        .map_err(|err| io_error("reading", dir, err))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|err| io_error("reading", dir, err))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let from = entry.path();
+        let path = relative.join(entry.file_name());
+        let metadata =
+            std::fs::symlink_metadata(&from).map_err(|err| io_error("inspecting", &from, err))?;
+        let kind = metadata.file_type();
+        // The leading tag is what keeps the three kinds apart, so a file cannot
+        // be fed the same bytes as a symlink naming its contents.
+        if kind.is_symlink() {
+            let target =
+                std::fs::read_link(&from).map_err(|err| io_error("reading", &from, err))?;
+            field(hasher, b"link");
+            field(hasher, path.as_os_str().as_bytes());
+            field(hasher, target.as_os_str().as_bytes());
+        } else if kind.is_dir() {
+            field(hasher, b"dir");
+            field(hasher, path.as_os_str().as_bytes());
+            hash_directory(&from, &path, hasher)?;
+        } else if kind.is_file() {
+            let contents = std::fs::read(&from).map_err(|err| io_error("reading", &from, err))?;
+            field(hasher, b"file");
+            field(hasher, path.as_os_str().as_bytes());
+            field(
+                hasher,
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    b"-"
+                } else {
+                    b"x"
+                },
+            );
+            field(hasher, &contents);
+        }
+    }
+    Ok(())
+}
+
+/// Feeds one length-prefixed field to a tree digest, so that two trees differing
+/// only in where one field ends and the next begins cannot digest the same. See
+/// [`tree_digest`].
+fn field(hasher: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest;
+
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
 
 /// The file a declared version writes into the source tree.
 const CHANGELOG: &str = "debian/changelog";
@@ -1970,6 +2097,170 @@ mod tests {
             series_digest(&series(&[("a.patch", "onetwo")])),
             series_digest(&series(&[("a.patch", "one"), ("b.patch", "two")])),
         );
+    }
+
+    /// A packaging tree built from `files`, each a path and its contents.
+    fn digest_of(label: &str, files: &[(&str, &str)]) -> (PathBuf, String) {
+        let root = scratch(label);
+        for (path, contents) in files {
+            write(&root.join(path), contents);
+        }
+        let digest = tree_digest(&root).unwrap();
+        (root, digest)
+    }
+
+    #[test]
+    fn a_tree_digest_is_a_hash_of_what_the_directory_holds() {
+        let (root, digest) = digest_of(
+            "digest-shape",
+            &[
+                ("control", "Source: pkg\n"),
+                ("rules", "#!/usr/bin/make -f\n"),
+            ],
+        );
+        assert_eq!(digest.len(), 64);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // The same contents digest the same wherever the directory sits, which
+        // is what lets a recipe move its packaging without republishing every
+        // component built from it.
+        let (elsewhere, again) = digest_of(
+            "digest-shape-moved",
+            &[
+                ("control", "Source: pkg\n"),
+                ("rules", "#!/usr/bin/make -f\n"),
+            ],
+        );
+        assert_eq!(digest, again);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn a_tree_digest_follows_every_edit_that_reaches_the_build() {
+        let base: &[(&str, &str)] = &[
+            ("control", "Source: pkg\n"),
+            ("rules", "#!/usr/bin/make -f\n"),
+        ];
+        let (root, digest) = digest_of("digest-base", base);
+
+        // Editing a file, adding one, and removing one are each a different
+        // tree — the whole reason a packaging directory is digested at all.
+        for (label, files) in [
+            (
+                "digest-edited",
+                vec![
+                    ("control", "Source: renamed\n"),
+                    ("rules", "#!/usr/bin/make -f\n"),
+                ],
+            ),
+            (
+                "digest-added",
+                vec![
+                    ("control", "Source: pkg\n"),
+                    ("rules", "#!/usr/bin/make -f\n"),
+                    ("install", "usr/bin/pkg\n"),
+                ],
+            ),
+            ("digest-removed", vec![("control", "Source: pkg\n")]),
+            // A file's name is part of the tree: the same bytes installed under
+            // another name is different packaging.
+            (
+                "digest-renamed",
+                vec![
+                    ("control", "Source: pkg\n"),
+                    ("makefile", "#!/usr/bin/make -f\n"),
+                ],
+            ),
+            // ...and a nested file is not the same as one at the top level.
+            (
+                "digest-nested",
+                vec![
+                    ("control", "Source: pkg\n"),
+                    ("rules", "#!/usr/bin/make -f\n"),
+                    ("source/format", "3.0 (native)\n"),
+                ],
+            ),
+        ] {
+            let (other, moved) = digest_of(label, &files);
+            assert_ne!(digest, moved, "{label} digested the same as the base");
+            let _ = std::fs::remove_dir_all(&other);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tree_digest_carries_the_executable_bit_and_nothing_else_of_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `debian/rules` must be executable to build at all, so that bit is part
+        // of the packaging. The rest of the mode is not: it is whatever umask
+        // wrote the tree out, and git does not track it either — so a directory
+        // that round trips through a repository has to digest the same.
+        let (root, plain) = digest_of("digest-mode", &[("rules", "#!/usr/bin/make -f\n")]);
+        let rules = root.join("rules");
+
+        std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let executable = tree_digest(&root).unwrap();
+        assert_ne!(plain, executable);
+
+        std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert_eq!(tree_digest(&root).unwrap(), executable);
+        std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(tree_digest(&root).unwrap(), plain);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tree_digest_records_a_symlink_by_its_target_without_following_it() {
+        let root = scratch("digest-symlink");
+        write(&root.join("control"), "Source: pkg\n");
+        std::os::unix::fs::symlink("control", root.join("link")).unwrap();
+        let digest = tree_digest(&root).unwrap();
+
+        // Re-pointed is a different tree...
+        std::fs::remove_file(root.join("link")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", root.join("link")).unwrap();
+        assert_ne!(digest, tree_digest(&root).unwrap());
+
+        // ...and a link is not the file it names, which is what the entry tags
+        // keep apart. The copy recreates it as a link, so the digest reads it
+        // as one.
+        std::fs::remove_file(root.join("link")).unwrap();
+        write(&root.join("link"), "elsewhere");
+        assert_ne!(digest, tree_digest(&root).unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tree_digest_counts_an_empty_directory() {
+        // The copy carries one across, so a tree that gained one is a tree that
+        // changed. `debian/patches` with no series in it is the shape this comes
+        // up as.
+        let root = scratch("digest-empty-dir");
+        write(&root.join("control"), "Source: pkg\n");
+        let digest = tree_digest(&root).unwrap();
+
+        std::fs::create_dir_all(root.join("patches")).unwrap();
+        assert_ne!(digest, tree_digest(&root).unwrap());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tree_digest_cannot_be_confused_by_where_one_field_ends() {
+        // Length-prefixing is what stops a path running into the contents that
+        // follow it: `a` holding `bc` and `ab` holding `c` are different trees.
+        let (first, one) = digest_of("digest-fields-a", &[("a", "bc")]);
+        let (second, two) = digest_of("digest-fields-b", &[("ab", "c")]);
+        assert_ne!(one, two);
+
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
     }
 
     #[test]

@@ -1170,7 +1170,9 @@ fn plan_source(source: &Fingerprint) -> String {
         .map(|input| {
             let value = match input.kind() {
                 SourceKind::Git | SourceKind::Patches => abbreviate(input.value()).to_string(),
-                SourceKind::Sha256 => format!("sha256:{}", abbreviate(input.value())),
+                SourceKind::Sha256 | SourceKind::Tree => {
+                    format!("{}:{}", input.kind().label(), abbreviate(input.value()))
+                }
                 // A path abbreviated is a path with its identifying part cut
                 // off, so it is printed whole. It stays on this terminal; only
                 // the marker in the version reaches a package.

@@ -78,9 +78,13 @@ And what is taken *replaces* the source's own `debian/` rather than merging with
 it, so there is no per-file precedence to reason about and nothing of an
 abandoned packaging tree left beside the declared one.
 
-An overlay is a build input like any other: both revisions reach the version
-stamp and the manifest, and `--skip-published` rebuilds when either moves. See
-[Packaging overlays](recipes.md#packaging-overlays).
+An overlay is a build input like any other: both inputs reach the version stamp
+and the manifest, and `--skip-published` rebuilds when either moves. An overlay
+from a repository is identified by its revision, and one from a directory on
+disk by a digest over the `debian/` tree it supplied — so packaging kept beside
+the recipe is as comparable from run to run as packaging kept in a repository,
+and editing it publishes a new package. See [Packaging
+overlays](recipes.md#packaging-overlays).
 
 ### Versions for packaging with no history
 

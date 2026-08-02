@@ -290,10 +290,13 @@ reads without any of them having to be guessed at:
     patches 5f2e1a9c3b8d.
 ```
 
-A tree on disk appears as `local` rather than as the path it was read from: this
-text ships inside the `.deb`, and a build host's directory layout is not
-something a package should carry. The manifest, which stays in the work
-directory, records the path.
+A `source.path` tree appears as `local` rather than as the path it was read
+from: this text ships inside the `.deb`, and a build host's directory layout is
+not something a package should carry. The manifest, which stays in the work
+directory, records the path. A packaging overlay taken from a path carries a
+digest of what it held rather than a path in the first place, so it reads as
+`packaging tree:483b0e8...` and names its kind so a digest is not taken for a
+commit.
 
 The entry lands on the build's own copy of the source tree, inside the cage —
 not on the resolved checkout in the work directory. The checkout keeps

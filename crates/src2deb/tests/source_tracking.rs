@@ -11,6 +11,7 @@
 //! These drive real `git` against local repositories, so the ones that need it
 //! are skipped when `git` is unavailable.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -1247,17 +1248,91 @@ fn a_packaging_overlay_from_a_tree_on_disk_is_read_where_it_lies() {
         "a path packaging source was copied for no reason",
     );
 
-    // Two unpinned inputs: a path says where a tree was read from and nothing
-    // about what it held, whichever of a component's trees it names. The role
-    // is what tells them apart, since the version marks both the same way.
+    // The overlay is identified by what it held rather than by where it was
+    // read from — a digest over the `debian/` tree it supplied — so the version
+    // names the packaging rather than marking it `local`.
     assert_eq!(resolved.source.len(), 2);
-    assert!(!resolved.source.is_pinned());
-    assert_eq!(resolved.source.short(), "local.local");
-    assert_eq!(resolved.source.inputs()[1].role(), SourceRole::Packaging);
+    let overlay = &resolved.source.inputs()[1];
+    assert_eq!(overlay.role(), SourceRole::Packaging);
+    assert_eq!(overlay.kind(), src2deb::SourceKind::Tree);
+    assert!(overlay.is_pinned());
+    assert_eq!(overlay.value().len(), 64);
     assert_eq!(
-        resolved.source.inputs()[1].value(),
-        packaging.canonicalize().unwrap().to_string_lossy(),
+        resolved.source.short(),
+        format!("local.{}", &overlay.value()[..7])
     );
+    // The component's own source is still a path, and one unpinned input is
+    // enough to leave the whole build uncomparable.
+    assert!(!resolved.source.is_pinned());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_path_packaging_overlay_is_identified_by_what_it_holds_not_where_it_is() {
+    // The property that makes a directory beside the recipe as good an input as
+    // a repository: editing it is a different build, moving it is not.
+    let root = scratch("overlay-digest");
+    let upstream = root.join("working-tree");
+    write_bare_tree(&upstream, "v1");
+    let packaging = root.join("packaging");
+    write_packaging(&packaging, "first");
+
+    let resolver = resolver_in(&root, &root);
+    let comp = overlaid_from_path(path_component("pkg", &upstream), &packaging);
+    let before = resolver.resolve(&comp).expect("resolve").source;
+
+    // Editing the packaging is a different build...
+    write_packaging(&packaging, "second");
+    let edited = resolver.resolve(&comp).expect("re-resolve").source;
+    assert_ne!(before, edited);
+
+    // ...and so is changing what `debian/rules` may do, which is the one mode
+    // bit the digest carries.
+    let rules = packaging.join("debian/rules");
+    std::fs::write(&rules, "#!/usr/bin/make -f\n").unwrap();
+    let plain = resolver.resolve(&comp).expect("re-resolve").source;
+    std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = resolver.resolve(&comp).expect("re-resolve").source;
+    assert_ne!(plain, executable);
+
+    // Moving the same packaging elsewhere is not: the digest is over what the
+    // directory holds, so a recipe that relocates its packaging does not
+    // republish every component that uses it.
+    let moved = root.join("elsewhere/packaging");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&packaging, &moved).unwrap();
+    let relocated = resolver
+        .resolve(&overlaid_from_path(
+            path_component("pkg", &upstream),
+            &moved,
+        ))
+        .expect("resolve from the new location")
+        .source;
+    assert_eq!(relocated, executable);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_path_packaging_overlay_is_identified_by_debian_alone() {
+    // Only `debian/` is copied out of an overlay, so only `debian/` may reach
+    // its identity: a file beside it that never enters the build must not
+    // provoke a rebuild of everything that uses the directory.
+    let root = scratch("overlay-digest-bounded");
+    let upstream = root.join("working-tree");
+    write_bare_tree(&upstream, "v1");
+    let packaging = root.join("packaging");
+    write_packaging(&packaging, "the packaging");
+
+    let resolver = resolver_in(&root, &root);
+    let comp = overlaid_from_path(path_component("pkg", &upstream), &packaging);
+    let before = resolver.resolve(&comp).expect("resolve").source;
+
+    std::fs::write(packaging.join("README.md"), "notes for a human\n").unwrap();
+    std::fs::create_dir_all(packaging.join("notes")).unwrap();
+    let after = resolver.resolve(&comp).expect("re-resolve").source;
+    assert_eq!(before, after);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1278,12 +1353,16 @@ fn a_packaging_subdir_names_the_directory_holding_debian() {
     let resolved = resolver.resolve(&comp).expect("resolve");
     assert_eq!(packaging_marker(&resolved.tree), "from a subdirectory");
 
-    // The record names the tree the recipe declared, as a path source does; the
-    // recipe stays the authority for which part of it was taken.
-    assert_eq!(
-        resolved.source.inputs()[1].value(),
-        packaging.canonicalize().unwrap().to_string_lossy(),
-    );
+    // The record names the `debian/` tree that was actually taken, so a subdir
+    // is not something a reader of the manifest has to apply for themselves.
+    let taken = resolver
+        .resolve(&overlaid_from_path(
+            path_component("pkg", &upstream),
+            &packaging.join("pkg"),
+        ))
+        .expect("resolve the same packaging named directly")
+        .source;
+    assert_eq!(resolved.source.inputs()[1], taken.inputs()[1]);
 
     let _ = std::fs::remove_dir_all(&root);
 }
