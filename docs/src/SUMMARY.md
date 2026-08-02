@@ -6,6 +6,7 @@
 
 - [Quick start](quick-start.md)
 - [Using the pool](using-the-pool.md)
+- [Publishing to an archive](publishing.md)
 - [Troubleshooting](troubleshooting.md)
 
 # Writing recipes

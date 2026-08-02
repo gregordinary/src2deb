@@ -1,34 +1,43 @@
 # Command line
 
-Two subcommands: `build` runs a recipe, `plan` resolves and orders one without
-building. Both take a recipe directory and the same target options.
+Three subcommands: `build` runs a recipe, `plan` resolves and orders one without
+building, and `export` copies what a work directory holds out for an archive.
+All three take a recipe directory and the same target options.
 
 ```sh
-src2deb build RECIPE_DIR [options]
-src2deb plan  RECIPE_DIR [options]
+src2deb build  RECIPE_DIR [options]
+src2deb plan   RECIPE_DIR [options]
+src2deb export RECIPE_DIR --to DIR [options]
 ```
 
 `RECIPE_DIR` is a directory containing a `recipe.toml`. Exactly one is required,
 and it may appear before or after the options.
 
+Each subcommand takes the work directory's exclusive lock for as long as it
+runs, so only one of them works on a `--work` directory at a time.
+
 ## Target options
 
-Accepted by both subcommands. Each overrides the corresponding recipe field, so
-one recipe serves every target it builds against.
+Each overrides the corresponding recipe field, so one recipe serves every target
+it builds against.
 
-| Option | Effect |
-| --- | --- |
-| `--work DIR` | The working directory for sources, build roots, the package cache, the pool, and output. Defaults to `./work` |
-| `--suite SUITE` | Build for a Debian suite such as `trixie` or `forky`, superseding the recipe's `suite` and the `version-tag` that described it |
-| `--architecture ARCH` | Build for a Debian architecture such as `amd64` or `arm64`. A recipe naming none builds for the host |
-| `--arch-indep-owner ARCH` | Leave the recipe's `Architecture: all` packages to `ARCH`. Unset, every run produces its own |
-| `--version-tag TAG` | Stamp built versions with `TAG`, such as `deb13`, overriding both the recipe's `version-tag` and the tag derived from the suite |
+| Option | Subcommands | Effect |
+| --- | --- | --- |
+| `--work DIR` | all | The working directory for sources, build roots, the package cache, the pool, and output. Defaults to `./work` |
+| `--suite SUITE` | all | Build for a Debian suite such as `trixie` or `forky`, superseding the recipe's `suite` and the `version-tag` that described it |
+| `--architecture ARCH` | all | Build for a Debian architecture such as `amd64` or `arm64`. A recipe naming none builds for the host. For `export` it narrows what is read rather than retargeting anything |
+| `--arch-indep-owner ARCH` | all | Leave the recipe's `Architecture: all` packages to `ARCH`. Unset, every run produces its own |
+| `--version-tag TAG` | `build`, `plan` | Stamp built versions with `TAG`, such as `deb13`, overriding both the recipe's `version-tag` and the tag derived from the suite |
 
-`--suite`, `--architecture`, `--arch-indep-owner`, and `--version-tag` are
-validated as they are parsed, so a malformed value is a usage error against the
-flag rather than a failure partway into the run. Each suite and architecture pair gets its own pool,
-output tree, and manifest, so runs for several targets share one `--work`
-directory. See [Cross-architecture builds](cross-architecture.md) and
+`--version-tag` is not accepted where it would do nothing: an `export` carries
+packages a run already stamped, so it has no version to tag. Naming it there is
+a usage error rather than a silently ignored flag.
+
+Every value is validated as it is parsed, so a malformed one is a usage error
+against the flag rather than a failure partway into the run. Each suite and
+architecture pair gets its own pool, output tree, and manifest, so runs for
+several targets share one `--work` directory. See
+[Cross-architecture builds](cross-architecture.md) and
 [Package versions](package-versions.md).
 
 ## Build options
@@ -71,6 +80,17 @@ derived before a build stamps it into a package:
      version: 1.2.3
 ```
 
+## Export options
+
+| Option | Effect |
+| --- | --- |
+| `--to DIR` | Write the export to `DIR/<suite>/`. Required |
+| `--architecture ARCH` | Carry only `ARCH`. By default an export carries every architecture the work directory records a build for |
+
+An export carries every component the work directory records as **built**, not
+only what the last run produced, and replaces whatever the export before it left
+in the same directory. See [Publishing to an archive](publishing.md).
+
 ## Verbosity
 
 | Option | Prints |
@@ -110,9 +130,9 @@ spaces. Under `--jobs N` each line also carries its component's name. See
 
 | Status | Meaning |
 | --- | --- |
-| `0` | Every selected component built, or was skipped as already built |
+| `0` | Every selected component built, or was skipped as already built; or an export finished |
 | `1` | A component failed, or the run stopped before the build phase |
-| `2` | A usage error: an unknown option, a malformed value, or a selection naming a component the recipe does not have |
+| `2` | A usage error: an unknown option, a malformed value, a missing `--to`, or a selection naming a component the recipe does not have |
 | `130` | The run was cancelled with Ctrl-C or `SIGTERM` |
 
 `130` outranks a component failure: a cancelled run did not finish, so nothing

@@ -1379,6 +1379,27 @@ impl Engine {
         })
     }
 
+    /// Copies every package the work directory records as built for `recipe`
+    /// into an export directory an archive tool ingests, and reports what it
+    /// carried.
+    ///
+    /// Reads the work directory and writes nothing into it, so it neither
+    /// resolves a source nor provisions a root — but it reads the output trees
+    /// and manifests a run writes, so it takes the same lock a build does rather
+    /// than reading them while a run is replacing them.
+    ///
+    /// The recipe supplies the name, the suite, and the arch-indep owner. Which
+    /// architectures are carried comes from the work directory; see
+    /// [`crate::export`].
+    pub fn export(
+        &self,
+        recipe: &Recipe,
+        options: &crate::export::ExportOptions,
+    ) -> Result<crate::export::ExportReport> {
+        let _lock = self.lock_work_dir()?;
+        crate::export::export(&self.work_dir, recipe, options)
+    }
+
     /// Resolves every component's source, reads its `debian/control`, and
     /// computes the build order over the components that resolved. The shared
     /// front half of [`run`](Self::run) and [`plan`](Self::plan).

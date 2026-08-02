@@ -108,6 +108,8 @@ pub enum Error {
     Cancelled,
     /// A local pool operation failed.
     Pool(String),
+    /// An export could not be assembled from the work directory.
+    Export(String),
     /// The work directory is already locked by another run.
     WorkLocked {
         /// The lockfile whose presence holds the lock.
@@ -168,6 +170,7 @@ impl fmt::Display for Error {
             }
             Error::Cancelled => write!(f, "the run was cancelled"),
             Error::Pool(reason) => write!(f, "the local pool: {reason}"),
+            Error::Export(reason) => write!(f, "cannot export: {reason}"),
             Error::WorkLocked { path, holder } => match holder {
                 Some(pid) => write!(
                     f,

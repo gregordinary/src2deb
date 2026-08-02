@@ -491,7 +491,7 @@ fn stop(running: &mut Running<'_>) -> Result<()> {
 /// Prefers the `.changes` file `dpkg-buildpackage` writes — the authoritative
 /// list of this build's artifacts — and falls back to globbing `.deb`s when no
 /// `.changes` is present.
-fn collect_artifacts(out_dir: &Path) -> Result<Vec<Artifact>> {
+pub(crate) fn collect_artifacts(out_dir: &Path) -> Result<Vec<Artifact>> {
     if let Some(changes) = find_changes(out_dir)? {
         let text =
             std::fs::read_to_string(&changes).map_err(|err| io_error("reading", &changes, err))?;
@@ -520,7 +520,7 @@ fn collect_artifacts(out_dir: &Path) -> Result<Vec<Artifact>> {
 }
 
 /// Finds the first `.changes` file in the output directory.
-fn find_changes(out_dir: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn find_changes(out_dir: &Path) -> Result<Option<PathBuf>> {
     first_with_extension(out_dir, "changes")
 }
 
@@ -542,7 +542,7 @@ fn collect_buildinfo(out_dir: &Path) -> Result<Option<BuildInfo>> {
 ///
 /// One build writes one `.changes` and one `.buildinfo`, and the output
 /// directory is emptied before the build, so "first" is "the one".
-fn first_with_extension(dir: &Path, extension: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn first_with_extension(dir: &Path, extension: &str) -> Result<Option<PathBuf>> {
     for entry in std::fs::read_dir(dir).map_err(|err| io_error("reading", dir, err))? {
         let entry = entry.map_err(|err| io_error("reading", dir, err))?;
         let path = entry.path();

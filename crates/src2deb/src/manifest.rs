@@ -48,11 +48,18 @@ pub const MANIFEST_DIR: &str = "manifests";
 /// loads ([`Recipe::load`](crate::Recipe::load)), so none of them can climb out
 /// of the work directory here.
 pub fn manifest_path(work_dir: &Path, recipe: &str, suite: &str, architecture: &str) -> PathBuf {
-    work_dir
-        .join(MANIFEST_DIR)
-        .join(recipe)
-        .join(suite)
-        .join(format!("{architecture}.toml"))
+    manifest_dir(work_dir, recipe, suite).join(format!("{architecture}.toml"))
+}
+
+/// The directory holding every architecture's manifest for `recipe` at `suite`:
+/// `manifests/<recipe>/<suite>/`.
+///
+/// One file per architecture, so the directory listing is the record of which
+/// architectures a work directory holds a build for. That is what an
+/// [export](crate::export) enumerates, since a run builds for one architecture
+/// at a time and an archive merges them.
+pub fn manifest_dir(work_dir: &Path, recipe: &str, suite: &str) -> PathBuf {
+    work_dir.join(MANIFEST_DIR).join(recipe).join(suite)
 }
 
 /// The path a manifest is staged at before being renamed over `path`.

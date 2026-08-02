@@ -73,6 +73,11 @@ Name an owner when several architectures feed one published archive. Leave it
 unset when you serve a per-architecture pool directly — as a test machine does —
 since that pool has to carry every package the recipe declares.
 
+Either way, [`src2deb export`](publishing.md) carries one copy of each
+`Architecture: all` package: with no owner declared it has two to choose
+between, and it says which it took. Naming an owner is what stops the second
+from being built at all.
+
 ## Native and foreign
 
 A build is native when the host CPU runs the target's binaries directly.
@@ -129,3 +134,7 @@ src2deb does not orchestrate hosts. Run it once per host and collect the
 resulting pools — each is a complete archive for its own architecture, unless an
 [arch-indep owner](#who-builds-the-architecture-all-packages) is named, in which
 case only the owner's carries the `Architecture: all` packages.
+
+Where several architectures share one work directory, one
+[`src2deb export`](publishing.md) collects all of them into a single directory
+for an archive; where they do not, each host exports its own.

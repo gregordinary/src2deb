@@ -72,5 +72,7 @@ src2deb is released under MIT OR Apache-2.0.
 
 - [Quick start](quick-start.md) installs src2deb and runs a build.
 - [Using the pool](using-the-pool.md) gets from a finished run to `apt install`.
+- [Publishing to an archive](publishing.md) hands the packages to an archive
+  tool.
 - [Recipe reference](recipes.md) describes every field a recipe may set.
 - [How a build runs](how-a-build-runs.md) is the detailed pass-by-pass account.

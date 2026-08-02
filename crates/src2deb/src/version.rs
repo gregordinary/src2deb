@@ -349,6 +349,136 @@ pub fn declared_version_error(version: &str) -> Option<&'static str> {
     }
 }
 
+/// Orders two Debian version strings as `dpkg` does.
+///
+/// This module's whole design rests on how versions sort, and until now every
+/// claim it makes about that ordering was reasoned about rather than computed.
+/// Two callers need it computed: an export deduplicating an `Architecture: all`
+/// package built by more than one architecture has to know which copy is the
+/// later one, and pool retention has to know which versions of a package are
+/// superseded. Both are decisions about what to publish, so neither may use an
+/// approximation of `dpkg`'s rule.
+///
+/// The rule is Debian Policy 5.6.12. A version is `[epoch:]upstream[-revision]`:
+/// the epoch is the digits before the first `:` (absent is `0`), the revision is
+/// what follows the *last* `-` (absent is empty), and the upstream version is
+/// what lies between. The three are compared in that order: the epoch
+/// numerically, and the other two as alternating runs of non-digits and digits,
+/// the non-digits in a modified character order where `~` sorts before
+/// everything — even before the end of a part — and letters sort before every
+/// other character, and the digit runs as numbers.
+pub fn compare(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a_epoch, a_upstream, a_revision) = split_version(a);
+    let (b_epoch, b_upstream, b_revision) = split_version(b);
+    a_epoch
+        .cmp(&b_epoch)
+        .then_with(|| compare_part(a_upstream, b_upstream))
+        .then_with(|| compare_part(a_revision, b_revision))
+}
+
+/// Splits a version into its epoch, upstream version, and Debian revision.
+///
+/// A `:` with anything but digits before it is not an epoch separator — it is a
+/// character of the upstream version, which policy admits once an epoch is
+/// present — so the split is only taken when what precedes it reads as one. An
+/// epoch too large to hold is treated as absent rather than saturated, which
+/// keeps a malformed version from ordering above every well-formed one.
+fn split_version(version: &str) -> (u64, &str, &str) {
+    let (epoch, rest) = match version.split_once(':') {
+        Some((epoch, rest)) if !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit()) => {
+            (epoch.parse().unwrap_or(0), rest)
+        }
+        _ => (0, version),
+    };
+    match rest.rsplit_once('-') {
+        Some((upstream, revision)) => (epoch, upstream, revision),
+        None => (epoch, rest, ""),
+    }
+}
+
+/// Orders one part of a version — an upstream version or a Debian revision — as
+/// `dpkg` does.
+///
+/// The part is walked as alternating runs: a run of non-digits compared by the
+/// modified character order [`order_of`] describes, then a run of digits
+/// compared numerically. Comparing digit runs as numbers rather than as text is
+/// what makes `1.10` sort above `1.9`, and it is why the build stamp's date is
+/// `YYYYMMDD`.
+fn compare_part(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        // The non-digit run. Compared a byte at a time, and past the end of
+        // either run, so a part that ends where the other continues is ordered
+        // by what the longer one continues with — which is how `~` comes to
+        // sort before the end of a part.
+        let a_text = take_while(&mut a, |byte| !byte.is_ascii_digit());
+        let b_text = take_while(&mut b, |byte| !byte.is_ascii_digit());
+        for index in 0..a_text.len().max(b_text.len()) {
+            let ordering =
+                order_of(a_text.get(index).copied()).cmp(&order_of(b_text.get(index).copied()));
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+
+        // The digit run. Leading zeros carry no value, so they are dropped
+        // before the comparison; the longer remainder is then the larger
+        // number, and equal lengths compare lexically.
+        let a_digits = trim_zeros(take_while(&mut a, |byte| byte.is_ascii_digit()));
+        let b_digits = trim_zeros(take_while(&mut b, |byte| byte.is_ascii_digit()));
+        let ordering = a_digits
+            .len()
+            .cmp(&b_digits.len())
+            .then_with(|| a_digits.cmp(b_digits));
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+
+        if a.is_empty() && b.is_empty() {
+            return Ordering::Equal;
+        }
+    }
+}
+
+/// Splits the leading run of bytes satisfying `keep` off the front of `bytes`,
+/// advancing it past what it returns.
+fn take_while<'a>(bytes: &mut &'a [u8], keep: impl Fn(u8) -> bool) -> &'a [u8] {
+    let end = bytes
+        .iter()
+        .position(|byte| !keep(*byte))
+        .unwrap_or(bytes.len());
+    let (run, rest) = bytes.split_at(end);
+    *bytes = rest;
+    run
+}
+
+/// A digit run with its leading zeros removed, so `007` and `7` compare equal.
+fn trim_zeros(digits: &[u8]) -> &[u8] {
+    let start = digits
+        .iter()
+        .position(|byte| *byte != b'0')
+        .unwrap_or(digits.len());
+    &digits[start..]
+}
+
+/// The sort key of one character of a non-digit run, or of the end of one.
+///
+/// Policy modifies the ASCII order twice: `~` sorts before everything, even
+/// before the end of a part, so `1.0~rc1` precedes `1.0`; and letters sort
+/// before every other non-digit character, so `1.0a` precedes `1.0+b`. Mapping
+/// each case onto a key rather than branching at the comparison keeps the whole
+/// rule in one place.
+fn order_of(byte: Option<u8>) -> i16 {
+    match byte {
+        Some(b'~') => -1,
+        None => 0,
+        Some(byte) if byte.is_ascii_alphabetic() => byte as i16,
+        Some(byte) => byte as i16 + 256,
+    }
+}
+
 /// The upstream version a `git describe --tags` output names, or `None` when it
 /// does not name one that can be stamped.
 ///
@@ -534,6 +664,70 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
 
  -- Pop Packaging <pop@example.invalid>  Mon, 14 Jul 2026 09:00:00 +0000
 ";
+
+    /// Asserts that `lower` sorts below `higher`, and that the ordering is
+    /// antisymmetric and each version equal to itself.
+    #[track_caller]
+    fn orders_below(lower: &str, higher: &str) {
+        use std::cmp::Ordering;
+        assert_eq!(compare(lower, higher), Ordering::Less, "{lower} < {higher}");
+        assert_eq!(
+            compare(higher, lower),
+            Ordering::Greater,
+            "{higher} > {lower}"
+        );
+        assert_eq!(compare(lower, lower), Ordering::Equal);
+        assert_eq!(compare(higher, higher), Ordering::Equal);
+    }
+
+    #[test]
+    fn versions_order_as_dpkg_orders_them() {
+        // The cases Policy 5.6.12 turns on, each checked in both directions.
+        orders_below("1.0", "1.1");
+        // A digit run compares as a number, not as text.
+        orders_below("1.9", "1.10");
+        orders_below("1.0-1", "1.0-2");
+        // Leading zeros carry no value.
+        assert_eq!(compare("1.007", "1.7"), std::cmp::Ordering::Equal);
+        // A tilde sorts before everything, including the end of a part.
+        orders_below("1.0~rc1", "1.0");
+        orders_below("1.0~alpha.7", "1.0~beta.1");
+        // Letters sort before every other non-digit character.
+        orders_below("1.0a", "1.0+b");
+        // The epoch outranks everything after it.
+        orders_below("2.0", "1:1.0");
+        orders_below("1:1.0", "2:0.1");
+        // A `:` with anything but digits before it does not start an epoch.
+        // dpkg refuses such a version outright rather than ordering it, and no
+        // version src2deb reads is one — every version it compares was written
+        // by dpkg into a file name or a manifest — so what matters here is only
+        // that the ordering stays total and treats the whole string as the
+        // upstream version rather than reading `1.0` as an epoch.
+        orders_below("1.0", "1.0:2");
+    }
+
+    #[test]
+    fn stamped_versions_order_the_way_the_stamp_claims() {
+        // The three orderings the module's own design rests on, now computed
+        // rather than reasoned about: a stamped build sorts above the upstream
+        // version it was built from, a later build date sorts above an earlier
+        // one, and a later suite sorts above an earlier one.
+        orders_below("1.0.0~alpha.7-1", "1.0.0~alpha.7-1+deb13.20260731.abc1234");
+        orders_below(
+            "1.0.0~alpha.7-1+deb13.20260731.abc1234",
+            "1.0.0~alpha.7-1+deb13.20260802.abc1234",
+        );
+        orders_below(
+            "1.0.0~alpha.7-1+deb13.20260802.abc1234",
+            "1.0.0~alpha.7-1+deb14.20260802.abc1234",
+        );
+        // The date is a single digit run, so a month boundary orders
+        // numerically rather than by text: 20260901 above 20260831.
+        orders_below(
+            "1.0-1+deb13.20260831.abc1234",
+            "1.0-1+deb13.20260901.abc1234",
+        );
+    }
 
     #[test]
     fn suite_tags_cover_the_numbered_releases_and_reject_rolling_ones() {

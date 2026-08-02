@@ -324,3 +324,11 @@ run, which is the right answer for a tree someone is editing.
 A run reads only the manifest of its own recipe, suite, and architecture, so
 retargeting a recipe starts from a clean slate rather than skipping components on
 the strength of packages built for somewhere else.
+
+## Carrying the record with the packages
+
+[`src2deb export`](publishing.md) copies each architecture's manifest into the
+export beside the packages it describes, under
+`manifests/<recipe>/<architecture>.toml`. A publisher archiving a release
+therefore keeps the record of how it was built without reading anything under a
+build host's work directory.

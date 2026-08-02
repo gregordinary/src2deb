@@ -31,6 +31,8 @@ Usage:
   src2deb plan  RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]
                            [--arch-indep-owner ARCH] [--version-tag TAG]
                            [--build-deps]
+  src2deb export RECIPE_DIR --to DIR [--work DIR] [--suite SUITE]
+                           [--architecture ARCH] [--arch-indep-owner ARCH]
 
 Arguments:
   RECIPE_DIR            A directory containing a recipe.toml
@@ -69,6 +71,20 @@ Plan options:
                        a build does, so use a separate --work to plan while a
                        build is running
   --build-deps         Also print each component's build-dependencies
+
+Export options:
+  --to DIR             Write the export to DIR/<suite>/ (required). The
+                       directory holds the .deb, .changes, and .buildinfo files
+                       flat, plus the provenance manifests, so an archive tool
+                       ingests the whole suite in one command
+  --architecture ARCH  Carry only ARCH. By default an export carries every
+                       architecture the work directory records a build for,
+                       with one copy of each Architecture: all package
+
+  An export carries every component the work directory records as built, not
+  only what the last run produced, and replaces whatever the export before it
+  left in the same directory. Several recipes may export into one directory;
+  each replaces only its own files.
 
 Common options:
   --suite SUITE        Build for SUITE, a Debian suite name such as trixie or
@@ -158,6 +174,8 @@ enum Command {
     Build(BuildArgs),
     /// Resolve and order a recipe without building.
     Plan(PlanArgs),
+    /// Copy a recipe's built packages out for an archive.
+    Export(ExportArgs),
 }
 
 /// How much a run prints.
@@ -226,6 +244,27 @@ struct PlanArgs {
     verbosity: Verbosity,
 }
 
+/// The arguments to the `export` subcommand.
+#[derive(Debug, PartialEq, Eq)]
+struct ExportArgs {
+    /// The directory holding `recipe.toml`.
+    recipe_dir: PathBuf,
+    /// The working directory holding the packages to export.
+    work: PathBuf,
+    /// The destination root; the export is written to `<dest>/<suite>/`.
+    dest: PathBuf,
+    /// The target suite, overriding the recipe's own when given.
+    suite: Option<String>,
+    /// The single architecture to carry, or `None` for every architecture the
+    /// work directory records.
+    architecture: Option<String>,
+    /// The architecture that owns the recipe's `Architecture: all` packages,
+    /// overriding the recipe's own when given.
+    arch_indep_owner: Option<String>,
+    /// How much to print.
+    verbosity: Verbosity,
+}
+
 /// Parses the command-line arguments into a [`Cli`], or returns a usage message.
 ///
 /// `-h`/`--help` and `-V`/`--version` short-circuit even when other arguments
@@ -251,13 +290,45 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
 
     let (command, rest) = args
         .split_first()
-        .ok_or_else(|| "a subcommand is required: build, plan".to_string())?;
+        .ok_or_else(|| "a subcommand is required: build, plan, export".to_string())?;
     let command = match command.as_str() {
         "build" => Command::Build(parse_build(rest)?),
         "plan" => Command::Plan(parse_plan(rest)?),
+        "export" => Command::Export(parse_export(rest)?),
         other => return Err(format!("unknown subcommand {other}")),
     };
     Ok(Cli { command })
+}
+
+/// Which of the shared options that only some subcommands can act on are
+/// accepted.
+///
+/// `--work`, `--suite`, and `--architecture` mean something to every
+/// subcommand; the others need not. An `export` carries packages a run already
+/// stamped, so it has no version to tag. Accepting a flag that would then do
+/// nothing is the shape this project refuses everywhere else, so it is refused
+/// here too: the flag is not a flag of that subcommand, and naming it is a
+/// usage error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Retargets {
+    /// Whether `--arch-indep-owner ARCH` is accepted.
+    arch_indep_owner: bool,
+    /// Whether `--version-tag TAG` is accepted.
+    version_tag: bool,
+}
+
+impl Retargets {
+    /// A subcommand that runs a build or plans one: every target option
+    /// applies.
+    const BUILD: Retargets = Retargets {
+        arch_indep_owner: true,
+        version_tag: true,
+    };
+    /// A subcommand that reads what a run left behind.
+    const READS: Retargets = Retargets {
+        arch_indep_owner: false,
+        version_tag: false,
+    };
 }
 
 /// The `--work DIR` path, the `--suite SUITE`, `--architecture ARCH`, and
@@ -281,6 +352,7 @@ struct CommonArgs {
 /// recognized the option. When both `-q` and `-v` appear, the last one wins.
 fn common_args(
     rest: &[String],
+    retargets: Retargets,
     mut flag: impl FnMut(&str, &mut std::slice::Iter<'_, String>) -> Result<bool, String>,
 ) -> Result<CommonArgs, String> {
     let mut positional: Vec<&str> = Vec::new();
@@ -323,7 +395,7 @@ fn common_args(
                 }
                 architecture = Some(value.clone());
             }
-            "--arch-indep-owner" => {
+            "--arch-indep-owner" if retargets.arch_indep_owner => {
                 let value = iter
                     .next()
                     .ok_or_else(|| "--arch-indep-owner requires a value".to_string())?;
@@ -335,7 +407,7 @@ fn common_args(
                 }
                 arch_indep_owner = Some(value.clone());
             }
-            "--version-tag" => {
+            "--version-tag" if retargets.version_tag => {
                 let value = iter
                     .next()
                     .ok_or_else(|| "--version-tag requires a value".to_string())?;
@@ -382,7 +454,7 @@ fn parse_build(rest: &[String]) -> Result<BuildArgs, String> {
     let mut from: Option<String> = None;
     let mut skip_published = false;
     let mut build_date: Option<src2deb::BuildDate> = None;
-    let common = common_args(rest, |flag, iter| match flag {
+    let common = common_args(rest, Retargets::BUILD, |flag, iter| match flag {
         "--keep-going" => {
             keep_going = true;
             Ok(true)
@@ -455,7 +527,7 @@ fn parse_build(rest: &[String]) -> Result<BuildArgs, String> {
 /// Parses the `plan` subcommand's arguments.
 fn parse_plan(rest: &[String]) -> Result<PlanArgs, String> {
     let mut show_build_deps = false;
-    let common = common_args(rest, |flag, _iter| match flag {
+    let common = common_args(rest, Retargets::BUILD, |flag, _iter| match flag {
         "--build-deps" => {
             show_build_deps = true;
             Ok(true)
@@ -474,6 +546,40 @@ fn parse_plan(rest: &[String]) -> Result<PlanArgs, String> {
     })
 }
 
+/// Parses the `export` subcommand's arguments.
+fn parse_export(rest: &[String]) -> Result<ExportArgs, String> {
+    let mut dest: Option<PathBuf> = None;
+    // An export chooses between two architectures' copies of an
+    // `Architecture: all` package, so it takes an owner even though it builds
+    // nothing.
+    let accepts = Retargets {
+        arch_indep_owner: true,
+        ..Retargets::READS
+    };
+    let common = common_args(rest, accepts, |flag, iter| match flag {
+        "--to" => {
+            let value = iter
+                .next()
+                .ok_or_else(|| "--to requires a value".to_string())?;
+            dest = Some(PathBuf::from(value));
+            Ok(true)
+        }
+        _ => Ok(false),
+    })?;
+    Ok(ExportArgs {
+        recipe_dir: common.recipe_dir,
+        work: common.work,
+        // Required rather than defaulted: an export writes outside the work
+        // directory, and there is no destination that is obviously the right
+        // one to write a copy of every package into without being asked.
+        dest: dest.ok_or_else(|| "--to DIR is required".to_string())?,
+        suite: common.suite,
+        architecture: common.architecture,
+        arch_indep_owner: common.arch_indep_owner,
+        verbosity: common.verbosity,
+    })
+}
+
 /// Parses the arguments and dispatches to the selected command.
 fn execute(args: &[String]) -> Result<ExitCode, Fault> {
     let cli = parse_args(args).map_err(Fault::Usage)?;
@@ -488,6 +594,7 @@ fn execute(args: &[String]) -> Result<ExitCode, Fault> {
         }
         Command::Build(args) => build(args),
         Command::Plan(args) => plan(args),
+        Command::Export(args) => export(args),
     }
 }
 
@@ -699,6 +806,87 @@ fn plan(args: PlanArgs) -> Result<ExitCode, Fault> {
 
     print_plan(&outcome?, args.show_build_deps);
     Ok(ExitCode::SUCCESS)
+}
+
+/// Runs the `export` subcommand: copies every package the work directory
+/// records as built into a directory an archive tool ingests.
+///
+/// `--architecture` narrows the export rather than retargeting the recipe, so
+/// the recipe is loaded without it: an export carries whatever the work
+/// directory holds, and the recipe's own architecture says nothing about that.
+fn export(args: ExportArgs) -> Result<ExitCode, Fault> {
+    let recipe = load_recipe(
+        &args.recipe_dir,
+        args.suite,
+        None,
+        args.arch_indep_owner,
+        None,
+    )?;
+    let options = src2deb::ExportOptions {
+        dest: args.dest,
+        architectures: args.architecture.into_iter().collect(),
+    };
+    let engine = Engine::new(args.work);
+    let report = engine.export(&recipe, &options)?;
+    print_export(&recipe, &report, args.verbosity);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Prints what an export carried.
+///
+/// The deduplication notice is the part worth reading: an `Architecture: all`
+/// package built by two architectures means one of the two builds produced
+/// bytes nothing will publish, and the recipe can say so once and stop building
+/// it twice.
+fn print_export(recipe: &Recipe, report: &src2deb::ExportReport, verbosity: Verbosity) {
+    if verbosity != Verbosity::Quiet {
+        for duplicate in &report.duplicates {
+            eprintln!(
+                "src2deb: {}: Architecture: all package taken from {}, not from {}",
+                duplicate.package,
+                duplicate.kept,
+                duplicate.dropped.join(", ")
+            );
+        }
+        if !report.duplicates.is_empty() && recipe.arch_indep_owner.is_none() {
+            eprintln!(
+                "src2deb: set arch-indep-owner in the recipe to build those once \
+                 rather than once per architecture"
+            );
+        }
+        if report.removed > 0 {
+            eprintln!(
+                "src2deb: removed {} file(s) left by the previous export",
+                report.removed
+            );
+        }
+    }
+    eprintln!(
+        "src2deb: exported {} component(s), {} package(s), {} file(s), {} for {}, to {}",
+        report.components,
+        report.packages,
+        report.files,
+        human_bytes(report.bytes),
+        report.architectures.join(", "),
+        report.dir.display(),
+    );
+}
+
+/// A byte count for a person to read: whole units, and the largest unit that
+/// leaves the number above one.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// Which per-package phase of provisioning a counter is reporting.
@@ -1218,6 +1406,65 @@ mod tests {
             Command::Plan(plan) => plan,
             other => panic!("expected a plan command, got {other:?}"),
         }
+    }
+
+    /// Unwraps a parsed `export` command's arguments.
+    fn export_args(args: &[&str]) -> ExportArgs {
+        match parse(args).unwrap().command {
+            Command::Export(export) => export,
+            other => panic!("expected an export command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_requires_a_destination_and_carries_every_architecture_by_default() {
+        let args = export_args(&["export", "recipes/cosmic", "--to", "/srv/drop/rk1"]);
+        assert_eq!(args.dest, PathBuf::from("/srv/drop/rk1"));
+        assert_eq!(args.recipe_dir, PathBuf::from("recipes/cosmic"));
+        assert_eq!(args.work, PathBuf::from("work"));
+        // Unset, so the export carries whatever the work directory holds. A
+        // default destination would be a guess at where a copy of every package
+        // belongs, so there is none.
+        assert_eq!(args.architecture, None);
+        assert!(
+            parse(&["export", "r"])
+                .unwrap_err()
+                .contains("--to DIR is required")
+        );
+    }
+
+    #[test]
+    fn export_narrows_to_one_architecture_and_takes_an_arch_indep_owner() {
+        let args = export_args(&[
+            "export",
+            "r",
+            "--to",
+            "drop",
+            "--architecture",
+            "arm64",
+            "--arch-indep-owner",
+            "amd64",
+        ]);
+        assert_eq!(args.architecture, Some("arm64".to_string()));
+        assert_eq!(args.arch_indep_owner, Some("amd64".to_string()));
+    }
+
+    #[test]
+    fn a_target_option_a_subcommand_could_not_act_on_is_refused() {
+        // Rather than accepted and ignored: an export carries packages a run
+        // already stamped, so it has no version to tag.
+        let err = parse(&["export", "r", "--to", "d", "--version-tag", "deb13"]).unwrap_err();
+        assert!(err.contains("unrecognized option"), "{err}");
+        // The two that do act on them still take them.
+        assert_eq!(
+            build_args(&["build", "r", "--version-tag", "deb13"]).version_tag,
+            Some("deb13".to_string())
+        );
+        assert_eq!(
+            export_args(&["export", "r", "--to", "d", "--arch-indep-owner", "amd64"])
+                .arch_indep_owner,
+            Some("amd64".to_string())
+        );
     }
 
     #[test]
