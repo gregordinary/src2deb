@@ -13,11 +13,13 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use src2deb::recipe::Component;
 use src2deb::source::SourceResolver;
-use src2deb::{Fingerprint, Source, SourceInput, SourceRole};
+use src2deb::version::{BuildStamp, ChangelogHead, parse_changelog};
+use src2deb::{Fingerprint, Source, SourceInput, SourceRole, VersionFrom};
 
 /// Whether `git` can be launched at all; the tests no-op when it cannot.
 fn git_available() -> bool {
@@ -100,9 +102,7 @@ fn component(name: &str, git: &Path, git_ref: Option<&str>) -> Component {
             git_ref: git_ref.map(str::to_string),
             ..Source::default()
         },
-        packaging: None,
-        patches: Vec::new(),
-        extra_build_deps: Vec::new(),
+        ..Component::default()
     }
 }
 
@@ -114,15 +114,26 @@ fn path_component(name: &str, path: &Path) -> Component {
             path: Some(path.to_path_buf()),
             ..Source::default()
         },
-        packaging: None,
-        patches: Vec::new(),
-        extra_build_deps: Vec::new(),
+        ..Component::default()
     }
 }
 
-/// A resolver whose relative paths are taken from `recipe_dir`.
-fn resolver_in(root: &Path, recipe_dir: &Path) -> SourceResolver {
-    SourceResolver::new(root, recipe_dir)
+/// The stamp a resolve dates a synthesized changelog with.
+///
+/// Fixed rather than `now()`, so a test reading one back reads the same text
+/// every run, and shared so a resolver can borrow it without every test
+/// carrying one of its own.
+fn stamp() -> &'static BuildStamp {
+    static STAMP: OnceLock<BuildStamp> = OnceLock::new();
+    // 2026-07-31, the date the version tests stamp with.
+    STAMP.get_or_init(|| BuildStamp::at("deb13", 1_785_456_000))
+}
+
+/// A resolver whose relative paths are taken from `recipe_dir`, declaring no
+/// recipe-level maintainer — so a component that needs one takes it from its
+/// own `debian/control`.
+fn resolver_in(root: &Path, recipe_dir: &Path) -> SourceResolver<'static> {
+    SourceResolver::new(root, recipe_dir, None, stamp())
 }
 
 /// `component` with a patch series applied over it.
@@ -181,7 +192,15 @@ fn resolved_marker(tree: &Path) -> String {
 
 /// The `debian/control` every tree in these tests carries, wherever it came
 /// from.
-const CONTROL: &str = "Source: pkg\n\nPackage: pkg\nArchitecture: any\n";
+///
+/// It declares a `Maintainer`, as Debian policy requires of any control file, so
+/// a component declaring a version has an identity to sign a synthesized
+/// changelog with without the recipe restating one.
+const CONTROL: &str = "Source: pkg\nMaintainer: Control Owner <control@example.invalid>\n\
+     \nPackage: pkg\nArchitecture: any\n";
+
+/// The identity [`CONTROL`] declares.
+const CONTROL_MAINTAINER: &str = "Control Owner <control@example.invalid>";
 
 /// A packaging tree: a `debian/` holding a control file and a marker the tests
 /// read back, and — outside `debian/` — a file of the same name the component's
@@ -224,6 +243,26 @@ fn overlaid_from_path(mut component: Component, path: &Path) -> Component {
         ..Source::default()
     });
     component
+}
+
+/// `component` with the upstream version its recipe states.
+fn versioned(mut component: Component, version: &str) -> Component {
+    component.version = Some(version.to_string());
+    component
+}
+
+/// `component` with its upstream version derived from `git describe`.
+fn described(mut component: Component) -> Component {
+    component.version_from = Some(VersionFrom::GitDescribe);
+    component
+}
+
+/// The head of a resolved tree's `debian/changelog`, which is what the version
+/// stamp reads and so what a declared version has to produce.
+fn changelog_head(tree: &Path) -> ChangelogHead {
+    let text = std::fs::read_to_string(tree.join("debian/changelog"))
+        .unwrap_or_else(|err| panic!("{}: {err}", tree.join("debian/changelog").display()));
+    parse_changelog(&text).expect("the resolved tree holds a well-formed changelog")
 }
 
 /// `component`'s packaging overlay, taken from `subdir` within its source.
@@ -1399,6 +1438,342 @@ fn a_patch_applies_even_when_the_work_directory_sits_inside_a_repository() {
         "added by a patch\n",
         "the enclosing repository must not change what a patch does",
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_declared_version_gives_a_component_the_changelog_its_packaging_lacks() {
+    if !git_available() {
+        return;
+    }
+    // The case the feature exists for: packaging complete enough to build —
+    // a control, a rules — with no release history behind it, so the version
+    // stamp has nothing to extend.
+    let root = scratch("declared-version");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+    assert!(!upstream.join("debian/changelog").exists());
+
+    let resolver = resolver_in(&root, &root);
+    let resolved = resolver
+        .resolve(&versioned(component("pkg", &upstream, None), "1.2.3"))
+        .expect("resolve");
+
+    // The tree now holds a changelog the stamping path can read, naming the
+    // source package `debian/control` declares and the version the recipe did.
+    let entry = changelog_head(&resolved.tree);
+    assert_eq!(entry.source, "pkg");
+    assert_eq!(entry.version, "1.2.3");
+    // The identity comes from `debian/control`, which Debian policy makes
+    // mandatory — so an ordinary recipe declares no identity at all.
+    assert_eq!(entry.maintainer, CONTROL_MAINTAINER);
+    // ...and the resolve reports the version, which is what a later run
+    // compares against so that editing it rebuilds.
+    assert_eq!(resolved.version.as_deref(), Some("1.2.3"));
+
+    // It is not an input: the fingerprint still names the one tree the build
+    // consumed, and the version stamp is unchanged by it.
+    assert_eq!(resolved.source.len(), 1);
+    assert_eq!(resolved.source.git_commit(), Some(head(&upstream).as_str()));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_declared_identity_outranks_the_one_control_declares() {
+    if !git_available() {
+        return;
+    }
+    // Three places an identity can come from, in the order they are consulted.
+    let root = scratch("declared-maintainer");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+
+    let stamp = BuildStamp::at("deb13", 1_785_456_000);
+    let recipe_owner = "Recipe Owner <recipe@example.invalid>";
+    let with_recipe_identity = SourceResolver::new(&root, &root, Some(recipe_owner), &stamp);
+
+    let base = versioned(component("pkg", &upstream, None), "1.2.3");
+    let resolved = with_recipe_identity.resolve(&base).expect("resolve");
+    assert_eq!(changelog_head(&resolved.tree).maintainer, recipe_owner);
+
+    let mut own = base.clone();
+    own.maintainer = Some("Component Owner <component@example.invalid>".to_string());
+    let resolved = with_recipe_identity.resolve(&own).expect("resolve");
+    assert_eq!(
+        changelog_head(&resolved.tree).maintainer,
+        "Component Owner <component@example.invalid>",
+    );
+
+    // With neither declared, control answers — which is the ordinary case.
+    let resolved = resolver_in(&root, &root).resolve(&base).expect("resolve");
+    assert_eq!(
+        changelog_head(&resolved.tree).maintainer,
+        CONTROL_MAINTAINER
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_declared_version_with_no_identity_anywhere_does_not_resolve() {
+    if !git_available() {
+        return;
+    }
+    // src2deb never invents an identity. With nothing to reuse, the component
+    // fails and names the setting that would fix it, rather than signing the
+    // entry with something made up.
+    let root = scratch("no-identity");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+    std::fs::write(
+        upstream.join("debian/control"),
+        "Source: pkg\n\nPackage: pkg\nArchitecture: any\n",
+    )
+    .unwrap();
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-q", "-m", "drop the maintainer"]);
+
+    let err = resolver_in(&root, &root)
+        .resolve(&versioned(component("pkg", &upstream, None), "1.2.3"))
+        .expect_err("an entry cannot be signed by nobody");
+    let message = err.to_string();
+    assert!(message.contains("no maintainer"), "{message}");
+    assert!(message.contains("set maintainer"), "{message}");
+    // Nothing was written on the way to failing.
+    assert!(!root.join("sources/pkg/debian/changelog").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_control_identity_that_could_not_sign_a_trailer_is_refused() {
+    if !git_available() {
+        return;
+    }
+    // The field is mandatory but not validated by anything upstream of here, and
+    // an entry signed with a malformed one does not parse — from a file the
+    // recipe never wrote, which is the hard failure to diagnose.
+    let root = scratch("bad-control-identity");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+    std::fs::write(
+        upstream.join("debian/control"),
+        "Source: pkg\nMaintainer: Someone\n\nPackage: pkg\nArchitecture: any\n",
+    )
+    .unwrap();
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-q", "-m", "malformed maintainer"]);
+
+    let err = resolver_in(&root, &root)
+        .resolve(&versioned(component("pkg", &upstream, None), "1.2.3"))
+        .expect_err("a malformed identity cannot sign an entry");
+    let message = err.to_string();
+    assert!(
+        message.contains("Maintainer field in debian/control"),
+        "{message}"
+    );
+    assert!(message.contains("Name <email>"), "{message}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_declared_version_replaces_the_changelog_a_source_ships() {
+    if !git_available() {
+        return;
+    }
+    // The same rule a packaging overlay follows: one authority for the version,
+    // with no per-entry precedence to reason about. A recipe that declares a
+    // version for a component whose upstream changelog is frozen gets the
+    // version it asked for.
+    let root = scratch("version-replaces");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+    std::fs::write(
+        upstream.join("debian/changelog"),
+        "pkg (0.1.0-1) trixie; urgency=low\n\n  * Frozen in 2019.\n\n \
+         -- Old Owner <old@example.invalid>  Mon, 14 Jan 2019 09:00:00 +0000\n",
+    )
+    .unwrap();
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-q", "-m", "a stale changelog"]);
+
+    let resolver = resolver_in(&root, &root);
+    let base = component("pkg", &upstream, None);
+    // Left alone, the component keeps upstream's changelog and its identity.
+    let resolved = resolver.resolve(&base).expect("resolve");
+    assert_eq!(changelog_head(&resolved.tree).version, "0.1.0-1");
+    assert_eq!(resolved.version, None);
+
+    let resolved = resolver
+        .resolve(&versioned(base.clone(), "2.5.0"))
+        .expect("resolve");
+    assert_eq!(changelog_head(&resolved.tree).version, "2.5.0");
+    // Replaced, not prepended: nothing of the old entry is left to contradict
+    // the declared one.
+    let text = std::fs::read_to_string(resolved.tree.join("debian/changelog")).unwrap();
+    assert!(!text.contains("0.1.0-1"), "{text}");
+    assert_eq!(text.matches("urgency=").count(), 1, "{text}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dropping_a_declared_version_restores_the_sources_own_changelog() {
+    if !git_available() {
+        return;
+    }
+    // A checkout persists between runs, and the file a declared version writes
+    // into a tracked `debian/` is untracked — so without the assembly record,
+    // a recipe that stops declaring a version would keep building the version
+    // it used to declare.
+    let root = scratch("version-dropped");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+
+    let resolver = resolver_in(&root, &root);
+    let base = component("pkg", &upstream, None);
+    let resolved = resolver
+        .resolve(&versioned(base.clone(), "1.2.3"))
+        .expect("resolve");
+    assert_eq!(changelog_head(&resolved.tree).version, "1.2.3");
+
+    // The recipe stops declaring one. The source ships no changelog, so the
+    // right answer is that there is none — which is what the version stamp
+    // then reports, with the setting that would fix it.
+    let resolved = resolver.resolve(&base).expect("resolve");
+    assert_eq!(resolved.version, None);
+    assert!(
+        !resolved.tree.join("debian/changelog").exists(),
+        "the dropped declaration left its changelog behind",
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_derived_version_comes_from_the_nearest_tag_and_the_distance_from_it() {
+    if !git_available() {
+        return;
+    }
+    let root = scratch("derived-version");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+    git(&upstream, &["tag", "v1.2.3"]);
+
+    let resolver = resolver_in(&root, &root);
+    let comp = described(component("pkg", &upstream, None));
+    let resolved = resolver.resolve(&comp).expect("resolve");
+    // On the tag: the conventional leading `v` is not part of the version.
+    assert_eq!(resolved.version.as_deref(), Some("1.2.3"));
+    assert_eq!(changelog_head(&resolved.tree).version, "1.2.3");
+
+    // Past it, the distance and the commit come with it — and no hyphen does,
+    // so the Debian revision boundary stays where the stamp will put it.
+    commit_bare_marker(&upstream, "v2");
+    let resolved = resolver.resolve(&comp).expect("resolve");
+    let version = resolved.version.expect("a derived version");
+    assert!(version.starts_with("1.2.3.1.g"), "{version}");
+    assert!(!version.contains('-'), "{version}");
+    assert_eq!(changelog_head(&resolved.tree).version, version);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_source_with_no_tag_to_describe_does_not_resolve_a_derived_version() {
+    if !git_available() {
+        return;
+    }
+    // Falling back to an abbreviated commit would produce a version that does
+    // not order against the one before it, which is worse than not building.
+    let root = scratch("derived-untagged");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+
+    let err = resolver_in(&root, &root)
+        .resolve(&described(component("pkg", &upstream, None)))
+        .expect_err("an untagged source has no version to derive");
+    let message = err.to_string();
+    assert!(message.contains("git describe"), "{message}");
+    assert!(message.contains("`version`"), "{message}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_derived_version_never_reads_a_repository_enclosing_the_work_directory() {
+    if !git_available() {
+        return;
+    }
+    // A work directory inside a checkout is an ordinary arrangement, and git
+    // searches upward for a repository. Without a ceiling, an untagged
+    // component would be versioned from whatever tag the enclosing repository
+    // happened to carry — a wrong answer arrived at silently, where no answer
+    // is loud.
+    let enclosing = scratch("derived-enclosed");
+    init_repo(&enclosing);
+    std::fs::write(enclosing.join("readme"), "the enclosing repository\n").unwrap();
+    git(&enclosing, &["add", "-A"]);
+    git(&enclosing, &["commit", "-q", "-m", "enclosing"]);
+    git(&enclosing, &["tag", "v9.9.9"]);
+
+    // The component's source is a plain directory: copied into the work
+    // directory, it carries no repository of its own.
+    let upstream = enclosing.join("upstream");
+    write_tree(&upstream, "v1");
+
+    let root = enclosing.join("work");
+    std::fs::create_dir_all(&root).unwrap();
+    let err = resolver_in(&root, &root)
+        .resolve(&described(path_component("pkg", &upstream)))
+        .expect_err("the enclosing repository's tag is not this component's");
+    assert!(!err.to_string().contains("9.9.9"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&enclosing);
+}
+
+#[test]
+fn a_declared_version_serves_a_component_packaged_from_a_second_repository() {
+    if !git_available() {
+        return;
+    }
+    // The shape E9 exists to unblock, end to end: upstream ships no `debian/`,
+    // the packaging comes from elsewhere and carries no changelog, and the
+    // recipe supplies the version neither of them has.
+    let root = scratch("declared-version-overlaid");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_bare_marker(&upstream, "v1");
+    let packaging = root.join("packaging-repo");
+    init_repo(&packaging);
+    commit_packaging(&packaging, "from packaging");
+
+    let comp = versioned(
+        overlaid_from_git(component("pkg", &upstream, None), &packaging),
+        "1.0.0",
+    );
+    let resolved = resolver_in(&root, &root).resolve(&comp).expect("resolve");
+
+    let entry = changelog_head(&resolved.tree);
+    assert_eq!(entry.version, "1.0.0");
+    assert_eq!(entry.source, "pkg");
+    // The changelog is written last, so it is signed from the control the whole
+    // assembly settled on — the overlay's, here.
+    assert_eq!(entry.maintainer, CONTROL_MAINTAINER);
+    // Both trees are still the only inputs recorded.
+    assert_eq!(resolved.source.len(), 2);
+    assert_eq!(resolved.version.as_deref(), Some("1.0.0"));
 
     let _ = std::fs::remove_dir_all(&root);
 }

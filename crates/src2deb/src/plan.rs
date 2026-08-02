@@ -45,6 +45,49 @@ pub fn build_dependencies(control: &str) -> Vec<String> {
         .collect()
 }
 
+/// The source package name a `debian/control` declares, or `None` when it
+/// declares none.
+///
+/// This is the name a changelog entry opens with, so it is what a
+/// [synthesized changelog](crate::version::synthesized_changelog) has to agree
+/// with: `dpkg-buildpackage` reads the source package name from the changelog
+/// and checks it against `control`.
+pub fn source_package(control: &str) -> Option<&str> {
+    source_field(control, "Source")
+}
+
+/// The maintainer identity a `debian/control` declares, or `None` when it
+/// declares none.
+///
+/// Debian policy makes the field mandatory, so a component that can be built at
+/// all carries one — which is what lets a synthesized changelog be signed
+/// without src2deb inventing an identity or the recipe restating one the
+/// packaging already declares.
+pub fn maintainer(control: &str) -> Option<&str> {
+    source_field(control, "Maintainer")
+}
+
+/// The value of field `name` in a `debian/control`'s source stanza — the first
+/// stanza, which ends at the first blank line.
+///
+/// Bounded to that stanza deliberately. A binary stanza may carry a field
+/// spelled the same for a different subject, and reading the whole file would
+/// answer with whichever came first rather than with the source's own.
+///
+/// Field names are matched without regard to case, as `dpkg` matches them. A
+/// continuation line begins with whitespace, so its leading text never matches
+/// a field name and a folded value contributes nothing.
+fn source_field<'a>(control: &'a str, name: &str) -> Option<&'a str> {
+    control
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+        .filter(|value| !value.is_empty())
+}
+
 /// The binary package names a `debian/control` produces: the value of every
 /// `Package:` field (the binary stanzas; the source stanza has none).
 pub fn binary_packages(control: &str) -> Vec<String> {
@@ -258,6 +301,45 @@ mod tests {
         // The source stanza contributes none, whitespace is trimmed, and an empty
         // Package value is skipped.
         assert_eq!(binary_packages(control), ["a", "b"]);
+    }
+
+    #[test]
+    fn the_source_stanza_yields_the_package_name_and_the_maintainer() {
+        // The two fields a synthesized changelog is written from.
+        let control = "Source: cosmic-icons\n\
+                       Maintainer: Someone <someone@example.invalid>\n\
+                       Build-Depends: debhelper-compat (= 13)\n\
+                       \nPackage: cosmic-icons\nArchitecture: all\n";
+        assert_eq!(source_package(control), Some("cosmic-icons"));
+        assert_eq!(
+            maintainer(control),
+            Some("Someone <someone@example.invalid>"),
+        );
+        // Read as dpkg reads them: case-insensitively, and with the value
+        // trimmed of the space that follows the colon.
+        assert_eq!(source_package("source:   spaced   \n"), Some("spaced"));
+        assert_eq!(
+            maintainer("MAINTAINER: A <a@e.invalid>\n"),
+            Some("A <a@e.invalid>")
+        );
+    }
+
+    #[test]
+    fn a_field_a_binary_stanza_carries_is_not_the_sources_own() {
+        // The reading stops at the first blank line, so a binary stanza cannot
+        // answer for the source — and a source declaring neither says so.
+        let control = "Source: outer\n\nPackage: inner\nArchitecture: all\n\
+                       Maintainer: Wrong <wrong@example.invalid>\n";
+        assert_eq!(source_package(control), Some("outer"));
+        assert_eq!(maintainer(control), None);
+        // An empty value is no value, rather than an identity of nothing.
+        assert_eq!(maintainer("Source: s\nMaintainer:   \n"), None);
+        // A folded continuation line begins with whitespace, so its text is
+        // never read as a field of its own.
+        assert_eq!(
+            source_package("Uploaders: A <a@e.invalid>,\n Source: not-a-field <b@e.invalid>\n"),
+            None,
+        );
     }
 
     #[test]

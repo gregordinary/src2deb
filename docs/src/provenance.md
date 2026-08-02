@@ -167,6 +167,30 @@ The recorded versions are the stamped ones the packages actually carry, so the
 suite, the build date, and the abbreviated source are legible from the manifest
 as well as from `apt policy`. See [Package versions](package-versions.md).
 
+## The declared version
+
+A component whose packaging carries no `debian/changelog` takes its version from
+the recipe, and the record names it:
+
+```toml
+[[component]]
+name = "foo"
+status = "built"
+version = "1.2.3"
+```
+
+`version` is the upstream version the recipe declared or derived — the base the
+stamp extends — and it appears only for a component that declares one. A
+component that takes its version from a changelog it already has records no such
+field.
+
+It sits beside the source record rather than in it, because it is not a tree the
+build consumed: it is a name the recipe gave. It is recorded all the same,
+because it is the one thing a recipe can change that produces different packages
+while every input the fingerprint names stays exactly where it was — so
+`--skip-published` compares it alongside the fingerprint. See [Components with no
+changelog](recipes.md#components-with-no-changelog).
+
 ## The build date
 
 `build-date` is the date the run stamped into every version it produced, as
@@ -267,10 +291,11 @@ says nothing about what the packages were built from. See
 
 The manifest is also the build-state record `--skip-published` reads: a component
 is skipped when its source resolves to what the manifest already records as
-`built`. Every input has to match, so a component gains a rebuild the moment any
-one of them moves. Each run folds the prior manifest forward — a component this
-run did not build keeps its earlier record — so the manifest always describes the
-whole recipe, and a chain of selective runs stays consistent.
+`built`, at the same [declared version](#the-declared-version). Every input has to
+match, so a component gains a rebuild the moment any one of them moves. Each run
+folds the prior manifest forward — a component this run did not build keeps its
+earlier record — so the manifest always describes the whole recipe, and a chain
+of selective runs stays consistent.
 
 A source that is not pinned is never skipped, however exactly it matches the
 record. An unpinned value says where a tree was read from and not what it held,

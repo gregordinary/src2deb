@@ -64,6 +64,15 @@ source.git = "https://github.com/pop-os/cosmic-settings"
   suite = "sid"
   version-tag = "debsid"
   ```
+- `maintainer` — the identity src2deb signs a synthesized `debian/changelog`
+  with, written as Debian writes it. Optional, and consulted only for a component
+  that [declares its version](#components-with-no-changelog); a component's own
+  `maintainer` overrides it, and a component with neither takes the `Maintainer`
+  its `debian/control` declares.
+
+  ```toml
+  maintainer = "Your Name <you@example.org>"
+  ```
 - `mirror` — the primary archive mirror URL. Defaults to the Debian CDN. Name one
   to build against a local or regional mirror rather than `deb.debian.org`.
 
@@ -185,6 +194,14 @@ Each `[[components]]` entry is one buildable component: a source tree with a
   `packaging.subdir` — under the same rules.
 - `patches` — patch files applied over the resolved source tree, in the order
   given. Optional; see [Patches](#patches) below.
+- `version` — the upstream version to build the component as, for packaging that
+  carries no `debian/changelog`. Optional; see [Components with no
+  changelog](#components-with-no-changelog) below. Exclusive with
+  `version-from`.
+- `version-from` — where to derive that version instead of stating it. The one
+  value is `git-describe`. Exclusive with `version`.
+- `maintainer` — the identity a synthesized changelog is signed with, overriding
+  the recipe's. Optional.
 - `extra-build-deps` — extra build-dependency package names beyond those
   `debian/control` declares. Rarely needed; most build-dependencies are
   discovered from the control file. Reach for it when a component's build needs
@@ -282,6 +299,108 @@ unreproducible and is never skipped by `--skip-published` — the same rule
 
 Nothing is ever written to a packaging source, so a path one is read where it
 lies rather than copied into the work directory.
+
+## Components with no changelog
+
+A component's version normally comes from its own `debian/changelog`, which
+src2deb extends with the suite, the date, and the source revision. Packaging
+assembled from a [packaging overlay](#packaging-overlays) often has no such
+history: a `control` and a `rules` are enough to build with, and a changelog is
+not something you want to maintain by hand for a package that is rebuilt from
+source every time.
+
+Declare the version instead, and src2deb writes the changelog:
+
+```toml
+[[components]]
+name = "foo"
+source.git = "https://github.com/example/foo"
+packaging.path = "packaging/foo"
+version = "1.2.3"
+```
+
+The entry it writes carries the version you declared, the source package name
+`debian/control` declares, and a maintainer identity — and the ordinary stamping
+path then extends it, so the package is versioned exactly as any other:
+
+```text
+foo (1.2.3+deb13.20260731.abc1234.def5678) trixie; urgency=medium
+```
+
+Everything downstream reads that changelog, including the vendor pass, so the
+component builds like any other.
+
+### Deriving the version from a tag
+
+A project that tags its releases can state its version once, in the tag:
+
+```toml
+[[components]]
+name = "foo"
+source.git = "https://github.com/example/foo"
+packaging.path = "packaging/foo"
+version-from = "git-describe"
+```
+
+`git describe --tags` runs against the resolved source, and its output becomes a
+version: a leading `v` is dropped, and hyphens become dots so the Debian revision
+boundary stays where the stamp puts it.
+
+| Tag state | `git describe` | Version |
+| --- | --- | --- |
+| On the tag | `v1.2.3` | `1.2.3` |
+| Four commits past it | `v1.2.3-4-gabc1234` | `1.2.3.4.gabc1234` |
+
+Those order the way the history does, so a build from a later commit supersedes
+one from an earlier commit even before the build date is taken into account.
+
+A source with no tag in its history has no version to derive, and the component
+is refused rather than versioned from an abbreviated commit that would not order
+against the build before it. State the version with `version` in that case.
+
+`git describe` reads the repository the source was resolved into, not the
+`source.subdir` within it — a member of a superproject takes the superproject's
+tag, because that is the only tag there is.
+
+### Where the maintainer comes from
+
+The entry is signed with the first identity that is declared:
+
+1. the component's own `maintainer`,
+2. the recipe's `maintainer`,
+3. the `Maintainer` field in the component's `debian/control`.
+
+Debian policy makes that last field mandatory, so packaging complete enough to
+build already carries an identity and most recipes declare nothing at all.
+src2deb never invents one: a component that declares a version with no identity
+anywhere is refused.
+
+Write an identity as Debian writes it, `Name <email>`. An identity with no
+address, or one carrying a line break or two consecutive spaces, cannot be read
+back out of a changelog trailer and is refused by the recipe.
+
+### A declared version replaces the changelog
+
+`version` and `version-from` are the authority wherever they are set. If the
+assembled tree does ship a `debian/changelog`, the declared version **replaces**
+it — the same rule a packaging overlay follows, and for the same reason: one
+authority for the version, with no per-entry precedence to reason about. That is
+what lets you build a project whose upstream changelog has been frozen for years
+at the version it actually has.
+
+The consequence is that the shipped package carries the declared entry and the
+stamped one above it, and not the history it replaced. Leave `version` out for a
+component whose changelog you want kept.
+
+Dropping the setting restores the tree's own changelog on the next run, exactly
+as dropping a `packaging` overlay does.
+
+### The declaration is part of what was built
+
+`--skip-published` compares the declared version alongside the source
+fingerprint, so editing `version` rebuilds the component even though every tree
+it resolves is byte-identical. The manifest records it as `version` on the
+component. See [The provenance manifest](provenance.md).
 
 ## Patches
 

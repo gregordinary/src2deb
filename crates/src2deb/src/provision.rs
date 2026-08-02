@@ -971,9 +971,7 @@ mod tests {
                 git: Some("https://example.invalid/repo.git".to_string()),
                 ..Source::default()
             },
-            packaging: None,
-            patches: Vec::new(),
-            extra_build_deps: Vec::new(),
+            ..Component::default()
         }
     }
 

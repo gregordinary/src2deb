@@ -316,6 +316,17 @@ pub struct ComponentRecord {
     /// The failure reason, present only when the component failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The upstream version the recipe declared for the component, present only
+    /// when it declares one — that is, when its packaging carries no
+    /// `debian/changelog` of its own and src2deb wrote one.
+    ///
+    /// Recorded because it is the one thing a run can change that produces
+    /// different packages while leaving every input the fingerprint names
+    /// exactly where it was. Without it, editing `version` and re-running with
+    /// `--skip-published` would skip the component and never publish the version
+    /// that was asked for. See [`is_built_at`](Self::is_built_at).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// The `.buildinfo` the component's build wrote, present only when it built
     /// and wrote one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -385,17 +396,26 @@ impl BuildInfoRecord {
 }
 
 impl ComponentRecord {
-    /// Whether this record marks the component as built from `source`, so a
-    /// `--skip-published` run may skip it. A failed or skipped record is not a
-    /// reason to skip.
+    /// Whether this record marks the component as built from `source` at
+    /// `version`, so a `--skip-published` run may skip it. A failed or skipped
+    /// record is not a reason to skip.
     ///
     /// An unpinned source is never skippable, however exactly it matches. Its
     /// value names where the tree was read from and not what the tree held, so
     /// two runs agreeing on it establishes nothing about whether the source
     /// moved — and skipping on that basis would quietly publish yesterday's
     /// package as today's build.
-    pub fn is_built_at(&self, source: &Fingerprint) -> bool {
-        self.status == STATUS_BUILT && source.is_pinned() && &self.source == source
+    ///
+    /// `version` is the upstream version the recipe declared, or `None` for a
+    /// component that takes one from its own `debian/changelog`. It is compared
+    /// alongside the source because it is the one input to a package's version
+    /// that the fingerprint does not name: a recipe that declares `1.2.4` where
+    /// it declared `1.2.3` resolves byte-identical trees and must still build.
+    pub fn is_built_at(&self, source: &Fingerprint, version: Option<&str>) -> bool {
+        self.status == STATUS_BUILT
+            && source.is_pinned()
+            && &self.source == source
+            && self.version.as_deref() == version
     }
 }
 
@@ -513,6 +533,7 @@ mod tests {
             name: name.to_string(),
             status: STATUS_BUILT.to_string(),
             error: None,
+            version: None,
             buildinfo: None,
             source: git(commit),
             packages: vec![PackageRecord {
@@ -534,6 +555,7 @@ mod tests {
                     name: "cosmic-osd".to_string(),
                     status: STATUS_FAILED.to_string(),
                     error: Some("boom".to_string()),
+                    version: None,
                     buildinfo: None,
                     source: git("def456"),
                     packages: Vec::new(),
@@ -544,8 +566,8 @@ mod tests {
         let parsed = Manifest::load_from_str(&toml);
         assert_eq!(parsed.recipe, "cosmic-epoch");
         assert_eq!(parsed.components.len(), 2);
-        assert!(parsed.components[0].is_built_at(&git("abc123")));
-        assert!(!parsed.components[0].is_built_at(&git("other")));
+        assert!(parsed.components[0].is_built_at(&git("abc123"), None));
+        assert!(!parsed.components[0].is_built_at(&git("other"), None));
         assert_eq!(parsed.components[0].packages[0].version, "1.0-1");
         assert_eq!(parsed.components[1].status, STATUS_FAILED);
         assert_eq!(parsed.components[1].error.as_deref(), Some("boom"));
@@ -564,6 +586,7 @@ mod tests {
                 name: "c".to_string(),
                 status: STATUS_BUILT.to_string(),
                 error: None,
+                version: None,
                 buildinfo: None,
                 source: Fingerprint::over(vec![
                     SourceInput::git(SourceRole::Source, "abc123"),
@@ -648,6 +671,7 @@ mod tests {
                 name: "c".to_string(),
                 status: STATUS_FAILED.to_string(),
                 error: Some("no such repository".to_string()),
+                version: None,
                 buildinfo: None,
                 source: Fingerprint::none(),
                 packages: Vec::new(),
@@ -720,7 +744,7 @@ mod tests {
         // renamed through is gone — a leftover would accumulate one per run, and
         // a manifest left half-written would fail every later `load`.
         let loaded = Manifest::load(&path).unwrap().expect("a manifest is there");
-        assert!(loaded.components[0].is_built_at(&git("def")));
+        assert!(loaded.components[0].is_built_at(&git("def"), None));
         let siblings: Vec<String> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -899,7 +923,7 @@ mod tests {
             .expect("the first survives");
         assert_eq!(first.recipe, "cosmic-epoch");
         assert_eq!(first.components.len(), 1);
-        assert!(first.components[0].is_built_at(&git("abc123")));
+        assert!(first.components[0].is_built_at(&git("abc123"), None));
 
         let second = Manifest::load(&theme)
             .unwrap()
@@ -961,15 +985,15 @@ mod tests {
     #[test]
     fn only_a_built_record_of_the_same_source_is_skippable() {
         let record = built("c", "abc", "1.0");
-        assert!(record.is_built_at(&git("abc")));
+        assert!(record.is_built_at(&git("abc"), None));
         // A different commit, or a non-built status, is not skippable.
-        assert!(!record.is_built_at(&git("xyz")));
+        assert!(!record.is_built_at(&git("xyz"), None));
         let mut failed = record.clone();
         failed.status = STATUS_FAILED.to_string();
-        assert!(!failed.is_built_at(&git("abc")));
+        assert!(!failed.is_built_at(&git("abc"), None));
         let mut skipped = record;
         skipped.status = STATUS_SKIPPED.to_string();
-        assert!(!skipped.is_built_at(&git("abc")));
+        assert!(!skipped.is_built_at(&git("abc"), None));
     }
 
     #[test]
@@ -985,12 +1009,13 @@ mod tests {
             name: "c".to_string(),
             status: STATUS_BUILT.to_string(),
             error: None,
+            version: None,
             buildinfo: None,
             source: working_tree.clone(),
             packages: Vec::new(),
         };
         assert_eq!(record.source, working_tree);
-        assert!(!record.is_built_at(&working_tree));
+        assert!(!record.is_built_at(&working_tree, None));
 
         // One unpinned input among pinned ones is enough: whatever else the
         // build consumed, part of it cannot be compared.
@@ -1002,7 +1027,7 @@ mod tests {
             source: overlaid.clone(),
             ..record
         };
-        assert!(!record.is_built_at(&overlaid));
+        assert!(!record.is_built_at(&overlaid, None));
     }
 
     #[test]
@@ -1010,10 +1035,70 @@ mod tests {
         // Adding a patch series or a packaging overlay to a component makes it
         // a different source, so a prior run's record does not excuse a build.
         let record = built("c", "abc", "1.0");
-        assert!(!record.is_built_at(&Fingerprint::over(vec![
-            SourceInput::git(SourceRole::Source, "abc"),
-            SourceInput::sha256(SourceRole::Packaging, "9f8e7d6"),
-        ])));
+        assert!(!record.is_built_at(
+            &Fingerprint::over(vec![
+                SourceInput::git(SourceRole::Source, "abc"),
+                SourceInput::sha256(SourceRole::Packaging, "9f8e7d6"),
+            ]),
+            None,
+        ));
+    }
+
+    #[test]
+    fn a_declared_version_that_moved_is_not_the_build_that_was_recorded() {
+        // The one edit a recipe can make that produces different packages while
+        // every input the fingerprint names stays exactly where it was. Without
+        // this, `--skip-published` would skip the component and the version that
+        // was asked for would never be published.
+        let source = git("abc");
+        let record = ComponentRecord {
+            version: Some("1.2.3".to_string()),
+            ..built("c", "abc", "1.2.3+deb13.20260731.abc")
+        };
+        assert!(record.is_built_at(&source, Some("1.2.3")));
+        assert!(!record.is_built_at(&source, Some("1.2.4")));
+        // Dropping the declaration is a move too: the version now comes from the
+        // component's own changelog, which is a different answer.
+        assert!(!record.is_built_at(&source, None));
+
+        // ...and a component that never declared one is unaffected, which is
+        // every component whose packaging ships a changelog.
+        let undeclared = built("c", "abc", "1.0-1");
+        assert!(undeclared.is_built_at(&source, None));
+        assert!(!undeclared.is_built_at(&source, Some("1.2.3")));
+    }
+
+    #[test]
+    fn a_declared_version_is_recorded_and_omitted_when_there_is_none() {
+        let manifest = Manifest::new(
+            "r",
+            "trixie",
+            "amd64",
+            vec![ComponentRecord {
+                version: Some("1.2.3".to_string()),
+                ..built("c", "abc", "1.2.3+deb13.20260731.abc")
+            }],
+        );
+        let toml = manifest.to_toml();
+        assert!(toml.contains("version = \"1.2.3\""), "{toml}");
+        assert_eq!(
+            Manifest::load_from_str(&toml).components[0]
+                .version
+                .as_deref(),
+            Some("1.2.3"),
+        );
+        // A component that declared none writes no field, so the manifest never
+        // claims a declaration the recipe did not make.
+        let none = Manifest::new(
+            "r",
+            "trixie",
+            "amd64",
+            vec![ComponentRecord {
+                packages: Vec::new(),
+                ..built("c", "abc", "1.0-1")
+            }],
+        );
+        assert!(!none.to_toml().contains("version"), "{}", none.to_toml());
     }
 
     impl Manifest {

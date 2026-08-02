@@ -65,6 +65,19 @@ pub struct Recipe {
     /// [`owns_arch_indep`](Self::owns_arch_indep).
     #[serde(default)]
     pub arch_indep_owner: Option<String>,
+    /// The maintainer identity a synthesized `debian/changelog` is signed with,
+    /// for components whose packaging carries none of their own.
+    ///
+    /// Written as Debian writes it, `Name <email>`. A component may name its
+    /// own with [`Component::maintainer`], and a component that names neither
+    /// takes the `Maintainer` its `debian/control` declares — so this is a
+    /// convenience for a recipe packaging several components under one
+    /// identity, not a requirement.
+    ///
+    /// Unused by a component whose packaging ships a changelog: that entry's
+    /// own trailer is reused, as it always has been. See [`crate::version`].
+    #[serde(default)]
+    pub maintainer: Option<String>,
     /// The primary archive mirror. Defaults to the Debian CDN inside the
     /// provisioner when unset.
     #[serde(default)]
@@ -166,7 +179,7 @@ pub struct Repository {
 }
 
 /// One buildable component: a source tree with a `debian/` directory.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Component {
     /// The component name, unique within the recipe.
@@ -206,11 +219,72 @@ pub struct Component {
     /// under `--skip-published`. See [`crate::fingerprint`].
     #[serde(default)]
     pub patches: Vec<PathBuf>,
+    /// The upstream version to build this component as, for packaging that
+    /// carries no `debian/changelog` to take one from.
+    ///
+    /// Exclusive with [`version_from`](Self::version_from), which derives the
+    /// same thing rather than stating it. Declaring either makes src2deb write
+    /// the component's `debian/changelog`, **replacing** whatever the assembled
+    /// tree holds — the same rule a [`packaging`](Self::packaging) overlay
+    /// follows, and for the same reason: one authority for the version, with no
+    /// per-entry precedence to reason about.
+    ///
+    /// The value stands where a changelog's own version would, so it may carry
+    /// an epoch and a Debian revision. src2deb stamps the suite, date, and
+    /// source fingerprint onto it as it does any other. See
+    /// [`crate::version`].
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Where to derive this component's upstream version from, for packaging
+    /// that carries no `debian/changelog` and a source that names its releases.
+    ///
+    /// Exclusive with [`version`](Self::version). See [`VersionFrom`].
+    #[serde(default)]
+    pub version_from: Option<VersionFrom>,
+    /// The maintainer identity this component's synthesized `debian/changelog`
+    /// is signed with, overriding the recipe's
+    /// [`maintainer`](Recipe::maintainer).
+    ///
+    /// Written as Debian writes it, `Name <email>`. A component naming neither
+    /// takes the `Maintainer` its `debian/control` declares.
+    #[serde(default)]
+    pub maintainer: Option<String>,
     /// Extra build-dependency package names beyond those `debian/control`
     /// declares, given in the recipe as `extra-build-deps`. Rarely needed; most
     /// build-deps are discovered from control.
     #[serde(default)]
     pub extra_build_deps: Vec<String>,
+}
+
+/// Where a component's upstream version is derived from, when the recipe does
+/// not state it outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VersionFrom {
+    /// `git describe --tags`, run against the component's resolved source.
+    ///
+    /// The nearest tag on a tagged commit, and `<tag>-<commits>-g<hash>`
+    /// anywhere after one, rewritten into a Debian version — see
+    /// [`version_from_describe`](crate::version::version_from_describe). A
+    /// source with no tag in its history has no version to derive, and the
+    /// component is refused rather than given one that does not order.
+    ///
+    /// The repository described is the one the source was resolved into, not
+    /// the [`subdir`](Source::subdir) within it: a member of a superproject
+    /// takes the superproject's tag, because that is the only tag there is.
+    GitDescribe,
+}
+
+/// Where a component's upstream version comes from, as a single choice rather
+/// than two fields that could contradict each other.
+///
+/// Produced by [`Component::version_source`] once a recipe has been validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionSource<'a> {
+    /// The version the recipe states outright.
+    Declared(&'a str),
+    /// A version derived from the resolved source.
+    Derived(VersionFrom),
 }
 
 /// Where a tree a component is built from comes from.
@@ -289,6 +363,24 @@ impl Source {
                 git_ref: self.git_ref.as_deref(),
             }),
             (None, Some(path)) => Some(Origin::Path(path)),
+            (Some(_), Some(_)) | (None, None) => None,
+        }
+    }
+}
+
+impl Component {
+    /// Where this component's upstream version comes from, or `None` when the
+    /// recipe states neither — which is every component whose packaging ships a
+    /// `debian/changelog`, and so the ordinary case.
+    ///
+    /// Never both for a validated recipe: [`Recipe::load`] refuses a component
+    /// naming a version and a derivation at once, so exactly one arm applies
+    /// when either is set. A caller that builds a [`Component`] itself is
+    /// outside that guarantee, which is why this reports rather than asserts.
+    pub fn version_source(&self) -> Option<VersionSource<'_>> {
+        match (&self.version, self.version_from) {
+            (Some(version), None) => Some(VersionSource::Declared(version)),
+            (None, Some(from)) => Some(VersionSource::Derived(from)),
             (Some(_), Some(_)) | (None, None) => None,
         }
     }
@@ -503,6 +595,43 @@ impl Recipe {
                     component.name
                 )));
             }
+
+            // A component's version is stated or derived, never both: the two
+            // would give one component two versions, and which won would be
+            // whichever the resolver consulted first.
+            if component.version.is_some() && component.version_from.is_some() {
+                return Err(bad(format!(
+                    "component {:?} declares both version and version-from; a \
+                     component's version is stated or derived, not both",
+                    component.name
+                )));
+            }
+            // Checked here rather than at build time: a version that cannot be
+            // stamped is a recipe error, and a run is better refused before it
+            // resolves a single source tree.
+            if let Some(version) = &component.version
+                && let Some(reason) = crate::version::declared_version_error(version)
+            {
+                return Err(bad(format!(
+                    "component {:?} version {version:?} {reason}",
+                    component.name
+                )));
+            }
+            if let Some(maintainer) = &component.maintainer
+                && let Some(reason) = maintainer_error(maintainer)
+            {
+                return Err(bad(format!(
+                    "component {:?} maintainer {maintainer:?} {reason}",
+                    component.name
+                )));
+            }
+        }
+
+        // The recipe's own identity, held to the same rules as a component's.
+        if let Some(maintainer) = &self.maintainer
+            && let Some(reason) = maintainer_error(maintainer)
+        {
+            return Err(bad(format!("maintainer {maintainer:?} {reason}")));
         }
 
         // A rustup toolchain must pin an exact version, so the build is
@@ -578,6 +707,49 @@ pub fn version_tag_error(tag: &str) -> Option<&'static str> {
         .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '~')
     {
         Some("contains a character a Debian version may not")
+    } else {
+        None
+    }
+}
+
+/// Reports why a maintainer identity cannot sign a changelog entry, or `None`
+/// when it can.
+///
+/// The value is written verbatim into a changelog trailer,
+/// ` -- Name <email>  Date`, which `dpkg` parses. Four rules follow from that
+/// one line:
+///
+/// - **`Name <email>`**, because that is the form the trailer takes; an
+///   identity with no address is a trailer `dpkg-parsechangelog` rejects.
+/// - **No line break**, which would end the trailer early and leave the rest of
+///   the identity standing as a changelog line of its own.
+/// - **No two consecutive spaces**, which are what separate the identity from
+///   the date: an identity carrying a pair would read back truncated, and the
+///   remainder would be read as part of the date.
+/// - **No leading or trailing whitespace**, since the trailer supplies its own
+///   and the value is not trimmed on the way in.
+///
+/// This is the check [`Recipe::load`] applies to a declared identity. The
+/// `Maintainer` a `debian/control` declares is held to it too, at the point it
+/// is used, since it reaches the same line by another route.
+pub fn maintainer_error(maintainer: &str) -> Option<&'static str> {
+    if maintainer.is_empty() {
+        Some("is empty")
+    } else if maintainer != maintainer.trim() {
+        Some("has leading or trailing whitespace")
+    } else if maintainer.contains(['\n', '\r']) {
+        Some("contains a line break")
+    } else if maintainer.contains("  ") {
+        Some(
+            "contains two consecutive spaces, which end the identity in a \
+             changelog trailer",
+        )
+    } else if !maintainer.ends_with('>')
+        || !maintainer
+            .split_once('<')
+            .is_some_and(|(name, _)| !name.trim().is_empty())
+    {
+        Some("is not of the form \"Name <email>\"")
     } else {
         None
     }
@@ -1267,6 +1439,144 @@ mod tests {
                 "{setting} gave: {message}"
             );
         }
+    }
+
+    #[test]
+    fn a_component_states_its_version_or_derives_it_and_reports_which() {
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             version = \"1.2.3\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.components[0].version_source(),
+            Some(VersionSource::Declared("1.2.3")),
+        );
+
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             version-from = \"git-describe\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.components[0].version_source(),
+            Some(VersionSource::Derived(VersionFrom::GitDescribe)),
+        );
+
+        // The ordinary case: neither, and the component's own changelog is the
+        // authority as it always has been.
+        let recipe = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap();
+        assert!(recipe.components[0].version_source().is_none());
+    }
+
+    #[test]
+    fn a_component_stating_a_version_and_deriving_one_is_rejected() {
+        // Which won would be whichever the resolver consulted first.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             version = \"1.2.3\"\nversion-from = \"git-describe\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("declares both version and version-from"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_declared_version_a_package_could_not_carry_is_rejected_by_the_recipe() {
+        // Checked at load, not at build: a run is better refused before it
+        // resolves a single source tree.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             version = \"v1.2.3\"\n",
+        )
+        .unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("component \"c\" version \"v1.2.3\""),
+            "{message}"
+        );
+        assert!(message.contains("begin with a digit"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_version_derivation_is_rejected_rather_than_ignored() {
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             version-from = \"git-tag\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("git-describe"), "{err}");
+    }
+
+    #[test]
+    fn a_maintainer_is_taken_at_the_recipe_or_the_component() {
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             maintainer = \"Recipe Owner <owner@example.invalid>\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             maintainer = \"Component Owner <c@example.invalid>\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.maintainer.as_deref(),
+            Some("Recipe Owner <owner@example.invalid>"),
+        );
+        assert_eq!(
+            recipe.components[0].maintainer.as_deref(),
+            Some("Component Owner <c@example.invalid>"),
+        );
+        // A recipe that names none leaves the component's `debian/control` to
+        // answer, which is the common case.
+        let recipe = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap();
+        assert!(recipe.maintainer.is_none());
+        assert!(recipe.components[0].maintainer.is_none());
+    }
+
+    #[test]
+    fn an_identity_that_could_not_sign_a_changelog_trailer_is_rejected() {
+        // Every rule follows from the one line the value is written into:
+        // ` -- Name <email>  Date`.
+        for (value, needle) in [
+            ("", "is empty"),
+            ("Someone", "Name <email>"),
+            ("<someone@example.invalid>", "Name <email>"),
+            ("Someone <someone@example.invalid> ", "whitespace"),
+            // Two spaces are what separate the identity from the date, so an
+            // identity carrying a pair reads back truncated.
+            ("Some  One <s@example.invalid>", "two consecutive spaces"),
+            ("Some\nOne <s@example.invalid>", "line break"),
+        ] {
+            assert!(
+                maintainer_error(value).is_some_and(|reason| reason.contains(needle)),
+                "{value:?} should be refused for {needle:?}, got {:?}",
+                maintainer_error(value),
+            );
+            // ...and the recipe refuses it wherever it is declared: at the
+            // recipe, and at a component overriding it.
+            for setting in [
+                format!("maintainer = {value:?}\n{ONE_COMPONENT}"),
+                format!("{ONE_COMPONENT}maintainer = {value:?}\n"),
+            ] {
+                let err = load(&format!("name = \"r\"\nsuite = \"trixie\"\n{setting}"))
+                    .expect_err(&format!("{setting:?} should be refused"));
+                assert!(format!("{err}").contains(needle), "{setting:?} gave: {err}");
+            }
+        }
+        // An ordinary identity is accepted.
+        assert_eq!(maintainer_error("Someone <someone@example.invalid>"), None);
     }
 
     #[test]

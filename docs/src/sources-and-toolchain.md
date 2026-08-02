@@ -82,6 +82,21 @@ An overlay is a build input like any other: both revisions reach the version
 stamp and the manifest, and `--skip-published` rebuilds when either moves. See
 [Packaging overlays](recipes.md#packaging-overlays).
 
+### Versions for packaging with no history
+
+Packaging assembled this way often has no `debian/changelog` — a `control` and a
+`rules` are enough to build with, and a release history is not something worth
+maintaining by hand for a package rebuilt from source each time. The version
+stamp has nothing to extend in that case, so the component names its version in
+the recipe and src2deb writes the changelog: one entry, over an identity the
+recipe or the packaging's own `Maintainer` field supplies. The ordinary stamping
+path then extends that entry, so one code path produces every version src2deb
+stamps.
+
+`version` states the version outright and `version-from = "git-describe"` derives
+it from the source's tags. See [Components with no
+changelog](recipes.md#components-with-no-changelog).
+
 ### Patches over the assembled tree
 
 Either kind of source may carry a patch series — local fixes upstream has not

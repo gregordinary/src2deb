@@ -39,7 +39,7 @@ directory. See [Cross-architecture builds](cross-architecture.md) and
 | `--jobs N` | Build up to `N` components concurrently, respecting the dependency order. Defaults to `1` |
 | `--only C` | Build only component `C`. Repeatable |
 | `--from C` | Build component `C` and every component after it in the build order |
-| `--skip-published` | Skip a component whose source resolves to what a prior run recorded as built. A source that is not pinned to exact content is always rebuilt |
+| `--skip-published` | Skip a component whose source resolves to what a prior run recorded as built, at the same declared version. A source that is not pinned to exact content is always rebuilt |
 | `--build-date DATE` | Stamp every version with `DATE` (`YYYY-MM-DD`) instead of today, and hand the build the same `SOURCE_DATE_EPOCH`. `--build-date manifest` takes the date the prior run recorded |
 
 `--only` and `--from` are mutually exclusive, and `--jobs` takes an integer of 1
@@ -61,6 +61,15 @@ is refused before anything is provisioned, naming the component to add. See
 from every `debian/control`. It takes the same exclusive lock on its work
 directory that `build` does, so planning while a build runs wants a `--work`
 directory of its own.
+
+A component that [declares its version](recipes.md#components-with-no-changelog)
+gets a line for it, which is where to see what `version-from = "git-describe"`
+derived before a build stamps it into a package:
+
+```text
+  1. foo @ source 1f3a9c2e5b7d, packaging 8d4b0e1c7a92
+     version: 1.2.3
+```
 
 ## Verbosity
 

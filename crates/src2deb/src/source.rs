@@ -31,6 +31,28 @@
 //! same order, so the version stamp and the manifest name every tree the build
 //! was assembled from.
 //!
+//! A fourth step follows the three, and it is not an input: a component whose
+//! recipe declares a version has its `debian/changelog` written from that
+//! declaration — see [Declared versions](#declared-versions).
+//!
+//! # Declared versions
+//!
+//! Packaging assembled from a source with no `debian/` of its own has a
+//! `control` and a `rules` but no release history, and the version stamp has
+//! nothing to build on. Such a component names its version in the recipe, and
+//! the resolver writes the changelog the packaging lacks — one entry, over the
+//! identity the recipe or the component's own `debian/control` declares. See
+//! [`crate::version`].
+//!
+//! It is written here, during assembly, rather than alongside the stamp,
+//! because the vendor pass runs the component's own `debian/rules clean` before
+//! anything is stamped, and `debhelper` reads `debian/changelog` to learn what
+//! it is cleaning. A tree that reaches that pass without one does not build.
+//!
+//! Like a packaging overlay, a declared version **replaces** whatever the
+//! assembled tree holds rather than sitting beside it, so the version a package
+//! is built as is the version the recipe named.
+//!
 //! # Packaging overlays
 //!
 //! Not every upstream ships a `debian/` directory, and for many that do not,
@@ -93,7 +115,8 @@ use std::process::Command;
 
 use crate::error::{Error, Result, io_error};
 use crate::fingerprint::{Fingerprint, SourceInput, SourceRole};
-use crate::recipe::{Component, Origin, Source};
+use crate::recipe::{Component, Origin, Source, VersionFrom, VersionSource};
+use crate::version::BuildStamp;
 
 /// A resolved component source: the tree that holds `debian/`, and what the
 /// tree was resolved from.
@@ -110,6 +133,19 @@ pub struct ResolvedSource {
     pub tree: PathBuf,
     /// What the tree was assembled from.
     pub source: Fingerprint,
+    /// The upstream version the recipe declared for this component, when it
+    /// declares one — stated outright, or derived from the resolved source.
+    ///
+    /// `None` for a component that takes its version from a `debian/changelog`,
+    /// which is the ordinary case.
+    ///
+    /// Recorded beside the fingerprint rather than within it, because it is not
+    /// a tree the build consumed: it is a name the recipe gave. It travels all
+    /// the same, because a run that changes it produces different packages
+    /// while every input it resolved stays exactly where it was — so
+    /// `--skip-published` has to see it move. See
+    /// [`ComponentRecord::is_built_at`](crate::manifest::ComponentRecord::is_built_at).
+    pub version: Option<String>,
 }
 
 /// One of a component's declared trees, resolved into the work directory: where
@@ -123,13 +159,20 @@ struct ResolvedTree {
 
 /// Puts the trees a component is built from under a work directory: cloning and
 /// checking out a git source, and copying a path source.
-pub struct SourceResolver {
+pub struct SourceResolver<'a> {
     sources_dir: PathBuf,
     packaging_dir: PathBuf,
     recipe_dir: PathBuf,
+    /// The recipe's maintainer identity, which a component's own overrides and
+    /// its `debian/control` stands in for. See [Declared
+    /// versions](self#declared-versions).
+    maintainer: Option<&'a str>,
+    /// The run's build stamp, whose timestamp dates a synthesized changelog so
+    /// it agrees with the stamped entry that will sit above it.
+    stamp: &'a BuildStamp,
 }
 
-impl SourceResolver {
+impl<'a> SourceResolver<'a> {
     /// Creates a resolver that works under `work_dir` and resolves a relative
     /// [`Source::path`](crate::Source::path) against `recipe_dir`.
     ///
@@ -138,12 +181,24 @@ impl SourceResolver {
     /// `<work_dir>/packaging/<component>`. They are kept apart because both are
     /// checkouts named for the component, and a component's source tree is
     /// bound into a cage while its packaging source is only ever read.
-    pub fn new(work_dir: impl AsRef<Path>, recipe_dir: impl Into<PathBuf>) -> SourceResolver {
+    ///
+    /// `maintainer` and `stamp` are the recipe's identity and the run's date,
+    /// which a component declaring its own version is given a `debian/changelog`
+    /// from. Neither is consulted for a component that takes its version from a
+    /// changelog it already has.
+    pub fn new(
+        work_dir: impl AsRef<Path>,
+        recipe_dir: impl Into<PathBuf>,
+        maintainer: Option<&'a str>,
+        stamp: &'a BuildStamp,
+    ) -> SourceResolver<'a> {
         let work_dir = work_dir.as_ref();
         SourceResolver {
             sources_dir: work_dir.join("sources"),
             packaging_dir: work_dir.join("packaging"),
             recipe_dir: recipe_dir.into(),
+            maintainer,
+            stamp,
         }
     }
 
@@ -163,6 +218,10 @@ impl SourceResolver {
     /// declaring one has no `debian/` until it is applied. It is what makes the
     /// tree a component at all, so nothing downstream has to ask again.
     ///
+    /// A declared version is written last, so the changelog it produces is
+    /// signed from the `debian/control` the whole assembly settled on — a patch
+    /// that corrects the `Maintainer` field corrects the trailer with it.
+    ///
     /// A component that names no origin — or two — cannot be resolved. A
     /// validated recipe has neither ([`Recipe::load`](crate::Recipe::load)
     /// refuses both), so this is reported rather than assumed away.
@@ -172,9 +231,134 @@ impl SourceResolver {
         inputs.extend(self.overlay_packaging(component, &source.tree)?);
         refuse_without_control(component, &source.tree)?;
         inputs.extend(self.apply_patches(component, &source.tree)?);
+        let version = self.declare_version(component, &source.tree)?;
         Ok(ResolvedSource {
             tree: source.tree,
             source: Fingerprint::over(inputs),
+            version,
+        })
+    }
+
+    /// Writes the `debian/changelog` a component's declared version calls for,
+    /// and returns that version — `None` when the recipe declares none, which
+    /// leaves the tree's own changelog to be read as it always has been.
+    ///
+    /// See [Declared versions](self#declared-versions) for why the file is
+    /// written here rather than beside the version stamp, and
+    /// [`synthesized_changelog`](crate::version::synthesized_changelog) for what
+    /// it holds.
+    ///
+    /// Three things have to agree for the entry to be a changelog at all: the
+    /// source package name, which comes from `debian/control` so that
+    /// `dpkg-buildpackage` finds the two saying the same thing; the version;
+    /// and an identity. Each is reported by name when it is missing, because
+    /// each has a different remedy.
+    fn declare_version(&self, component: &Component, tree: &Path) -> Result<Option<String>> {
+        let Some(declared) = component.version_source() else {
+            return Ok(None);
+        };
+        let version = match declared {
+            VersionSource::Declared(version) => version.to_string(),
+            VersionSource::Derived(VersionFrom::GitDescribe) => self.describe(component)?,
+        };
+
+        let control = crate::plan::read_control(&component.name, tree)?;
+        let source = crate::plan::source_package(&control).ok_or_else(|| Error::Source {
+            component: component.name.clone(),
+            reason: format!(
+                "{}/debian/control declares no Source field, so there is no \
+                 source package name to write a changelog entry for",
+                tree.display(),
+            ),
+        })?;
+        let maintainer = self.maintainer(component, &control)?;
+
+        let path = tree.join(CHANGELOG);
+        let entry = crate::version::synthesized_changelog(source, &version, maintainer, self.stamp);
+        std::fs::write(&path, entry).map_err(|err| io_error("writing", &path, err))?;
+        Ok(Some(version))
+    }
+
+    /// The identity a component's synthesized changelog is signed with: its own
+    /// [`maintainer`](Component::maintainer), then the recipe's, then the
+    /// `Maintainer` its `debian/control` declares.
+    ///
+    /// The last is why the recipe rarely has to say anything: Debian policy
+    /// makes the control field mandatory, so packaging complete enough to build
+    /// already carries an identity, and reusing it keeps src2deb's rule that it
+    /// never invents one.
+    ///
+    /// A control field that could not sign a trailer is refused rather than
+    /// written, since the entry it produced would not parse — and would do so
+    /// from a file the recipe never wrote.
+    fn maintainer<'c>(&'c self, component: &'c Component, control: &'c str) -> Result<&'c str> {
+        if let Some(declared) = component.maintainer.as_deref().or(self.maintainer) {
+            return Ok(declared);
+        }
+        let control_field = crate::plan::maintainer(control).ok_or_else(|| Error::Source {
+            component: component.name.clone(),
+            reason: "the component declares a version but no maintainer, and its \
+                     debian/control declares no Maintainer field to take one from; \
+                     set maintainer on the component or on the recipe"
+                .to_string(),
+        })?;
+        match crate::recipe::maintainer_error(control_field) {
+            Some(reason) => Err(Error::Source {
+                component: component.name.clone(),
+                reason: format!(
+                    "the Maintainer field in debian/control, {control_field:?}, \
+                     {reason}, so it cannot sign the changelog entry src2deb \
+                     writes; set maintainer on the component or on the recipe"
+                ),
+            }),
+            None => Ok(control_field),
+        }
+    }
+
+    /// The version `git describe --tags` names for the component's resolved
+    /// source, rewritten into one that can be stamped.
+    ///
+    /// Run against the source root under the work directory — the checkout, or
+    /// the copy a path source was taken into — rather than against the
+    /// [`subdir`](Source::subdir) built from it, since a subdirectory of a
+    /// repository has no tags of its own.
+    ///
+    /// A source with no tag in its history, or one whose tag does not read as a
+    /// version, fails the component naming what git said. Falling back to an
+    /// abbreviated commit would produce a version that does not order against
+    /// the one before it, which is worse than not building.
+    fn describe(&self, component: &Component) -> Result<String> {
+        let root = self.sources_dir.join(&component.name);
+        let mut command = Command::new("git");
+        command
+            .args(["describe", "--tags"])
+            .current_dir(&root)
+            .env("LC_ALL", "C");
+        if let Some(ceiling) = repository_ceiling(&root).map_err(|err| self.fail(component, err))? {
+            command.env("GIT_CEILING_DIRECTORIES", ceiling);
+        }
+        let output = command.output().map_err(|err| self.fail(component, err))?;
+        if !output.status.success() {
+            return Err(Error::Source {
+                component: component.name.clone(),
+                reason: format!(
+                    "version-from = \"git-describe\", but git describe --tags \
+                     found no version in {}: {}. Tag a release, or state the \
+                     version with `version`",
+                    root.display(),
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                ),
+            });
+        }
+        let described = String::from_utf8_lossy(&output.stdout);
+        crate::version::version_from_describe(&described).ok_or_else(|| Error::Source {
+            component: component.name.clone(),
+            reason: format!(
+                "version-from = \"git-describe\" found {:?}, which is not a \
+                 version a package can be stamped with; state the version with \
+                 `version`",
+                described.trim(),
+            ),
         })
     }
 
@@ -568,17 +752,9 @@ impl SourceResolver {
     ///
     /// Two parts of the environment are set deliberately.
     ///
-    /// `GIT_CEILING_DIRECTORIES` puts any repository *enclosing* the tree out of
-    /// view. `git apply` run from a subdirectory of a repository prefixes every
-    /// patch path with that subdirectory — and then silently skips a
-    /// git-format patch that creates a file, because the name in its
-    /// `diff --git` header does not carry the prefix it now expects. It exits
-    /// zero having written nothing. A work directory inside a checkout is an
-    /// ordinary arrangement, so without this a real build would quietly drop
-    /// patches. Stopping git's search above the tree leaves the plain-patch
-    /// behaviour: paths relative to the tree, and no repository consulted. A
-    /// tree that is itself a repository root is unaffected either way, since
-    /// there is no prefix to prepend.
+    /// [`repository_ceiling`] puts any repository *enclosing* the tree out of
+    /// view, which for `git apply` is what keeps a patch from being silently
+    /// dropped; see that function.
     ///
     /// `LC_ALL` fixes the language of git's report, which is read back rather
     /// than only shown.
@@ -602,15 +778,8 @@ impl SourceResolver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Absolute and symlink-free, which is the form git compares against.
-        // A tree with no parent is the filesystem root, which holds no
-        // repository to hide.
-        if let Some(parent) = tree
-            .canonicalize()
-            .map_err(|err| self.fail(component, err))?
-            .parent()
-        {
-            command.env("GIT_CEILING_DIRECTORIES", parent);
+        if let Some(ceiling) = repository_ceiling(tree).map_err(|err| self.fail(component, err))? {
+            command.env("GIT_CEILING_DIRECTORIES", ceiling);
         }
 
         let mut child = command.spawn().map_err(|err| self.fail(component, err))?;
@@ -637,9 +806,10 @@ impl SourceResolver {
     /// stays put after the recipe stops declaring one.
     ///
     /// The paths to discard are the ones the assembly itself names: `debian/`
-    /// for a packaging overlay, and for a patch whatever `git apply --numstat`
-    /// reports, which parses a patch without applying it. Cleaning exactly those
-    /// leaves everything else — the vendored crates above all — where it was.
+    /// for a packaging overlay, `debian/changelog` for a declared version, and
+    /// for a patch whatever `git apply --numstat` reports, which parses a patch
+    /// without applying it. Cleaning exactly those leaves everything else — the
+    /// vendored crates above all — where it was.
     ///
     /// Two assemblies are consulted, not one: this run's, and whatever the last
     /// run recorded ([`ASSEMBLED_PATHS`]). An input dropped from the recipe is
@@ -651,7 +821,11 @@ impl SourceResolver {
     /// is the previous run's work and never this one's.
     fn discard_prior_assembly(&self, component: &Component, checkout: &Path) -> Result<()> {
         let record = checkout.join(ASSEMBLED_PATHS);
-        if component.patches.is_empty() && component.packaging.is_none() && !record.is_file() {
+        if component.patches.is_empty()
+            && component.packaging.is_none()
+            && component.version_source().is_none()
+            && !record.is_file()
+        {
             return Ok(());
         }
 
@@ -659,6 +833,13 @@ impl SourceResolver {
         let mut current = Vec::new();
         if component.packaging.is_some() {
             current.push(PathBuf::from(PACKAGING));
+        }
+        // A synthesized changelog written into a `debian/` the source itself
+        // tracks is untracked, so a re-checkout leaves it where it is. Without
+        // this, a recipe that stops declaring a version keeps building the
+        // version it used to declare.
+        if component.version_source().is_some() {
+            current.push(PathBuf::from(CHANGELOG));
         }
         for (path, contents) in self.read_patches(component)? {
             current.extend(self.patch_targets(component, &tree, &path, &contents)?);
@@ -1076,6 +1257,34 @@ fn source_tree(checkout: &Path, subdir: Option<&Path>) -> PathBuf {
 /// The directory a packaging overlay supplies, and the one path an overlay
 /// writes into the source tree.
 const PACKAGING: &str = "debian";
+
+/// The file a declared version writes into the source tree.
+const CHANGELOG: &str = "debian/changelog";
+
+/// The `GIT_CEILING_DIRECTORIES` value that bounds a git command's repository
+/// search to `dir` itself, or `None` when `dir` is the filesystem root.
+///
+/// git searches upward from its working directory for a repository, so a
+/// command run under a work directory that happens to sit inside a checkout —
+/// an ordinary arrangement — finds that checkout rather than nothing. A ceiling
+/// at `dir`'s parent stops the search before it leaves `dir`, so a repository is
+/// found only when `dir` is one.
+///
+/// Both callers need that, for different reasons. `git describe` would otherwise
+/// answer with the enclosing repository's tags, which have nothing to do with
+/// the component; and `git apply` run from a subdirectory of a repository
+/// prefixes every patch path with that subdirectory, then *silently skips* a
+/// git-format patch that creates a file, because the name in its `diff --git`
+/// header does not carry the prefix it now expects — exiting zero having written
+/// nothing. Stopping the search leaves the plain-patch behaviour: paths relative
+/// to the tree, and no repository consulted. A directory that is itself a
+/// repository root is unaffected either way.
+///
+/// The path is canonicalized first, which is the absolute, symlink-free form git
+/// compares ceilings against.
+fn repository_ceiling(dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    Ok(dir.canonicalize()?.parent().map(Path::to_path_buf))
+}
 
 /// Where a checkout records the paths its last assembly wrote, relative to the
 /// checkout.
@@ -1501,9 +1710,7 @@ mod tests {
                 path: Some(path.to_path_buf()),
                 ..crate::recipe::Source::default()
             },
-            packaging: None,
-            patches: Vec::new(),
-            extra_build_deps: Vec::new(),
+            ..crate::recipe::Component::default()
         }
     }
 

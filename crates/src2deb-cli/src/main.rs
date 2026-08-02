@@ -1106,6 +1106,10 @@ fn skipped_tally(report: &RunReport) -> String {
 /// Prints the resolved build order to stdout, one component per line with the
 /// source it resolved to and, when requested, its build-dependencies. Progress
 /// goes to stderr, so the plan itself stays cleanly pipeable on stdout.
+///
+/// A component that declares its version gets a line for it. Most do not, and a
+/// line saying so for every component would bury the ones where the version was
+/// a decision — for `version-from`, one the plan made.
 fn print_plan(report: &PlanReport, show_build_deps: bool) {
     for (position, component) in report.components.iter().enumerate() {
         println!(
@@ -1114,6 +1118,9 @@ fn print_plan(report: &PlanReport, show_build_deps: bool) {
             component.name,
             plan_source(&component.source)
         );
+        if let Some(version) = &component.version {
+            println!("     version: {version}");
+        }
         if show_build_deps {
             if component.build_deps.is_empty() {
                 println!("     build-deps: (none)");
@@ -1518,6 +1525,7 @@ mod tests {
                 .map(|n| src2deb::Built {
                     component: format!("built-{n}"),
                     source: git("abc"),
+                    version: None,
                     artifacts: vec![src2deb::Artifact {
                         package: format!("built-{n}"),
                         version: "1.0".to_string(),

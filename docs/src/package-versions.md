@@ -93,6 +93,49 @@ day stamp the same version. `apt upgrade` sees nothing to do. Install the new
 `.deb` directly with `dpkg -i`, which reinstalls a matching version, or pass a
 distinct `--build-date` to separate the two.
 
+### Packaging that ships no changelog
+
+Not every component has an upstream version to extend. Packaging assembled from a
+[packaging overlay](recipes.md#packaging-overlays) is often a `control` and a
+`rules` and nothing else — no release history, and so no version for the stamp to
+build on.
+
+Such a component declares its version in the recipe, and src2deb writes the
+`debian/changelog` the packaging lacks:
+
+```toml
+[[components]]
+name = "foo"
+source.git = "https://github.com/example/foo"
+packaging.path = "packaging/foo"
+version = "1.2.3"
+```
+
+```text
+foo (1.2.3) UNRELEASED; urgency=medium
+
+  * Version declared by the build recipe; this source carries no changelog of its own.
+
+ -- Your Name <you@example.org>  Fri, 31 Jul 2026 00:00:00 +0000
+```
+
+That entry is a base and not a build record. The stamping path above extends it
+exactly as it extends an upstream changelog, so the package is versioned by one
+code path however its version was arrived at:
+
+```text
+1.2.3+deb13.20260731.abc1234.def5678
+```
+
+`version-from = "git-describe"` derives the version from the source's own tags
+rather than stating it. See [Components with no
+changelog](recipes.md#components-with-no-changelog) for both, and for where the
+maintainer identity comes from.
+
+The declared version is compared by `--skip-published` alongside the source
+fingerprint, so editing it rebuilds the component — which it has to, since every
+tree the component resolves is unchanged and only the version moved.
+
 ## The date is the build date
 
 The date is when the build ran, not when the source was committed. A rebuild of
@@ -256,3 +299,9 @@ The entry lands on the build's own copy of the source tree, inside the cage —
 not on the resolved checkout in the work directory. The checkout keeps
 upstream's changelog, so each rebuild starts from the same base version rather
 than compounding suffixes onto the last build's.
+
+A component that [declares its version](#packaging-that-ships-no-changelog) is
+the one exception to that last sentence, in form rather than in substance: the
+base entry it extends is one src2deb wrote into the resolved tree, and each run
+rewrites it from the recipe. The base version still comes from one place and
+still does not compound.

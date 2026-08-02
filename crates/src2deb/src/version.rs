@@ -36,6 +36,26 @@
 //!
 //! The stamp is applied to the build's private copy of the source tree, inside
 //! the cage, so the resolved checkout on the host keeps upstream's changelog.
+//!
+//! # Packaging that carries no changelog
+//!
+//! Not every component has a `debian/changelog` to extend. A source with no
+//! `debian/` of its own, packaged from a
+//! [second tree](crate::Component::packaging) or from a directory kept beside
+//! the recipe, has a `control` and a `rules` but no release history — and the
+//! version stamp has nothing to build on.
+//!
+//! Such a component names its version in the recipe, and src2deb writes the
+//! changelog it would otherwise have read: one entry, declaring that version,
+//! signed with a declared maintainer identity. See
+//! [`synthesized_changelog`]. The stamping path above then extends that entry
+//! exactly as it extends upstream's, so one code path produces every version
+//! src2deb stamps.
+//!
+//! The identity is still never invented. It comes from the recipe's own
+//! `maintainer` setting, or failing that from the `Maintainer` field the
+//! component's `debian/control` already declares — which Debian policy makes
+//! mandatory, so a component that can be built at all carries one.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -179,6 +199,17 @@ impl BuildStamp {
         &self.tag
     }
 
+    /// The run's instant formatted for a `debian/changelog` trailer (RFC 2822,
+    /// in UTC).
+    ///
+    /// The same instant every entry a run writes is dated with, so a
+    /// [synthesized changelog](synthesized_changelog) and the stamped entry
+    /// above it agree — and so a run given `--build-date` writes the same text
+    /// twice over.
+    pub fn timestamp(&self) -> &str {
+        &self.timestamp
+    }
+
     /// The build date as `YYYYMMDD`, which is the form the version carries.
     pub fn date(&self) -> &str {
         &self.date
@@ -242,6 +273,114 @@ impl BuildStamp {
     }
 }
 
+/// The distribution a [synthesized](synthesized_changelog) entry names.
+///
+/// The entry declares a version that was never uploaded anywhere — src2deb
+/// writes it because the component's packaging carries no changelog to take one
+/// from — so it names no suite. The stamped entry above it names the suite the
+/// build targets, and that is the entry `dpkg-buildpackage` reads.
+const SYNTHESIZED_DISTRIBUTION: &str = "UNRELEASED";
+
+/// The `debian/changelog` for a component whose recipe declares its version:
+/// one entry, naming `version` for source package `source` over `maintainer`'s
+/// identity.
+///
+/// Written into the assembled tree so that everything downstream — the vendor
+/// pass, the version stamp, `dpkg-buildpackage` — reads a changelog whether or
+/// not the packaging shipped one. It is a base rather than a build record:
+/// [`stamped_entry`] reads it and prepends the entry that declares the version
+/// the packages are actually built as, so the changelog inside the `.deb` reads
+/// as any other stamped one does.
+///
+/// One entry, and only one. A history invented from a git log would claim
+/// releases that never happened, and nothing downstream reads past the top
+/// entry in any case.
+///
+/// `version` is the caller's to validate; see [`declared_version_error`].
+pub fn synthesized_changelog(
+    source: &str,
+    version: &str,
+    maintainer: &str,
+    stamp: &BuildStamp,
+) -> String {
+    format!(
+        "{source} ({version}) {SYNTHESIZED_DISTRIBUTION}; urgency=medium\n\
+         \n\
+         \x20 * Version declared by the build recipe; this source carries no \
+         changelog of its own.\n\
+         \n\
+         \x20-- {maintainer}  {timestamp}\n",
+        timestamp = stamp.timestamp,
+    )
+}
+
+/// Reports why a declared version cannot be stamped, or `None` when it can.
+///
+/// The value is spliced into the changelog entry src2deb writes —
+/// `source (version) UNRELEASED; urgency=medium` — which `dpkg` then parses, so
+/// it has to be a version `dpkg` accepts.
+///
+/// Two rules, both of which a git tag routinely breaks:
+///
+/// - **It begins with a digit**, as Debian's grammar requires of an upstream
+///   version. `v1.2.3` is the ordinary spelling of a tag and is not a version;
+///   it is refused here rather than stamped into something `dpkg` rejects deep
+///   inside a build.
+/// - **It carries only the characters a version may** — alphanumerics, `.`,
+///   `+`, `~`, `-`, and `:`. Whitespace or a `)` would end the field somewhere
+///   other than where it reads as ending, and the entry would parse as
+///   something else entirely.
+///
+/// `-` and `:` are admitted because a declared version stands where a
+/// changelog's own would: it may carry a Debian revision (`1.2.3-1`) and an
+/// epoch (`1:1.2.3`), and the stamp appends to it without disturbing either.
+pub fn declared_version_error(version: &str) -> Option<&'static str> {
+    if version.is_empty() {
+        Some("is empty")
+    } else if !version.starts_with(|c: char| c.is_ascii_digit()) {
+        Some("does not begin with a digit, which a Debian version must")
+    } else if !version
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '~' | '-' | ':'))
+    {
+        Some("contains a character a Debian version may not")
+    } else {
+        None
+    }
+}
+
+/// The upstream version a `git describe --tags` output names, or `None` when it
+/// does not name one that can be stamped.
+///
+/// `git describe` renders `<tag>` on a tagged commit and
+/// `<tag>-<commits>-g<hash>` anywhere after one. Two substitutions turn that
+/// into a Debian version:
+///
+/// - **A leading `v` is dropped**, since `v1.2.3` is the conventional spelling
+///   of the tag for version `1.2.3`. Only when a digit follows, so a project
+///   whose tags read `vulkan-1.0` keeps its name.
+/// - **Every `-` becomes `.`**. A version's Debian revision begins at its
+///   *last* hyphen, so `1.2.3-4-gabc1234` would split as upstream `1.2.3-4`
+///   over revision `gabc1234`, which is not where it reads as splitting. `.`
+///   leaves no revision boundary to move and orders the same way: it compares
+///   component-wise, and digit runs compare numerically, so `1.2.3.10.gabc1234`
+///   still sorts above `1.2.3.9.gdef5678` and both above the bare tag `1.2.3`.
+///
+/// Anything the result cannot be stamped as — a tag not beginning with a digit,
+/// or carrying a character a version may not — is `None`, so the caller reports
+/// the tag it found rather than stamping something that does not order.
+pub fn version_from_describe(described: &str) -> Option<String> {
+    let described = described.trim();
+    let unprefixed = described
+        .strip_prefix('v')
+        .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or(described);
+    let version = unprefixed.replace('-', ".");
+    declared_version_error(&version)
+        .is_none()
+        .then_some(version)
+}
+
 /// Reads `tree/debian/changelog` and renders the entry that stamps a build of
 /// `source` for `suite`.
 ///
@@ -249,6 +388,11 @@ impl BuildStamp {
 /// entry: src2deb cannot name a version it cannot derive, and a build that
 /// silently kept upstream's version would publish a package apt never offers as
 /// an upgrade — the failure this whole module exists to prevent.
+///
+/// A tree with no changelog at all is the one failure with a remedy in the
+/// recipe rather than in the source, so it is reported as such: the component
+/// declares its version and src2deb writes the changelog. See [Packaging that
+/// carries no changelog](self#packaging-that-carries-no-changelog).
 pub fn stamped_entry(
     component: &str,
     tree: &Path,
@@ -259,7 +403,15 @@ pub fn stamped_entry(
     let path = tree.join("debian/changelog");
     let text = std::fs::read_to_string(&path).map_err(|err| Error::Changelog {
         component: component.to_string(),
-        reason: format!("{}: {err}", path.display()),
+        reason: match err.kind() {
+            std::io::ErrorKind::NotFound => format!(
+                "{} does not exist; a component whose packaging carries no \
+                 changelog names its version in the recipe, with `version` or \
+                 `version-from`",
+                path.display()
+            ),
+            _ => format!("{}: {err}", path.display()),
+        },
     })?;
     let head = parse_changelog(&text).ok_or_else(|| Error::Changelog {
         component: component.to_string(),
@@ -580,6 +732,167 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
         // 2000 is a leap year (divisible by 400); 1900 was not.
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+    }
+
+    #[test]
+    fn a_synthesized_changelog_is_a_changelog_the_stamping_path_can_extend() {
+        // The whole point: what src2deb writes for packaging that ships none has
+        // to read back as a changelog head, because the next thing that happens
+        // to it is `stamped_entry`.
+        let stamp = BuildStamp::at("deb13", 1_785_456_000);
+        let text = synthesized_changelog(
+            "cosmic-icons",
+            "1.0.0",
+            "Someone <someone@example.invalid>",
+            &stamp,
+        );
+        let head = parse_changelog(&text).expect("the synthesized file is a changelog");
+        assert_eq!(head.source, "cosmic-icons");
+        assert_eq!(head.version, "1.0.0");
+        assert_eq!(head.maintainer, "Someone <someone@example.invalid>");
+        // It names no suite: the version it declares was never uploaded
+        // anywhere, and the stamped entry above it names the target.
+        assert!(text.contains(") UNRELEASED; urgency=medium\n"), "{text}");
+        // One entry, and nothing invented around it.
+        assert_eq!(text.matches("urgency=").count(), 1);
+
+        // ...and stamping it produces exactly the version an upstream changelog
+        // declaring the same base would have produced.
+        let entry = stamp.changelog_entry(&head, "trixie", &git("abc1234def5678"));
+        assert!(
+            entry.starts_with("cosmic-icons (1.0.0+deb13.20260731.abc1234) trixie;"),
+            "{entry}",
+        );
+    }
+
+    #[test]
+    fn a_synthesized_changelog_is_dated_by_the_run_that_wrote_it() {
+        // Same stamp, same text — so a `--build-date` run rewrites the file it
+        // wrote last time rather than moving the base entry beneath a stamp that
+        // did not move.
+        let stamp = BuildStamp::at("deb13", 1_785_456_000);
+        let text = synthesized_changelog("c", "1.0", "S <s@e.invalid>", &stamp);
+        assert!(text.contains("Fri, 31 Jul 2026 00:00:00 +0000"), "{text}");
+        assert_eq!(
+            text,
+            synthesized_changelog("c", "1.0", "S <s@e.invalid>", &stamp),
+        );
+        assert_eq!(stamp.timestamp(), "Fri, 31 Jul 2026 00:00:00 +0000");
+    }
+
+    #[test]
+    fn a_declared_version_may_carry_an_epoch_and_a_debian_revision() {
+        // It stands where a changelog's own version would, so it may be
+        // anything a changelog could declare.
+        for version in ["1.0", "1.2.3-1", "1:1.2.3-1", "1.0.0~alpha.7-1", "2026.07"] {
+            assert_eq!(
+                declared_version_error(version),
+                None,
+                "{version:?} should be accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_version_that_dpkg_would_not_parse_is_refused() {
+        for (version, needle) in [
+            ("", "is empty"),
+            // The one a git tag hands you, and the reason the check exists.
+            ("v1.2.3", "begin with a digit"),
+            ("release-1.0", "begin with a digit"),
+            ("1.0 beta", "may not"),
+            ("1.0)", "may not"),
+            ("1.0\n", "may not"),
+            ("1.0/2", "may not"),
+        ] {
+            let reason = declared_version_error(version)
+                .unwrap_or_else(|| panic!("{version:?} should be refused"));
+            assert!(reason.contains(needle), "{version:?} gave: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_describe_output_becomes_a_version_that_orders_the_way_the_history_does() {
+        // On a tag, and after one. The `v` goes, and the hyphens become dots so
+        // no Debian revision boundary is invented.
+        assert_eq!(version_from_describe("v1.2.3\n").as_deref(), Some("1.2.3"));
+        assert_eq!(
+            version_from_describe("v1.2.3-4-gabc1234").as_deref(),
+            Some("1.2.3.4.gabc1234"),
+        );
+        assert_eq!(
+            version_from_describe("1.2.3-4-gabc1234").as_deref(),
+            Some("1.2.3.4.gabc1234"),
+        );
+        // A tag whose leading `v` is part of a word keeps it, and is then
+        // refused for not starting with a digit rather than silently truncated.
+        assert_eq!(version_from_describe("vulkan-1.0"), None);
+    }
+
+    #[test]
+    fn derived_versions_order_by_distance_from_the_tag() {
+        // What the substitution is for. Each is strictly greater than the one
+        // before it under dpkg's rules: a shorter string sorts first where the
+        // longer continues with `.`, and digit runs compare numerically.
+        let ordered = [
+            version_from_describe("v1.2.3").unwrap(),
+            version_from_describe("v1.2.3-1-gaaaaaaa").unwrap(),
+            version_from_describe("v1.2.3-9-gbbbbbbb").unwrap(),
+            version_from_describe("v1.2.3-10-gccccccc").unwrap(),
+            version_from_describe("v1.2.4").unwrap(),
+        ];
+        assert_eq!(
+            ordered,
+            [
+                "1.2.3",
+                "1.2.3.1.gaaaaaaa",
+                "1.2.3.9.gbbbbbbb",
+                "1.2.3.10.gccccccc",
+                "1.2.4",
+            ],
+        );
+        // No hyphen survives, so the stamp appended after this cannot land on
+        // the far side of a revision boundary the tag introduced.
+        assert!(ordered.iter().all(|version| !version.contains('-')));
+    }
+
+    #[test]
+    fn a_describe_output_that_is_not_a_version_is_refused_rather_than_stamped() {
+        for described in [
+            "release/1.0",      // a slashed tag
+            "abc1234",          // what --always would give, which does not order
+            "start",            // a tag that is a word
+            "",                 //
+            "v",                // a `v` with nothing after it
+            "1.0 with a space", //
+        ] {
+            assert_eq!(
+                version_from_describe(described),
+                None,
+                "{described:?} should be refused",
+            );
+        }
+    }
+
+    #[test]
+    fn a_tree_with_no_changelog_at_all_is_told_where_the_version_comes_from() {
+        // The failure a component packaged from a source with no `debian/` of
+        // its own hits, and its remedy is in the recipe rather than the source.
+        let dir = std::env::temp_dir().join(format!("src2deb-no-changelog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("debian")).unwrap();
+        let err = stamped_entry(
+            "c",
+            &dir,
+            &BuildStamp::at("deb13", 0),
+            "trixie",
+            &git("abc1234"),
+        )
+        .expect_err("a tree with no changelog cannot be stamped");
+        let message = err.to_string();
+        assert!(message.contains("does not exist"), "{message}");
+        assert!(message.contains("version-from"), "{message}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

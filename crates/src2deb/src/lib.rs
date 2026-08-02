@@ -60,4 +60,4 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use fingerprint::{Fingerprint, SourceInput, SourceKind, SourceRole};
 pub use manifest::Manifest;
-pub use recipe::{Component, Origin, Recipe, Source};
+pub use recipe::{Component, Origin, Recipe, Source, VersionFrom, VersionSource};
