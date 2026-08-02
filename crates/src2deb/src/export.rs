@@ -750,6 +750,7 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VersionStamp;
 
     use crate::fingerprint::{Fingerprint, SourceInput, SourceRole};
     use crate::manifest::{ComponentRecord, PackageRecord};
@@ -798,6 +799,7 @@ mod tests {
                 status: STATUS_BUILT.to_string(),
                 error: None,
                 version: None,
+                version_stamp: VersionStamp::default(),
                 buildinfo: None,
                 source: Fingerprint::of(SourceInput::git(SourceRole::Source, "abc1234")),
                 packages: vec![PackageRecord {
@@ -1131,6 +1133,7 @@ mod tests {
                 status: STATUS_BUILT.to_string(),
                 error: None,
                 version: None,
+                version_stamp: VersionStamp::default(),
                 buildinfo: None,
                 source: Fingerprint::of(SourceInput::git(SourceRole::Source, "def5678")),
                 packages: vec![PackageRecord {

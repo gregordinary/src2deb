@@ -14,6 +14,14 @@
 //! For a **path** source it copies the tree on disk into the work directory and
 //! builds from the copy. See [Path sources](#path-sources).
 //!
+//! For an **archive** source it fetches the release tarball, verifies it against
+//! the declared digest, and unpacks it.
+//!
+//! For a **Debian source package** it fetches the `.dsc`, verifies it, then
+//! fetches and verifies each file the `.dsc` names and assembles them into a
+//! tree. It is the one origin that produces [`VendorPass::Skip`], since a source
+//! package already carries what its build needs.
+//!
 //! # Assembling a tree
 //!
 //! A component's tree is assembled from up to three inputs, in this order:
@@ -152,6 +160,33 @@ pub struct ResolvedSource {
     /// `--skip-published` has to see it move. See
     /// [`ComponentRecord::is_built_at`](crate::manifest::ComponentRecord::is_built_at).
     pub version: Option<String>,
+    /// Whether the tree still needs the vendor pass before it can be built.
+    ///
+    /// A property of what the source is, so it is settled here — where the
+    /// origin is known — rather than asked again at build time.
+    pub vendor: VendorPass,
+}
+
+/// Whether a component's build needs [pass 1](crate::build): the step that runs
+/// `debian/rules clean` in a cage with the **host network**, so that a component
+/// which vendors its dependencies at clean time has them before the isolated
+/// build begins.
+///
+/// That pass is src2deb's trust boundary — the one place upstream code runs with
+/// the host's network — so which sources cross it is worth stating rather than
+/// leaving as "always".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VendorPass {
+    /// Run it. Every source but a Debian source package: what a checkout, a
+    /// working tree, or a release archive holds is upstream's source, and
+    /// whether the build needs anything fetched into it is the packaging's to
+    /// decide by what `debian/rules clean` does.
+    #[default]
+    Run,
+    /// Skip it. A [Debian source package](crate::Source::dsc) already carries
+    /// everything its build needs — that is what makes it a source package —
+    /// so the pass would fetch nothing and the build is hermetic without it.
+    Skip,
 }
 
 /// One of a component's declared trees, resolved into the work directory: where
@@ -161,6 +196,10 @@ struct ResolvedTree {
     tree: PathBuf,
     /// The input this tree contributes to the component's fingerprint.
     input: SourceInput,
+    /// Whether a build from this tree still needs the vendor pass. Meaningful
+    /// only for a component's own source; a packaging overlay contributes a
+    /// `debian/` directory rather than the tree the pass would run in.
+    vendor: VendorPass,
 }
 
 /// Puts the trees a component is built from under a work directory: cloning and
@@ -250,6 +289,7 @@ impl<'a> SourceResolver<'a> {
             tree: source.tree,
             source: Fingerprint::over(inputs),
             version,
+            vendor: source.vendor,
         })
     }
 
@@ -382,15 +422,80 @@ impl<'a> SourceResolver<'a> {
             Some(Origin::Git { url, git_ref }) => self.resolve_git(component, url, git_ref),
             Some(Origin::Path(path)) => self.resolve_path(component, path),
             Some(Origin::Tarball { url, sha256 }) => self.resolve_tarball(component, url, sha256),
+            Some(Origin::Dsc { url, sha256 }) => self.resolve_dsc(
+                component,
+                &component.source,
+                url,
+                sha256,
+                SourceRole::Source,
+            ),
             None => Err(Error::Source {
                 component: component.name.clone(),
                 reason: "the component names no single source; set source.git to \
                          clone a repository, source.path to build a tree on disk, \
-                         or source.tarball with source.sha256 to build a release \
-                         archive"
+                         source.tarball with source.sha256 to build a release \
+                         archive, or source.dsc with source.sha256 to rebuild a \
+                         Debian source package"
                     .to_string(),
             }),
         }
+    }
+
+    /// Resolves a Debian source package: fetches its `.dsc`, verifies it against
+    /// the declared digest, fetches and verifies the files it names, and unpacks
+    /// them into the directory `role` calls for.
+    ///
+    /// `source` is the recipe table the origin came from — the component's own
+    /// or its overlay's — since only that says what `subdir` to apply. `role`
+    /// decides both where the package lands and how much of it is fetched. As a component's own source it becomes the whole tree, under
+    /// `sources/<component>`; as a [packaging overlay](Component::packaging)
+    /// only what carries `debian/` is fetched at all, under
+    /// `packaging/<component>`. See [`crate::dsc`].
+    ///
+    /// The input is the digest of the `.dsc`, which pins the whole package: the
+    /// `.dsc` carries the digest of every file, and a file that did not match
+    /// failed the resolve rather than reaching here.
+    ///
+    /// A source package needs no vendor pass, which is what makes this src2deb's
+    /// one hermetic source kind — but only as a *source*. A packaging overlay
+    /// says nothing about how the tree it is applied to acquires its
+    /// dependencies, so it leaves the pass where it found it.
+    fn resolve_dsc(
+        &self,
+        component: &Component,
+        source: &Source,
+        url: &str,
+        sha256: &str,
+        role: SourceRole,
+    ) -> Result<ResolvedTree> {
+        let (parent, want, vendor) = match role {
+            SourceRole::Source => (
+                &self.sources_dir,
+                crate::dsc::Want::Source,
+                VendorPass::Skip,
+            ),
+            _ => (
+                &self.packaging_dir,
+                crate::dsc::Want::Packaging,
+                VendorPass::Run,
+            ),
+        };
+        let unpacked = crate::dsc::unpack(
+            &component.name,
+            &self.tarballs_dir,
+            url,
+            sha256,
+            &parent.join(&component.name),
+            want,
+        )?;
+        let subdir = source.subdir.as_deref();
+        let tree = source_tree(&unpacked.tree, subdir);
+        refuse_missing_subdir(component, role.label(), subdir, &tree)?;
+        Ok(ResolvedTree {
+            tree,
+            input: SourceInput::dsc(role, unpacked.digest),
+            vendor,
+        })
     }
 
     /// Resolves an archive source: fetches it, verifies it against the declared
@@ -423,6 +528,7 @@ impl<'a> SourceResolver<'a> {
         Ok(ResolvedTree {
             tree,
             input: SourceInput::sha256(SourceRole::Source, unpacked.digest),
+            vendor: VendorPass::Run,
         })
     }
 
@@ -455,6 +561,7 @@ impl<'a> SourceResolver<'a> {
         Ok(ResolvedTree {
             tree,
             input: SourceInput::git(SourceRole::Source, commit),
+            vendor: VendorPass::Run,
         })
     }
 
@@ -529,6 +636,7 @@ impl<'a> SourceResolver<'a> {
         Ok(ResolvedTree {
             tree: source_tree(&checkout, subdir),
             input: SourceInput::path(SourceRole::Source, origin.to_string_lossy()),
+            vendor: VendorPass::Run,
         })
     }
 
@@ -623,6 +731,7 @@ impl<'a> SourceResolver<'a> {
                 Ok(ResolvedTree {
                     tree,
                     input: SourceInput::git(SourceRole::Packaging, commit),
+                    vendor: VendorPass::Run,
                 })
             }
             Some(Origin::Path(declared)) => {
@@ -648,6 +757,7 @@ impl<'a> SourceResolver<'a> {
                 Ok(ResolvedTree {
                     tree,
                     input: SourceInput::tree(SourceRole::Packaging, digest),
+                    vendor: VendorPass::Run,
                 })
             }
             Some(Origin::Tarball { url, sha256 }) => {
@@ -663,14 +773,20 @@ impl<'a> SourceResolver<'a> {
                 Ok(ResolvedTree {
                     tree,
                     input: SourceInput::sha256(SourceRole::Packaging, unpacked.digest),
+                    vendor: VendorPass::Run,
                 })
+            }
+            Some(Origin::Dsc { url, sha256 }) => {
+                self.resolve_dsc(component, packaging, url, sha256, SourceRole::Packaging)
             }
             None => Err(Error::Source {
                 component: component.name.clone(),
                 reason: "the component names no single packaging source; set \
                          packaging.git to clone a repository, packaging.path to \
-                         overlay a tree on disk, or packaging.tarball with \
-                         packaging.sha256 to overlay a release archive"
+                         overlay a tree on disk, packaging.tarball with \
+                         packaging.sha256 to overlay a release archive, or \
+                         packaging.dsc with packaging.sha256 to take a Debian \
+                         source package's own packaging"
                     .to_string(),
             }),
         }

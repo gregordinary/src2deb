@@ -1705,7 +1705,7 @@ fn plan_source(source: &Fingerprint) -> String {
         .map(|input| {
             let value = match input.kind() {
                 SourceKind::Git | SourceKind::Patches => abbreviate(input.value()).to_string(),
-                SourceKind::Sha256 | SourceKind::Tree => {
+                SourceKind::Sha256 | SourceKind::Dsc | SourceKind::Tree => {
                     format!("{}:{}", input.kind().label(), abbreviate(input.value()))
                 }
                 // A path abbreviated is a path with its identifying part cut
@@ -2224,6 +2224,7 @@ mod tests {
                     component: format!("built-{n}"),
                     source: git("abc"),
                     version: None,
+                    version_stamp: src2deb::VersionStamp::default(),
                     artifacts: vec![src2deb::Artifact {
                         package: format!("built-{n}"),
                         version: "1.0".to_string(),

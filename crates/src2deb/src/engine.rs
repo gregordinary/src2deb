@@ -11,7 +11,7 @@ use crate::cancel::Cancel;
 use crate::error::{Error, Result, io_error};
 use crate::fingerprint::Fingerprint;
 use crate::lock::WorkLock;
-use crate::manifest::{self, Manifest, SandboxRecord};
+use crate::manifest::{self, BuildIdentity, Manifest, SandboxRecord};
 use crate::observer::Stream;
 use crate::plan::{self, BuildGraph};
 use crate::pool::LocalPool;
@@ -20,7 +20,8 @@ use crate::provision::{
 };
 use crate::recipe::{Component, Recipe};
 use crate::schedule::{Claim, Scheduler};
-use crate::source::{ResolvedSource, SourceResolver};
+use crate::source::{ResolvedSource, SourceResolver, VendorPass};
+use crate::version::VersionStamp;
 
 /// A progress event from a build run, delivered to the reporter passed to
 /// [`Engine::run`].
@@ -752,6 +753,10 @@ pub struct Built {
     /// `debian/changelog`. See
     /// [`ResolvedSource::version`](crate::source::ResolvedSource::version).
     pub version: Option<String>,
+    /// How this component's version was stamped, which decides whether its
+    /// packages sort above or below the archive's own of the same version. See
+    /// [`VersionStamp`].
+    pub version_stamp: VersionStamp,
     /// The files the build produced, under the run's output tree. One package
     /// contributes more than one — a `.deb` and its `.ddeb` debug companion —
     /// so this is longer than [`packages`](Self::packages).
@@ -894,6 +899,9 @@ struct Resolved<'a> {
     /// The upstream version the recipe declared, when it declares one. See
     /// [`ResolvedSource::version`](crate::source::ResolvedSource::version).
     version: Option<String>,
+    /// Whether a build of this tree still needs the vendor pass. See
+    /// [`VendorPass`].
+    vendor: VendorPass,
     control: String,
 }
 
@@ -1125,10 +1133,18 @@ impl Engine {
         let mut skipped: Vec<Skipped> = excused;
         for name in graph.order() {
             let entry = resolved[name.as_str()];
+            // Resolved per component rather than once for the run: a recipe may
+            // mix rebuilds of archive packages with software the archive does
+            // not carry, and the two order differently on purpose.
+            let version_stamp = recipe.resolved_version_stamp(entry.component);
+            let identity = BuildIdentity {
+                source: &entry.source,
+                version: entry.version.as_deref(),
+                version_stamp,
+            };
             if let Some(reason) = skip_reason(
                 name,
-                &entry.source,
-                entry.version.as_deref(),
+                &identity,
                 options,
                 &selected,
                 &prior_records,
@@ -1154,6 +1170,8 @@ impl Engine {
                 tree: &entry.tree,
                 source: &entry.source,
                 version: entry.version.as_deref(),
+                version_stamp,
+                vendor: entry.vendor,
                 binaries,
                 build_deps,
                 stamp: &stamp,
@@ -1509,6 +1527,7 @@ impl Engine {
                         tree,
                         source,
                         version,
+                        vendor,
                     },
                     control,
                 )) => {
@@ -1517,6 +1536,7 @@ impl Engine {
                         tree,
                         source,
                         version,
+                        vendor,
                         control,
                     });
                     continue;
@@ -1816,8 +1836,13 @@ impl Engine {
     ) -> Result<BuildOutcome> {
         let name = item.name;
         let target = item.target(changelog_entry);
-        reporter(Progress::Vendoring { component: name });
-        builder.vendor(root, target, reporter)?;
+        // A source that already carries what its build needs skips the one pass
+        // that reaches the host network, so such a component is built entirely
+        // inside an isolated cage. See [`VendorPass`].
+        if item.vendor == VendorPass::Run {
+            reporter(Progress::Vendoring { component: name });
+            builder.vendor(root, target, reporter)?;
+        }
 
         let out_dir = item.out_root.join(name);
         let outcome = builder.build(root, target, &out_dir, reporter)?;
@@ -1845,6 +1870,12 @@ struct WorkItem<'a> {
     /// only to be recorded: the tree's own `debian/changelog` already holds it,
     /// which is what the build reads.
     version: Option<&'a str>,
+    /// How this component's version is stamped, resolved from the component and
+    /// the recipe. Reaches the entry the build stamps the tree with, and the
+    /// manifest, so a run that changes it publishes rather than skips.
+    version_stamp: VersionStamp,
+    /// Whether this component's build runs the vendor pass. See [`VendorPass`].
+    vendor: VendorPass,
     /// Which of the component's binary packages this run builds. Run-level, not
     /// per component: it follows from which architecture owns the recipe's
     /// arch-indep output, and a component with nothing left to build under it is
@@ -1875,7 +1906,14 @@ impl WorkItem<'_> {
     /// not open with a well-formed entry, which is a failure of this component
     /// and not of the run: the error travels the same path a build failure does.
     fn changelog_entry(&self) -> Result<String> {
-        crate::version::stamped_entry(self.name, self.tree, self.stamp, self.suite, self.source)
+        crate::version::stamped_entry(
+            self.name,
+            self.tree,
+            self.stamp,
+            self.suite,
+            self.source,
+            self.version_stamp,
+        )
     }
 
     /// What the build passes need to know about this component, given the
@@ -1896,6 +1934,7 @@ impl WorkItem<'_> {
             component: self.name.to_string(),
             source: self.source.clone(),
             version: self.version.map(str::to_string),
+            version_stamp: self.version_stamp,
             packages: packages_of(&artifacts),
             artifacts,
             buildinfo,
@@ -2174,8 +2213,7 @@ fn refuse_unbuildable_run(
 /// [`ComponentRecord::is_built_at`](manifest::ComponentRecord::is_built_at).
 fn skip_reason(
     name: &str,
-    source: &Fingerprint,
-    version: Option<&str>,
+    identity: &BuildIdentity,
     options: &RunOptions,
     selected: &BTreeSet<&str>,
     prior: &BTreeMap<String, manifest::ComponentRecord>,
@@ -2190,7 +2228,7 @@ fn skip_reason(
     if options.skip_published
         && prior
             .get(name)
-            .is_some_and(|record| record.is_built_at(source, version))
+            .is_some_and(|record| record.is_built_at(identity))
     {
         return Some(SkipReason::AlreadyBuilt);
     }
@@ -2237,6 +2275,7 @@ fn manifest_for_run(
                     status: manifest::STATUS_BUILT.to_string(),
                     error: None,
                     version: built.version.clone(),
+                    version_stamp: built.version_stamp,
                     buildinfo: built
                         .buildinfo
                         .as_ref()
@@ -2260,6 +2299,8 @@ fn manifest_for_run(
                     // record is ever compared against one, and a component that
                     // failed may not have reached the point of declaring it.
                     version: None,
+                    // ...nor a version stamp, for the same reason.
+                    version_stamp: VersionStamp::default(),
                     // A failed build produced no packages to record one for.
                     buildinfo: None,
                     source: failed.source.clone(),
@@ -2276,6 +2317,7 @@ fn manifest_for_run(
                     status: manifest::STATUS_SKIPPED.to_string(),
                     error: None,
                     version: None,
+                    version_stamp: VersionStamp::default(),
                     buildinfo: None,
                     source: skipped
                         .get(key)
@@ -2515,6 +2557,7 @@ mod tests {
             status: STATUS_BUILT.to_string(),
             error: None,
             version: None,
+            version_stamp: VersionStamp::default(),
             buildinfo: None,
             source: git(commit),
             packages: vec![PackageRecord {
@@ -2525,6 +2568,16 @@ mod tests {
     }
 
     /// A git source at `commit`, the shape the resolver produces.
+    /// The identity a run would build a component at, defaulted to what an
+    /// ordinary component carries.
+    fn identity<'a>(source: &'a Fingerprint, version: Option<&'a str>) -> BuildIdentity<'a> {
+        BuildIdentity {
+            source,
+            version,
+            version_stamp: VersionStamp::default(),
+        }
+    }
+
     fn git(commit: &str) -> Fingerprint {
         Fingerprint::of(crate::fingerprint::SourceInput::git(
             crate::fingerprint::SourceRole::Source,
@@ -2640,6 +2693,8 @@ mod tests {
             tree: Path::new("/sources/pkg-b"),
             source: &source,
             version: None,
+            version_stamp: VersionStamp::default(),
+            vendor: VendorPass::Run,
             binaries: Binaries::All,
             build_deps: vec!["debhelper".to_string(), "liba-dev".to_string()],
             stamp: &stamp,
@@ -2756,22 +2811,50 @@ mod tests {
 
         // Outside the selection: skipped regardless of the flag.
         assert_eq!(
-            skip_reason("b", &git("abc"), None, &skip, &selected, &prior, true),
+            skip_reason(
+                "b",
+                &identity(&git("abc"), None),
+                &skip,
+                &selected,
+                &prior,
+                true
+            ),
             Some(SkipReason::NotSelected)
         );
         // Selected, --skip-published, prior built from the same source: skipped.
         assert_eq!(
-            skip_reason("a", &git("abc"), None, &skip, &selected, &prior, true),
+            skip_reason(
+                "a",
+                &identity(&git("abc"), None),
+                &skip,
+                &selected,
+                &prior,
+                true
+            ),
             Some(SkipReason::AlreadyBuilt)
         );
         // Selected but the source moved: built.
         assert_eq!(
-            skip_reason("a", &git("moved"), None, &skip, &selected, &prior, true),
+            skip_reason(
+                "a",
+                &identity(&git("moved"), None),
+                &skip,
+                &selected,
+                &prior,
+                true
+            ),
             None
         );
         // Selected, no --skip-published: built even though the prior matches.
         assert_eq!(
-            skip_reason("a", &git("abc"), None, &no_skip, &selected, &prior, true),
+            skip_reason(
+                "a",
+                &identity(&git("abc"), None),
+                &no_skip,
+                &selected,
+                &prior,
+                true
+            ),
             None
         );
     }
@@ -2798,8 +2881,7 @@ mod tests {
         assert_eq!(
             skip_reason(
                 "a",
-                &git("abc"),
-                Some("1.2.3"),
+                &identity(&git("abc"), Some("1.2.3")),
                 &skip,
                 &selected,
                 &prior,
@@ -2810,8 +2892,7 @@ mod tests {
         assert_eq!(
             skip_reason(
                 "a",
-                &git("abc"),
-                Some("1.2.4"),
+                &identity(&git("abc"), Some("1.2.4")),
                 &skip,
                 &selected,
                 &prior,
@@ -2844,7 +2925,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            skip_reason("a", &working_tree, None, &skip, &selected, &prior, true),
+            skip_reason(
+                "a",
+                &identity(&working_tree, None),
+                &skip,
+                &selected,
+                &prior,
+                true
+            ),
             None
         );
     }
@@ -2862,7 +2950,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            skip_reason("a", &git("abc"), None, &skip, &selected, &prior, false),
+            skip_reason(
+                "a",
+                &identity(&git("abc"), None),
+                &skip,
+                &selected,
+                &prior,
+                false
+            ),
             Some(SkipReason::ArchIndepElsewhere),
         );
         // It outranks `--skip-published`, which would otherwise claim the
@@ -2871,8 +2966,7 @@ mod tests {
         assert_eq!(
             skip_reason(
                 "a",
-                &git("abc"),
-                None,
+                &identity(&git("abc"), None),
                 &RunOptions::default(),
                 &selected,
                 &prior,
@@ -2882,7 +2976,14 @@ mod tests {
         );
         // Outside the selection still outranks both: it was never asked for.
         assert_eq!(
-            skip_reason("z", &git("abc"), None, &skip, &selected, &prior, false),
+            skip_reason(
+                "z",
+                &identity(&git("abc"), None),
+                &skip,
+                &selected,
+                &prior,
+                false
+            ),
             Some(SkipReason::NotSelected),
         );
     }
@@ -2902,6 +3003,7 @@ mod tests {
             component: "a".to_string(),
             source: git("aaa"),
             version: None,
+            version_stamp: VersionStamp::default(),
             artifacts: artifacts(1),
             buildinfo: None,
             packages: Vec::new(),
@@ -2946,6 +3048,7 @@ mod tests {
                 component: name.to_string(),
                 source: git("abc"),
                 version: None,
+                version_stamp: VersionStamp::default(),
                 artifacts: artifacts(1),
                 buildinfo: None,
                 packages: Vec::new(),
@@ -3012,6 +3115,7 @@ mod tests {
             component: "a".to_string(),
             source: git("aaa"),
             version: None,
+            version_stamp: VersionStamp::default(),
             artifacts: artifacts(1),
             buildinfo: None,
             packages: Vec::new(),
@@ -3037,6 +3141,7 @@ mod tests {
                 component: "b".to_string(),
                 source: git("def"),
                 version: None,
+                version_stamp: VersionStamp::default(),
                 artifacts: artifacts(1),
                 buildinfo: None,
                 packages: vec![Package {
@@ -3058,7 +3163,7 @@ mod tests {
         let manifest = manifest_for_run(&recipe, &report, &prior, Path::new("/w"));
         let records = manifest.records_by_name();
         // a is carried forward from the prior run: still built at abc.
-        assert!(records["a"].is_built_at(&git("abc"), None));
+        assert!(records["a"].is_built_at(&identity(&git("abc"), None)));
         // b is recorded fresh from this run.
         assert_eq!(records["b"].status, STATUS_BUILT);
         assert_eq!(records["b"].source, git("def"));
@@ -3116,6 +3221,7 @@ mod tests {
                 component: "a".to_string(),
                 source: git("abc"),
                 version: None,
+                version_stamp: VersionStamp::default(),
                 artifacts: artifacts(1),
                 buildinfo: Some(BuildInfo {
                     path: PathBuf::from("/w/out/trixie/amd64/a/a_1.0_amd64.buildinfo"),

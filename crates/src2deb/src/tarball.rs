@@ -90,12 +90,48 @@ pub(crate) fn unpack(
     declared: &str,
     dest: &Path,
 ) -> Result<Unpacked> {
-    // Lowercase because that is the spelling a measured digest takes, so the
-    // cache holds one file per archive however the recipe wrote the hash.
-    let declared = declared.to_ascii_lowercase();
-    let archive = cache.join(&declared);
+    let file = cached(component, cache, url, declared)?;
+    clear(dest)?;
+    extract(component, &file.path, dest, url)?;
+    Ok(Unpacked {
+        tree: archive_root(dest)?,
+        digest: file.digest,
+    })
+}
 
-    if !archive.is_file() {
+/// A file in the work directory's cache, verified against the digest it is
+/// named by.
+pub(crate) struct CachedFile {
+    /// Where the file sits in the cache.
+    pub path: PathBuf,
+    /// The digest it was verified against, in the lowercase hexadecimal a
+    /// measured digest takes.
+    pub digest: String,
+}
+
+/// Puts the file at `url` in the cache under `declared`, fetching it if the
+/// cache does not already hold it, and verifies it before returning.
+///
+/// The cache is content-addressed, so nothing about `url` reaches a path: two
+/// recipes naming one artefact through different mirrors share a download, and a
+/// changed digest names a different file rather than a stale one.
+///
+/// Verification is unconditional rather than a property of having just fetched
+/// it, so "nothing is used that does not hash to what was declared" holds
+/// however the file got there — including for a file put in the cache by hand
+/// on a host with no network.
+pub(crate) fn cached(
+    component: &str,
+    cache: &Path,
+    url: &str,
+    declared: &str,
+) -> Result<CachedFile> {
+    // Lowercase because that is the spelling a measured digest takes, so the
+    // cache holds one file per artefact however the recipe wrote the hash.
+    let declared = declared.to_ascii_lowercase();
+    let path = cache.join(&declared);
+
+    if !path.is_file() {
         std::fs::create_dir_all(cache).map_err(|err| io_error("creating", cache, err))?;
         // Fetched beside its destination rather than to it, so the cache never
         // holds a file under a name it has not been verified against — an
@@ -103,19 +139,27 @@ pub(crate) fn unpack(
         let partial = cache.join(format!("{declared}.partial"));
         fetch(component, url, &partial)?;
         verify(component, &partial, &declared, url)?;
-        std::fs::rename(&partial, &archive).map_err(|err| io_error("renaming", &partial, err))?;
+        std::fs::rename(&partial, &path).map_err(|err| io_error("renaming", &partial, err))?;
     } else {
-        // Verified again on the way out of the cache, so "nothing is unpacked
-        // that does not hash to what the recipe declared" holds however the
-        // file got there.
-        verify(component, &archive, &declared, url)?;
+        verify(component, &path, &declared, url)?;
     }
 
-    extract(component, &archive, dest)?;
-    Ok(Unpacked {
-        tree: archive_root(dest)?,
+    Ok(CachedFile {
+        path,
         digest: declared,
     })
+}
+
+/// Empties `dest`, creating it if it does not exist.
+///
+/// Every source tree src2deb unpacks starts from an empty directory, so a run
+/// unpacks what the recipe now names rather than that over the leavings of the
+/// run before. See the module documentation.
+pub(crate) fn clear(dest: &Path) -> Result<()> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest).map_err(|err| io_error("clearing", dest, err))?;
+    }
+    std::fs::create_dir_all(dest).map_err(|err| io_error("creating", dest, err))
 }
 
 /// Fetches `url` to `dest` with [`CURL`].
@@ -230,19 +274,28 @@ fn digest_of(path: &Path) -> Result<String> {
     }
 }
 
-/// Unpacks `archive` into `dest`, which is emptied first.
-fn extract(component: &str, archive: &Path, dest: &Path) -> Result<()> {
+/// Unpacks `archive` into `dest`, which must already exist.
+///
+/// `dest` is not emptied, so several archives can be unpacked over one tree —
+/// which is what a Debian source package needs, its upstream tarball and its
+/// `debian/` tarball being two files that assemble into one. Callers unpacking a
+/// single archive [`clear`] the destination first.
+///
+/// `subject` names the archive as the recipe reaches it — the URL it was fetched
+/// from — rather than as the cache holds it. The cache is content-addressed, so
+/// its path is a digest and says nothing about which of a source package's
+/// several files failed.
+pub(crate) fn extract(component: &str, archive: &Path, dest: &Path, subject: &str) -> Result<()> {
     use ferroday_cage::provision::{ProvisionRequest, Provisioner, Tarball};
 
-    if dest.exists() {
-        std::fs::remove_dir_all(dest).map_err(|err| io_error("clearing", dest, err))?;
-    }
-    std::fs::create_dir_all(dest).map_err(|err| io_error("creating", dest, err))?;
     Tarball::new(archive)
         .provision(&ProvisionRequest::new(dest))
         .map_err(|err| Error::Source {
             component: component.to_string(),
-            reason: format!("unpacking {}: {err}", archive.display()),
+            reason: format!(
+                "unpacking {subject}: {err}. src2deb reads ustar and GNU tar \
+                 archives, optionally compressed with gzip, xz, or zstd"
+            ),
         })
 }
 
@@ -270,7 +323,7 @@ fn extract(component: &str, archive: &Path, dest: &Path) -> Result<()> {
 /// The entry's own type decides, so a lone symlink is not descended into: it
 /// resolves outside the archive as often as not, and following one would put
 /// the build somewhere the archive never described.
-fn archive_root(dest: &Path) -> Result<PathBuf> {
+pub(crate) fn archive_root(dest: &Path) -> Result<PathBuf> {
     let mut entries = std::fs::read_dir(dest)
         .map_err(|err| io_error("reading", dest, err))?
         .collect::<std::io::Result<Vec<_>>>()

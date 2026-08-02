@@ -17,7 +17,8 @@
 //!
 //! - `+` starts the suffix, and an empty string sorts before any character
 //!   other than `~`, so a stamped build sorts *after* the plain upstream
-//!   version it was built from.
+//!   version it was built from. A component rebuilding a source the archive
+//!   also ships starts it with `~` instead — see [`VersionStamp`].
 //! - The suite appears as `deb13`/`deb14`, never as `trixie`/`forky`. Spelled
 //!   out, `forky` sorts before `trixie`, so a user moving from trixie to forky
 //!   would see the forky packages as a downgrade. The release numbers sort the
@@ -56,9 +57,26 @@
 //! `maintainer` setting, or failing that from the `Maintainer` field the
 //! component's `debian/control` already declares — which Debian policy makes
 //! mandatory, so a component that can be built at all carries one.
+//!
+//! # Rebuilding a source the archive also ships
+//!
+//! A stamped version outranks the version it was built from, which is what a
+//! build of software the archive does not carry wants: each rebuild supersedes
+//! the last, and nothing else claims the name. A component rebuilt from a
+//! Debian source package is the other case — the archive ships that package
+//! too, or will — and there the stamp outranking the archive's own copy is the
+//! trap Debian's `~bpo` convention exists to avoid: the rebuild would win
+//! forever, including after an upgrade to the suite whose package it was built
+//! from.
+//!
+//! Such a component names [`VersionStamp::Backport`], which joins the stamp
+//! with `~` in place of `+` and so sorts the build *below* the archive's own
+//! package of the same version. Nothing else about the stamp changes.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::fingerprint::Fingerprint;
@@ -94,6 +112,68 @@ pub fn suite_tag(suite: &str) -> Option<&'static str> {
         .iter()
         .find(|(name, _)| *name == release)
         .map(|(_, tag)| *tag)
+}
+
+/// How a stamped version orders against the archive's own package of the same
+/// version.
+///
+/// The stamp joins onto the base version with a single character, and that
+/// character settles the whole relationship: `+` sorts above the version it
+/// extends, `~` sorts below it. Nothing else the stamp claims depends on the
+/// choice — under either, a later build date supersedes an earlier one, a later
+/// suite supersedes an earlier one, and a later Debian revision supersedes an
+/// earlier one.
+///
+/// The choice is per component, defaulting to [`Supersede`](Self::Supersede),
+/// with a recipe-level default of its own. See
+/// [`Component::version_stamp`](crate::Component::version_stamp) and
+/// [Rebuilding a source the archive also
+/// ships](self#rebuilding-a-source-the-archive-also-ships).
+///
+/// Changing it changes the version a component builds as while every input its
+/// fingerprint names stays exactly where it was, so it is recorded in the
+/// manifest and compared by `--skip-published` — the same treatment a declared
+/// [`version`](crate::Component::version) gets, and for the same reason. See
+/// [`ComponentRecord::is_built_at`](crate::manifest::ComponentRecord::is_built_at).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VersionStamp {
+    /// `1.2.3-4` stamps as `1.2.3-4+deb14.20260802.abc1234`, which sorts
+    /// **above** `1.2.3-4`.
+    ///
+    /// The default, and what a build of software the archive does not carry
+    /// wants: nothing else publishes that package, so there is nothing for the
+    /// build to defer to and each rebuild supersedes the one before it.
+    #[default]
+    Supersede,
+    /// `1.2.3-4` stamps as `1.2.3-4~deb14.20260802.abc1234`, which sorts
+    /// **below** `1.2.3-4`.
+    ///
+    /// What a rebuild of a source the archive also ships wants, and the
+    /// ordering Debian's own `~bpo` suffix produces. The archive's package of
+    /// that version wins wherever it is available, so the rebuild fills a gap
+    /// rather than occupying the name permanently — while still superseding the
+    /// archive's *earlier* versions, and still superseding the rebuild before
+    /// it.
+    ///
+    /// Turning it on for a package already published under
+    /// [`Supersede`](Self::Supersede) lowers that package's version, which apt
+    /// treats as a downgrade and does not offer. Choose it when the component is
+    /// first declared.
+    Backport,
+}
+
+impl VersionStamp {
+    /// The character that joins the stamp onto the base version.
+    ///
+    /// The whole of this type comes down to this one character; see the variant
+    /// documentation for what each produces.
+    fn joiner(self) -> char {
+        match self {
+            VersionStamp::Supersede => '+',
+            VersionStamp::Backport => '~',
+        }
+    }
 }
 
 /// The head of a `debian/changelog`: what src2deb needs in order to write an
@@ -232,8 +312,16 @@ impl BuildStamp {
     ///
     /// `base` is the version from the component's own changelog, so the result
     /// keeps upstream's version and only extends its Debian revision.
-    pub fn version(&self, base: &str, source: &Fingerprint) -> String {
-        format!("{base}+{}.{}.{}", self.tag, self.date, source.short())
+    /// `version_stamp` decides whether the result sorts above or below `base`
+    /// itself; see [`VersionStamp`].
+    pub fn version(&self, base: &str, source: &Fingerprint, version_stamp: VersionStamp) -> String {
+        format!(
+            "{base}{}{}.{}.{}",
+            version_stamp.joiner(),
+            self.tag,
+            self.date,
+            source.short(),
+        )
     }
 
     /// The `debian/changelog` entry that declares the stamped version,
@@ -246,8 +334,9 @@ impl BuildStamp {
         head: &ChangelogHead,
         suite: &str,
         source: &Fingerprint,
+        version_stamp: VersionStamp,
     ) -> String {
-        let version = self.version(&head.version, source);
+        let version = self.version(&head.version, source, version_stamp);
         // The entry ships inside the package, so it names the inputs as
         // `Fingerprint::describe` renders them for publication rather than as
         // the manifest records them.
@@ -529,6 +618,7 @@ pub fn stamped_entry(
     stamp: &BuildStamp,
     suite: &str,
     source: &Fingerprint,
+    version_stamp: VersionStamp,
 ) -> Result<String> {
     let path = tree.join("debian/changelog");
     let text = std::fs::read_to_string(&path).map_err(|err| Error::Changelog {
@@ -550,7 +640,7 @@ pub fn stamped_entry(
             path.display()
         ),
     })?;
-    Ok(stamp.changelog_entry(&head, suite, source))
+    Ok(stamp.changelog_entry(&head, suite, source, version_stamp))
 }
 
 /// Seconds since the Unix epoch at the start of `text`, a `YYYY-MM-DD` date in
@@ -730,6 +820,68 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
     }
 
     #[test]
+    fn a_backport_stamp_sorts_below_the_archives_own_package() {
+        // The one property the `~` form exists for, and the one thing it
+        // changes: the archive's package of the same version wins.
+        orders_below("0.98.2-4~deb14.20260802.d6d10b4", "0.98.2-4");
+        // ...where the default form would have taken it.
+        orders_below("0.98.2-4", "0.98.2-4+deb14.20260802.d6d10b4");
+    }
+
+    #[test]
+    fn a_backport_stamp_keeps_every_other_ordering_the_stamp_claims() {
+        // Everything the module's design rests on has to survive the change of
+        // joiner, or the `~` form would trade one trap for several.
+        //
+        // A later build supersedes an earlier one...
+        orders_below(
+            "0.98.2-4~deb14.20260802.d6d10b4",
+            "0.98.2-4~deb14.20260803.d6d10b4",
+        );
+        // ...a later suite supersedes an earlier one...
+        orders_below(
+            "0.98.2-4~deb13.20260802.d6d10b4",
+            "0.98.2-4~deb14.20260802.d6d10b4",
+        );
+        // ...and the archive's *earlier* versions are still superseded, which
+        // is what makes the rebuild reachable at all.
+        orders_below("0.98.2-3", "0.98.2-4~deb14.20260802.d6d10b4");
+        // A native version stays native: `~` introduces no revision boundary,
+        // exactly as `+` does not.
+        let native = "1.2.3~deb14.20260802.d6d10b4";
+        orders_below(native, "1.2.3");
+        assert!(!native.contains('-'));
+        // Turning the setting on lowers a published version, which is the one
+        // hazard the documentation has to state.
+        orders_below(
+            "0.98.2-4~deb14.20260802.d6d10b4",
+            "0.98.2-4+deb14.20260802.d6d10b4",
+        );
+    }
+
+    #[test]
+    fn the_joiner_is_the_whole_of_the_difference_between_the_two_stamps() {
+        // Computed rather than asserted about: the two renderings differ in
+        // exactly one character, so nothing else in the stamp can drift with
+        // the choice.
+        let stamp = BuildStamp::at("deb14", 1_785_456_000);
+        let source = git("d6d10b4b70e621");
+        let supersede = stamp.version("0.98.2-4", &source, VersionStamp::Supersede);
+        let backport = stamp.version("0.98.2-4", &source, VersionStamp::Backport);
+        assert_eq!(supersede, "0.98.2-4+deb14.20260731.d6d10b4");
+        assert_eq!(backport, "0.98.2-4~deb14.20260731.d6d10b4");
+        assert_eq!(supersede.replace('+', "~"), backport);
+        // And the entry that ships inside the package carries it, since that is
+        // the version dpkg-buildpackage reads.
+        let head = parse_changelog(CHANGELOG).expect("well-formed changelog");
+        assert!(
+            stamp
+                .changelog_entry(&head, "forky", &source, VersionStamp::Backport)
+                .starts_with("cosmic-comp (1.0.0~alpha.7-1~deb14.20260731.d6d10b4) forky;"),
+        );
+    }
+
+    #[test]
     fn suite_tags_cover_the_numbered_releases_and_reject_rolling_ones() {
         assert_eq!(suite_tag("trixie"), Some("deb13"));
         assert_eq!(suite_tag("forky"), Some("deb14"));
@@ -766,7 +918,11 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
         assert_eq!(stamp.tag(), "deb13");
         assert_eq!(stamp.date(), "20260731");
         assert_eq!(
-            stamp.version("1.0.0~alpha.7-1", &git("abc1234def5678")),
+            stamp.version(
+                "1.0.0~alpha.7-1",
+                &git("abc1234def5678"),
+                VersionStamp::Supersede
+            ),
             "1.0.0~alpha.7-1+deb13.20260731.abc1234"
         );
     }
@@ -776,7 +932,7 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
         // No hyphen in, no hyphen introduced: the suffix joins with `+`, so a
         // native package is not turned into a non-native one.
         let stamp = BuildStamp::at("deb14", 1_785_456_000);
-        let stamped = stamp.version("1.2.3", &git("0123456789ab"));
+        let stamped = stamp.version("1.2.3", &git("0123456789ab"), VersionStamp::Supersede);
         assert_eq!(stamped, "1.2.3+deb14.20260731.0123456");
         assert!(!stamped.contains('-'));
     }
@@ -792,13 +948,13 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
             SourceInput::git(SourceRole::Packaging, "9f8e7d6c5b4a3928"),
         ]);
         assert_eq!(
-            stamp.version("1.0-1", &composed),
+            stamp.version("1.0-1", &composed, VersionStamp::Supersede),
             "1.0-1+deb13.20260731.abc1234.9f8e7d6"
         );
         let head = parse_changelog(CHANGELOG).expect("well-formed changelog");
         assert!(
             stamp
-                .changelog_entry(&head, "trixie", &composed)
+                .changelog_entry(&head, "trixie", &composed, VersionStamp::Supersede)
                 .contains("from source abc1234def5678, packaging 9f8e7d6c5b4a3928.")
         );
     }
@@ -814,9 +970,12 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
             SourceRole::Source,
             "/home/someone/cosmic-comp",
         ));
-        assert_eq!(stamp.version("1.0-1", &local), "1.0-1+deb13.20260731.local");
+        assert_eq!(
+            stamp.version("1.0-1", &local, VersionStamp::Supersede),
+            "1.0-1+deb13.20260731.local"
+        );
         let head = parse_changelog(CHANGELOG).expect("well-formed changelog");
-        let entry = stamp.changelog_entry(&head, "trixie", &local);
+        let entry = stamp.changelog_entry(&head, "trixie", &local, VersionStamp::Supersede);
         assert!(entry.contains("from source local."), "{entry}");
         assert!(!entry.contains("/home/someone"), "{entry}");
     }
@@ -825,7 +984,12 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
     fn the_entry_names_the_target_suite_not_the_one_upstream_wrote() {
         let head = parse_changelog(CHANGELOG).expect("well-formed changelog");
         let stamp = BuildStamp::at("deb14", 1_785_456_000);
-        let entry = stamp.changelog_entry(&head, "forky", &git("abc1234def5678"));
+        let entry = stamp.changelog_entry(
+            &head,
+            "forky",
+            &git("abc1234def5678"),
+            VersionStamp::Supersede,
+        );
         assert!(entry.starts_with(
             "cosmic-comp (1.0.0~alpha.7-1+deb14.20260731.abc1234) forky; urgency=medium\n"
         ));
@@ -844,7 +1008,12 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
         let stamp = BuildStamp::at("deb13", 1_785_456_000);
         let stamped = format!(
             "{}{CHANGELOG}",
-            stamp.changelog_entry(&head, "trixie", &git("abc1234def5678"))
+            stamp.changelog_entry(
+                &head,
+                "trixie",
+                &git("abc1234def5678"),
+                VersionStamp::Supersede
+            )
         );
         let reread = parse_changelog(&stamped).expect("the stamped file is a changelog");
         assert_eq!(reread.source, "cosmic-comp");
@@ -872,16 +1041,28 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
         // where `now()` would put a different date in each.
         let source = git("abc1234def5678");
         let seconds = epoch_at_date("2026-07-31").unwrap();
-        let first = BuildStamp::at("deb13", seconds).version("1.0-1", &source);
-        let second = BuildStamp::at("deb13", seconds).version("1.0-1", &source);
+        let first =
+            BuildStamp::at("deb13", seconds).version("1.0-1", &source, VersionStamp::Supersede);
+        let second =
+            BuildStamp::at("deb13", seconds).version("1.0-1", &source, VersionStamp::Supersede);
         assert_eq!(first, second);
         assert_eq!(first, "1.0-1+deb13.20260731.abc1234");
         // ...and the changelog trailer, which is what carries the clock into
         // the build, agrees too.
         let head = parse_changelog(CHANGELOG).unwrap();
         assert_eq!(
-            BuildStamp::at("deb13", seconds).changelog_entry(&head, "trixie", &source),
-            BuildStamp::at("deb13", seconds).changelog_entry(&head, "trixie", &source),
+            BuildStamp::at("deb13", seconds).changelog_entry(
+                &head,
+                "trixie",
+                &source,
+                VersionStamp::Supersede
+            ),
+            BuildStamp::at("deb13", seconds).changelog_entry(
+                &head,
+                "trixie",
+                &source,
+                VersionStamp::Supersede
+            ),
         );
     }
 
@@ -952,7 +1133,12 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
 
         // ...and stamping it produces exactly the version an upstream changelog
         // declaring the same base would have produced.
-        let entry = stamp.changelog_entry(&head, "trixie", &git("abc1234def5678"));
+        let entry = stamp.changelog_entry(
+            &head,
+            "trixie",
+            &git("abc1234def5678"),
+            VersionStamp::Supersede,
+        );
         assert!(
             entry.starts_with("cosmic-icons (1.0.0+deb13.20260731.abc1234) trixie;"),
             "{entry}",
@@ -1081,6 +1267,7 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
             &BuildStamp::at("deb13", 0),
             "trixie",
             &git("abc1234"),
+            VersionStamp::Supersede,
         )
         .expect_err("a tree with no changelog cannot be stamped");
         let message = err.to_string();
@@ -1094,7 +1281,8 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
         // 2026-07-31T12:34:56Z.
         let stamp = BuildStamp::at("deb13", 1_785_501_296);
         let head = parse_changelog(CHANGELOG).expect("well-formed changelog");
-        let entry = stamp.changelog_entry(&head, "trixie", &git("abc1234"));
+        let entry =
+            stamp.changelog_entry(&head, "trixie", &git("abc1234"), VersionStamp::Supersede);
         assert!(entry.contains("Fri, 31 Jul 2026 12:34:56 +0000"));
     }
 }

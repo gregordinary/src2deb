@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
+use crate::version::VersionStamp;
 
 /// A build recipe.
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +66,16 @@ pub struct Recipe {
     /// [`owns_arch_indep`](Self::owns_arch_indep).
     #[serde(default)]
     pub arch_indep_owner: Option<String>,
+    /// How this recipe's components order against the archive's own packages of
+    /// the same version, for components that do not state it themselves.
+    ///
+    /// Defaults to [`VersionStamp::Supersede`], which is what a build of
+    /// software the archive does not carry wants. A recipe whose components are
+    /// rebuilds of Debian source packages sets
+    /// [`backport`](VersionStamp::Backport) here rather than on each of them.
+    /// See [`Component::version_stamp`].
+    #[serde(default)]
+    pub version_stamp: Option<VersionStamp>,
     /// The maintainer identity a synthesized `debian/changelog` is signed with,
     /// for components whose packaging carries none of their own.
     ///
@@ -241,6 +252,25 @@ pub struct Component {
     /// Exclusive with [`version`](Self::version). See [`VersionFrom`].
     #[serde(default)]
     pub version_from: Option<VersionFrom>,
+    /// How this component's stamped version orders against the archive's own
+    /// package of the same version, overriding the recipe's
+    /// [`version_stamp`](Recipe::version_stamp).
+    ///
+    /// Unset — and unset on the recipe — a build supersedes the version it was
+    /// built from, which is right for software the archive does not carry.
+    /// `version-stamp = "backport"` puts it below instead, which is what a
+    /// rebuild of a source the archive also ships wants: the archive's own
+    /// package wins wherever it is available, and the rebuild fills the gap
+    /// where it is not.
+    ///
+    /// A component built from a [`source.dsc`](Source::dsc) is the usual case
+    /// for it, but the setting is about the package rather than about how its
+    /// source was fetched: a component built from a git repository of the same
+    /// software wants exactly the same thing. It is therefore stated rather than
+    /// implied, so that changing how a source is fetched never silently changes
+    /// how its packages order. See [`VersionStamp`].
+    #[serde(default)]
+    pub version_stamp: Option<VersionStamp>,
     /// The maintainer identity this component's synthesized `debian/changelog`
     /// is signed with, overriding the recipe's
     /// [`maintainer`](Recipe::maintainer).
@@ -318,14 +348,33 @@ pub struct Source {
     /// something else fails rather than producing a package.
     #[serde(default)]
     pub tarball: Option<String>,
-    /// The SHA-256 the [`tarball`](Self::tarball) must hash to, in hexadecimal
-    /// of either case.
+    /// The SHA-256 the [`tarball`](Self::tarball) or [`dsc`](Self::dsc) must
+    /// hash to, in hexadecimal of either case.
     ///
-    /// Required for an archive and refused on any other origin, since it says
-    /// nothing about a revision or a directory. Verified before anything is
+    /// Required for a fetched artefact and refused on any other origin, since it
+    /// says nothing about a revision or a directory. Verified before anything is
     /// unpacked, on every run.
     #[serde(default)]
     pub sha256: Option<String>,
+    /// A Debian source package to fetch and unpack, named by the URL of its
+    /// `.dsc`. Exclusive with the other origins, and requires
+    /// [`sha256`](Self::sha256).
+    ///
+    /// The declared digest pins the `.dsc`, and the `.dsc` declares the digest
+    /// of every file it names — so one hash in the recipe pins the whole source
+    /// package. The files are fetched from the directory the `.dsc` sits in.
+    ///
+    /// A component built from one **skips the vendor pass**: a Debian source
+    /// package already carries what its build needs, so the build is hermetic
+    /// from start to finish. Such a component ordinarily also names
+    /// [`version_stamp`](Component::version_stamp), since the archive ships the
+    /// package it rebuilds.
+    ///
+    /// `3.0 (quilt)`, `3.0 (native)`, and native `1.0` source packages are
+    /// built. A `1.0` package carrying a `.diff.gz` is refused, naming the
+    /// alternative.
+    #[serde(default)]
+    pub dsc: Option<String>,
     /// A tree already on disk, built without being cloned. Exclusive with
     /// [`git`](Self::git).
     ///
@@ -373,6 +422,14 @@ pub enum Origin<'a> {
         /// The SHA-256 the archive is verified against before it is unpacked.
         sha256: &'a str,
     },
+    /// A Debian source package, fetched and unpacked under the work directory.
+    Dsc {
+        /// The URL of the `.dsc`.
+        url: &'a str,
+        /// The SHA-256 the `.dsc` is verified against before it is read. The
+        /// `.dsc` then carries the digest of every file it names.
+        sha256: &'a str,
+    },
 }
 
 impl Source {
@@ -386,17 +443,21 @@ impl Source {
     /// [`Source`] itself is outside that guarantee, which is why this reports
     /// rather than asserts.
     pub fn origin(&self) -> Option<Origin<'_>> {
-        match (&self.git, &self.path, &self.tarball) {
-            (Some(url), None, None) => Some(Origin::Git {
+        match (&self.git, &self.path, &self.tarball, &self.dsc) {
+            (Some(url), None, None, None) => Some(Origin::Git {
                 url,
                 git_ref: self.git_ref.as_deref(),
             }),
-            (None, Some(path), None) => Some(Origin::Path(path)),
-            (None, None, Some(url)) => Some(Origin::Tarball {
+            (None, Some(path), None, None) => Some(Origin::Path(path)),
+            // A fetched artefact with no digest names no origin: there would be
+            // nothing to verify what was fetched against, and the tree would be
+            // whatever the URL happened to serve.
+            (None, None, Some(url), None) => Some(Origin::Tarball {
                 url,
-                // An archive with no digest names no origin: there would be
-                // nothing to verify what was fetched against, and the tree
-                // would be whatever the URL happened to serve.
+                sha256: self.sha256.as_deref()?,
+            }),
+            (None, None, None, Some(url)) => Some(Origin::Dsc {
+                url,
                 sha256: self.sha256.as_deref()?,
             }),
             _ => None,
@@ -474,6 +535,21 @@ impl Recipe {
         self.arch_indep_owner
             .as_deref()
             .unwrap_or(&self.architecture)
+    }
+
+    /// How `component`'s stamped version orders against the archive's own
+    /// package of the same version: the component's own
+    /// [`version_stamp`](Component::version_stamp), then the recipe's, then the
+    /// default.
+    ///
+    /// The same precedence [`maintainer`](Self::maintainer) follows, and for the
+    /// same reason: a recipe of rebuilds says it once, and a mixed recipe says
+    /// it per component.
+    pub fn resolved_version_stamp(&self, component: &Component) -> VersionStamp {
+        component
+            .version_stamp
+            .or(self.version_stamp)
+            .unwrap_or_default()
     }
 
     /// Whether the architecture this recipe targets produces its
@@ -577,8 +653,9 @@ impl Recipe {
                 [] => {
                     return Err(bad(format!(
                         "component {:?} declares no source; set source.git to clone \
-                         a repository, source.path to build a tree on disk, or \
-                         source.tarball to build a release archive",
+                         a repository, source.path to build a tree on disk, \
+                         source.tarball to build a release archive, or source.dsc \
+                         to rebuild a Debian source package",
                         component.name
                     )));
                 }
@@ -606,8 +683,10 @@ impl Recipe {
                         return Err(bad(format!(
                             "component {:?} declares a packaging overlay with no \
                              source; set packaging.git to clone a repository, \
-                             packaging.path to overlay a tree on disk, or \
-                             packaging.tarball to overlay a release archive",
+                             packaging.path to overlay a tree on disk, \
+                             packaging.tarball to overlay a release archive, or \
+                             packaging.dsc to take a Debian source package's \
+                             packaging",
                             component.name
                         )));
                     }
@@ -839,20 +918,21 @@ fn source_error(field: &str, source: &Source) -> Option<String> {
     {
         return Some(format!("{field}.git {git:?} {reason}"));
     }
-    // The archive URL reaches curl the same way, and is checked here for the
-    // same reason.
-    if let Some(tarball) = &source.tarball {
-        if let Some(reason) = argument_error(tarball) {
-            return Some(format!("{field}.tarball {tarball:?} {reason}"));
+    // A fetched artefact's URL reaches curl the same way, and is checked here
+    // for the same reason. Both kinds are pinned by a digest, and a recipe that
+    // names one with nothing to verify it against would build whatever the URL
+    // happened to serve — the one thing a fetched source exists to rule out.
+    // Refused at load, so a run does not fetch before discovering it cannot
+    // trust what it fetched.
+    for (setting, url) in [("tarball", &source.tarball), ("dsc", &source.dsc)] {
+        let Some(url) = url else { continue };
+        if let Some(reason) = argument_error(url) {
+            return Some(format!("{field}.{setting} {url:?} {reason}"));
         }
-        // An archive with nothing to verify it against is a tree that is
-        // whatever the URL happened to serve, which is the one thing an archive
-        // source exists to rule out. Refused at load, so a run does not fetch
-        // before discovering it cannot trust what it fetched.
         if source.sha256.is_none() {
             return Some(format!(
-                "sets {field}.tarball with no {field}.sha256 to verify it \
-                 against; an archive is pinned by its digest"
+                "sets {field}.{setting} with no {field}.sha256 to verify it \
+                 against; a fetched source is pinned by its digest"
             ));
         }
     }
@@ -860,14 +940,15 @@ fn source_error(field: &str, source: &Source) -> Option<String> {
         if let Some(reason) = sha256_error(sha256) {
             return Some(format!("{field}.sha256 {sha256:?} {reason}"));
         }
-        // A digest identifies a fetched archive, so it says nothing about a
-        // revision or a directory. Refused rather than ignored, as
-        // `git-ref` is: a recipe switched from an archive to a repository keeps
-        // its digest, and passing over it would build something other than what
-        // it reads as building.
-        if source.tarball.is_none() {
+        // A digest identifies a fetched artefact, so it says nothing about a
+        // revision or a directory. Refused rather than ignored, as `git-ref`
+        // is: a recipe switched from an archive to a repository keeps its
+        // digest, and passing over it would build something other than what it
+        // reads as building.
+        if source.tarball.is_none() && source.dsc.is_none() {
             return Some(format!(
-                "sets {field}.sha256, which applies only to {field}.tarball"
+                "sets {field}.sha256, which applies only to {field}.tarball and \
+                 {field}.dsc"
             ));
         }
     }
@@ -917,6 +998,7 @@ fn named_origins(field: &str, source: &Source) -> Vec<String> {
         source.git.is_some().then_some("git"),
         source.path.is_some().then_some("path"),
         source.tarball.is_some().then_some("tarball"),
+        source.dsc.is_some().then_some("dsc"),
     ]
     .into_iter()
     .flatten()
@@ -1997,6 +2079,87 @@ mod tests {
         ))
         .unwrap();
         assert!(recipe.owns_arch_indep());
+    }
+
+    #[test]
+    fn a_version_stamp_falls_back_from_the_component_to_the_recipe_to_the_default() {
+        // The precedence `maintainer` follows: a recipe of rebuilds says it
+        // once, a mixed recipe says it per component, and a recipe that says
+        // nothing supersedes — which is what a build of software the archive
+        // does not carry wants.
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\nversion-stamp = \"backport\"\n\
+             [[components]]\nname = \"inherits\"\nsource.git = \"https://e.invalid/a\"\n\
+             [[components]]\nname = \"overrides\"\nsource.git = \"https://e.invalid/b\"\n\
+             version-stamp = \"supersede\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.resolved_version_stamp(&recipe.components[0]),
+            VersionStamp::Backport,
+        );
+        assert_eq!(
+            recipe.resolved_version_stamp(&recipe.components[1]),
+            VersionStamp::Supersede,
+        );
+
+        // With nothing declared anywhere, and with only the component naming it.
+        let plain = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap();
+        assert_eq!(
+            plain.resolved_version_stamp(&plain.components[0]),
+            VersionStamp::Supersede,
+        );
+        let only_component = load(
+            "name = \"r\"\nsuite = \"trixie\"\n[[components]]\nname = \"c\"\n\
+             source.git = \"https://e.invalid/a\"\nversion-stamp = \"backport\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            only_component.resolved_version_stamp(&only_component.components[0]),
+            VersionStamp::Backport,
+        );
+    }
+
+    #[test]
+    fn a_source_package_is_pinned_by_the_digest_of_its_dsc() {
+        // `source.dsc` takes the same digest `source.tarball` does, and is
+        // refused without one for the same reason: there would be nothing to
+        // verify what was fetched against.
+        let recipe = load(
+            "name = \"r\"\nsuite = \"trixie\"\n[[components]]\nname = \"c\"\n\
+             source.dsc = \"https://e.invalid/c_1.0-1.dsc\"\n\
+             source.sha256 = \"5f2e1a9c3b8d4e7a2f9016c5b3d8e4a71f0c9d2b6e5a8347c1b0f9e2d6a4c8b1\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            recipe.components[0].source.origin(),
+            Some(Origin::Dsc { .. })
+        ));
+
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n[[components]]\nname = \"c\"\n\
+             source.dsc = \"https://e.invalid/c_1.0-1.dsc\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("source.dsc with no source.sha256"),
+            "{err}"
+        );
+
+        // And it is one origin among four, not a qualifier on another.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n[[components]]\nname = \"c\"\n\
+             source.git = \"https://e.invalid/c\"\n\
+             source.dsc = \"https://e.invalid/c_1.0-1.dsc\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("source.git and source.dsc"),
+            "{err}"
+        );
     }
 
     #[test]

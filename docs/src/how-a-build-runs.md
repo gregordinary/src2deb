@@ -106,6 +106,24 @@ stops at the first failure, and with `--keep-going` it continues to the next
 component. Either way the run finishes with a report of what built and what
 failed.
 
+### The vendor pass, and the one source that skips it
+
+The vendor pass is the only step in a run that executes upstream's own code with
+the **host network**. Everything that produces packages happens in the build
+pass, which is isolated. That split is deliberate: the build is hermetic, and
+acquiring the dependencies to build it is not.
+
+A component built from a [Debian source
+package](recipes.md#rebuilding-a-debian-source-package) skips the vendor pass
+entirely. A source package carries everything its build needs — that is what
+makes it a source package — so there is nothing for the pass to fetch, and the
+component is built start to finish inside an isolated cage.
+
+Every other source runs it. Whether a checkout, a tree on disk, or a release
+archive actually needs anything fetched is the packaging's to decide by what its
+`debian/rules clean` target does; for a component that vendors nothing, the pass
+runs and does nothing.
+
 What ends a run outright is what leaves it nothing coherent to do: a selection
 naming a component the recipe does not have, a dependency cycle, a target suite
 with no version tag, a selection that leaves out a producer of a selected

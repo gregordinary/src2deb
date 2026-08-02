@@ -104,6 +104,16 @@ pub enum SourceKind {
     Git,
     /// Content valued by its SHA-256 digest, in lowercase hexadecimal.
     Sha256,
+    /// A Debian source package, valued by the SHA-256 digest of its `.dsc`.
+    ///
+    /// A kind of its own rather than a [`Sha256`](Self::Sha256), even though it
+    /// is the same declared-and-verified digest over a fetched file, because
+    /// what it identifies is not the same kind of thing. A `.dsc` names its
+    /// component tarballs and the digest of each, so this one value pins a whole
+    /// source package rather than one archive — and a component built from one
+    /// is built without the [vendor pass](crate::build), which is a claim about
+    /// how the packages were produced that the provenance record should carry.
+    Dsc,
     /// A patch series applied over a tree, valued by a SHA-256 digest over its
     /// members' contents in series order.
     ///
@@ -137,6 +147,7 @@ impl SourceKind {
         match self {
             SourceKind::Git => "git",
             SourceKind::Sha256 => "sha256",
+            SourceKind::Dsc => "dsc",
             SourceKind::Patches => "patches",
             SourceKind::Tree => "tree",
             SourceKind::Path => "path",
@@ -150,7 +161,11 @@ impl SourceKind {
     /// point it is read changes that.
     pub fn is_pinned(self) -> bool {
         match self {
-            SourceKind::Git | SourceKind::Sha256 | SourceKind::Patches | SourceKind::Tree => true,
+            SourceKind::Git
+            | SourceKind::Sha256
+            | SourceKind::Dsc
+            | SourceKind::Patches
+            | SourceKind::Tree => true,
             SourceKind::Path => false,
         }
     }
@@ -185,6 +200,19 @@ impl SourceInput {
         SourceInput {
             role,
             kind: SourceKind::Sha256,
+            value: digest.into(),
+        }
+    }
+
+    /// A Debian source package in `role`, given the SHA-256 digest of its
+    /// `.dsc`.
+    ///
+    /// See [`SourceKind::Dsc`] for what separates this from
+    /// [`sha256`](Self::sha256), which carries the same shape of value.
+    pub fn dsc(role: SourceRole, digest: impl Into<String>) -> SourceInput {
+        SourceInput {
+            role,
+            kind: SourceKind::Dsc,
             value: digest.into(),
         }
     }
@@ -250,9 +278,11 @@ impl SourceInput {
     /// none.
     fn short(&self) -> String {
         match self.kind {
-            SourceKind::Git | SourceKind::Sha256 | SourceKind::Patches | SourceKind::Tree => {
-                self.value.chars().take(SHORT_HASH).collect()
-            }
+            SourceKind::Git
+            | SourceKind::Sha256
+            | SourceKind::Dsc
+            | SourceKind::Patches
+            | SourceKind::Tree => self.value.chars().take(SHORT_HASH).collect(),
             SourceKind::Path => LOCAL.to_string(),
         }
     }
@@ -272,7 +302,7 @@ impl SourceInput {
     fn describe(&self) -> String {
         let value = match self.kind {
             SourceKind::Git | SourceKind::Patches => self.value.clone(),
-            SourceKind::Sha256 | SourceKind::Tree => {
+            SourceKind::Sha256 | SourceKind::Dsc | SourceKind::Tree => {
                 format!("{}:{}", self.kind.label(), self.value)
             }
             SourceKind::Path => LOCAL.to_string(),

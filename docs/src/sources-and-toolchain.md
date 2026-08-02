@@ -35,6 +35,13 @@ An **archive source** is a release tarball, fetched and unpacked. It is how most
 projects that are not Rust ones publish, and an upstream tarball beside a
 separate `debian/` is the native Debian model.
 
+A **Debian source package** is a `.dsc` and the tarballs it names, fetched and
+assembled. It is how you rebuild a package one suite ships for another, and it is
+the one source that carries its own packaging, its own changelog, and everything
+its build needs — so it is also the one built with no host network at any point.
+See [Rebuilding a Debian source
+package](recipes.md#rebuilding-a-debian-source-package).
+
 ### Building from a tree on disk
 
 A path source is copied into the work directory and built from the copy. Nothing

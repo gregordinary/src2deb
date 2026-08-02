@@ -84,12 +84,16 @@ names four things:
   source is `source`; a [packaging overlay](recipes.md#packaging-overlays) is
   `packaging`; a [patch series](recipes.md#patches) is `patches`.
 - `kind` — what sort of input it is. A git checkout is `git`; a fetched release
-  archive is `sha256`; a source tree on disk is `path`; a patch series is
-  `patches`; a packaging directory on disk is `tree`.
+  archive is `sha256`; a [Debian source
+  package](recipes.md#rebuilding-a-debian-source-package) is `dsc`; a source tree
+  on disk is `path`; a patch series is `patches`; a packaging directory on disk
+  is `tree`.
 - `value` — what identifies it. For `git`, the exact `HEAD` the tree was checked
   out at, so a branch or default-branch ref is recorded as the concrete revision
   it resolved to, not the moving ref that named it. For `sha256`, the digest the
-  archive was verified against before it was unpacked. For `path`, the canonical
+  archive was verified against before it was unpacked. For `dsc`, the digest of
+  the `.dsc` itself, which declares the digest of every file the package is
+  assembled from and so pins all of them. For `path`, the canonical
   directory the tree was read from, so the record names one path however the
   recipe reached it. For `patches`, a SHA-256 over the series' members in the
   order they were applied. For `tree`, a SHA-256 over the contents of the
@@ -111,6 +115,12 @@ A `sha256` is one the recipe declared and src2deb verified against an archive it
 fetched, so the record names something that can be fetched again and checked; a
 `tree` is one src2deb measured off a directory the recipe pointed at. Both pin
 content, and only the first pins something a third party can obtain.
+
+`dsc` is a declared-and-verified digest like `sha256`, and is a kind of its own
+because it identifies something else: not one archive but a whole Debian source
+package, and one built without the vendor pass — so the record says both what the
+build consumed and that it was [hermetic
+throughout](how-a-build-runs.md#the-vendor-pass-and-the-one-source-that-skips-it).
 
 A build from a tree on disk therefore records:
 

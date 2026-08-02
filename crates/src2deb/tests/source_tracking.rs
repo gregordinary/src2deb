@@ -2189,3 +2189,356 @@ fn a_packaging_overlay_may_come_from_an_archive() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Writes a `.dsc` at `path` declaring `format` over `files`, each named beside
+/// it, and returns the digest a recipe would pin it by.
+///
+/// The files' own digests are measured rather than stated, so the `.dsc` a test
+/// writes is one the resolver's own verification passes — which is what makes a
+/// test that tampers with a file exercise the failure rather than a typo.
+fn write_dsc(path: &Path, format: &str, files: &[&Path]) -> String {
+    let mut text = format!("Format: {format}\nSource: pkg\nVersion: 1.2.3-4\n");
+    text.push_str("Checksums-Sha256:\n");
+    for file in files {
+        let name = file.file_name().unwrap().to_string_lossy();
+        let size = std::fs::metadata(file).unwrap().len();
+        text.push_str(&format!(" {} {size} {name}\n", digest(file)));
+    }
+    std::fs::write(path, text).unwrap();
+    digest(path)
+}
+
+/// Writes the two tarballs a `3.0 (quilt)` source package is assembled from: an
+/// upstream release, and the `debian/` directory beside it.
+fn write_quilt_files(root: &Path) -> (PathBuf, PathBuf) {
+    let orig = root.join("pkg_1.2.3.orig.tar");
+    write_tar(
+        &orig,
+        &[
+            ("pkg-1.2.3/", ""),
+            ("pkg-1.2.3/marker", "from the source package\n"),
+            ("pkg-1.2.3/src/", ""),
+            ("pkg-1.2.3/src/main.c", "int main(void) { return 0; }\n"),
+        ],
+    );
+    let debian = root.join("pkg_1.2.3-4.debian.tar");
+    write_tar(
+        &debian,
+        &[
+            ("debian/", ""),
+            ("debian/control", CONTROL),
+            ("debian/marker", "from the source package's own packaging\n"),
+            ("debian/patches/", ""),
+            ("debian/patches/series", "fix.patch\n"),
+        ],
+    );
+    (orig, debian)
+}
+
+/// A component built from the `.dsc` at `path`, pinned by `sha256`.
+fn dsc_component(name: &str, path: &Path, sha256: &str) -> Component {
+    Component {
+        name: name.to_string(),
+        source: Source {
+            dsc: Some(format!("file://{}", path.display())),
+            sha256: Some(sha256.to_string()),
+            ..Source::default()
+        },
+        ..Component::default()
+    }
+}
+
+#[test]
+fn a_source_package_assembles_from_its_tarballs_and_needs_no_vendor_pass() {
+    if !curl_available() {
+        return;
+    }
+    let root = scratch("dsc");
+    let (orig, debian) = write_quilt_files(&root);
+    let dsc = root.join("pkg_1.2.3-4.dsc");
+    let sha256 = write_dsc(&dsc, "3.0 (quilt)", &[&orig, &debian]);
+
+    let resolved = resolver_in(&root, &root)
+        .resolve(&dsc_component("pkg", &dsc, &sha256))
+        .expect("resolve");
+
+    // The tree is the upstream tarball's own root, with the packaging tarball
+    // unpacked over it — which is the whole of what assembling a source package
+    // amounts to, once the patch series is left to dpkg-buildpackage.
+    assert_eq!(resolved.tree, root.join("sources/pkg/pkg-1.2.3"));
+    assert_eq!(resolved_marker(&resolved.tree), "from the source package\n");
+    assert!(resolved.tree.join("src/main.c").is_file());
+    assert!(resolved.tree.join("debian/control").is_file());
+    assert_eq!(
+        packaging_marker(&resolved.tree),
+        "from the source package's own packaging",
+    );
+    // The series travels unapplied. `dpkg-source --before-build` applies it
+    // inside the cage, ahead of the build, so nothing on the host has to
+    // understand quilt.
+    assert!(resolved.tree.join("debian/patches/series").is_file());
+
+    // One input, pinning the whole package: the `.dsc` carries the digest of
+    // every file, so its own digest reaches all of them.
+    assert_eq!(resolved.source.len(), 1);
+    let source = &resolved.source.inputs()[0];
+    assert_eq!(source.kind(), src2deb::SourceKind::Dsc);
+    assert_eq!(source.role(), SourceRole::Source);
+    assert_eq!(source.value(), sha256);
+    assert!(resolved.source.is_pinned());
+    assert_eq!(resolved.source.short(), sha256[..7]);
+
+    // The claim the item is built on: a source package carries what its build
+    // needs, so the one pass that reaches the host network is not run.
+    assert_eq!(resolved.vendor, src2deb::VendorPass::Skip);
+
+    // Every file it named is in the shared cache, under its own digest.
+    for file in [&dsc, &orig, &debian] {
+        assert!(
+            root.join("tarballs").join(digest(file)).is_file(),
+            "{} was not cached under its digest",
+            file.display(),
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_clearsigned_source_package_is_read_through_its_armor() {
+    if !curl_available() {
+        return;
+    }
+    // What the archive actually publishes. The signature is not checked — the
+    // recipe's declared digest is what says which file was meant — but the
+    // armor still has to be read past.
+    let root = scratch("dsc-signed");
+    let (orig, debian) = write_quilt_files(&root);
+    let dsc = root.join("pkg_1.2.3-4.dsc");
+    write_dsc(&dsc, "3.0 (quilt)", &[&orig, &debian]);
+    let body = std::fs::read_to_string(&dsc).unwrap();
+    std::fs::write(
+        &dsc,
+        format!(
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n{body}\
+             -----BEGIN PGP SIGNATURE-----\n\nnot a real signature\n\
+             -----END PGP SIGNATURE-----\n"
+        ),
+    )
+    .unwrap();
+    let sha256 = digest(&dsc);
+
+    let resolved = resolver_in(&root, &root)
+        .resolve(&dsc_component("pkg", &dsc, &sha256))
+        .expect("resolve");
+    assert_eq!(resolved_marker(&resolved.tree), "from the source package\n");
+    // The digest pins the signed file, not the body inside it.
+    assert_eq!(resolved.source.inputs()[0].value(), sha256);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_supplementary_upstream_tarball_lands_at_its_component_name() {
+    if !curl_available() {
+        return;
+    }
+    let root = scratch("dsc-components");
+    let (orig, debian) = write_quilt_files(&root);
+    // Two shapes are published: one wrapping its contents in a directory, one
+    // laying them out flat. Both must arrive at the component's own name.
+    let wrapped = root.join("pkg_1.2.3.orig-docs.tar");
+    write_tar(
+        &wrapped,
+        &[
+            ("docs-1.2.3/", ""),
+            ("docs-1.2.3/manual.txt", "the manual\n"),
+        ],
+    );
+    let flat = root.join("pkg_1.2.3.orig-test-data.tar");
+    write_tar(&flat, &[("cases.txt", "one\n"), ("expected.txt", "two\n")]);
+    let dsc = root.join("pkg_1.2.3-4.dsc");
+    let sha256 = write_dsc(&dsc, "3.0 (quilt)", &[&orig, &wrapped, &flat, &debian]);
+
+    let resolved = resolver_in(&root, &root)
+        .resolve(&dsc_component("pkg", &dsc, &sha256))
+        .expect("resolve");
+
+    let tree = &resolved.tree;
+    assert_eq!(
+        std::fs::read_to_string(tree.join("docs/manual.txt")).unwrap(),
+        "the manual\n",
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join("test-data/cases.txt")).unwrap(),
+        "one\n",
+    );
+    // The staging directory each was unpacked through is not part of the source.
+    let leftovers: Vec<PathBuf> = std::fs::read_dir(root.join("sources/pkg"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path != tree)
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_native_source_package_is_the_one_tarball_it_names() {
+    if !curl_available() {
+        return;
+    }
+    let root = scratch("dsc-native");
+    let tarball = root.join("pkg_1.2.3.tar");
+    write_tar(
+        &tarball,
+        &[
+            ("pkg-1.2.3/", ""),
+            ("pkg-1.2.3/marker", "native\n"),
+            ("pkg-1.2.3/debian/", ""),
+            ("pkg-1.2.3/debian/control", CONTROL),
+            ("pkg-1.2.3/debian/marker", "native packaging\n"),
+        ],
+    );
+    for format in ["3.0 (native)", "1.0"] {
+        let dsc = root.join("pkg_1.2.3.dsc");
+        let sha256 = write_dsc(&dsc, format, &[&tarball]);
+        let resolved = resolver_in(&root, &root)
+            .resolve(&dsc_component("pkg", &dsc, &sha256))
+            .expect("resolve");
+        assert_eq!(resolved_marker(&resolved.tree), "native\n", "{format}");
+        assert_eq!(packaging_marker(&resolved.tree), "native packaging");
+        assert_eq!(resolved.vendor, src2deb::VendorPass::Skip);
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_source_package_used_as_packaging_fetches_only_what_carries_debian() {
+    if !curl_available() {
+        return;
+    }
+    // "Build upstream's git with Debian's packaging". Only the packaging
+    // tarball can carry a `debian/`, so only it is fetched — proved by naming
+    // an upstream tarball that is not there at all, which a resolve that
+    // reached for it could not pass.
+    let root = scratch("dsc-packaging");
+    let (orig, debian) = write_quilt_files(&root);
+    let dsc = root.join("pkg_1.2.3-4.dsc");
+    let sha256 = write_dsc(&dsc, "3.0 (quilt)", &[&orig, &debian]);
+    std::fs::remove_file(&orig).unwrap();
+
+    let upstream = root.join("working-tree");
+    write_bare_tree(&upstream, "v1");
+    let mut comp = path_component("pkg", &upstream);
+    comp.packaging = Some(Source {
+        dsc: Some(format!("file://{}", dsc.display())),
+        sha256: Some(sha256.clone()),
+        ..Source::default()
+    });
+    let resolved = resolver_in(&root, &root).resolve(&comp).expect("resolve");
+
+    // The packaging came from the source package; the source did not.
+    assert_eq!(
+        packaging_marker(&resolved.tree),
+        "from the source package's own packaging",
+    );
+    assert_eq!(resolved_marker(&resolved.tree), "v1");
+    let overlay = &resolved.source.inputs()[1];
+    assert_eq!(overlay.role(), SourceRole::Packaging);
+    assert_eq!(overlay.kind(), src2deb::SourceKind::Dsc);
+    assert_eq!(overlay.value(), sha256);
+    // A packaging overlay says nothing about how the tree it is applied to
+    // acquires its dependencies, so the vendor pass stays where it was.
+    assert_eq!(resolved.vendor, src2deb::VendorPass::Run);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_component_file_that_does_not_match_the_dsc_fails_before_anything_is_unpacked() {
+    if !curl_available() {
+        return;
+    }
+    // The `.dsc` extends the recipe's one digest to every file it names, so a
+    // mirror serving a different upstream tarball is caught even though the
+    // `.dsc` itself is exactly the one the recipe pinned.
+    let root = scratch("dsc-tampered");
+    let (orig, debian) = write_quilt_files(&root);
+    let dsc = root.join("pkg_1.2.3-4.dsc");
+    let sha256 = write_dsc(&dsc, "3.0 (quilt)", &[&orig, &debian]);
+    let declared = digest(&orig);
+    write_tar(
+        &orig,
+        &[("pkg-1.2.3/", ""), ("pkg-1.2.3/marker", "swapped\n")],
+    );
+
+    let err = resolver_in(&root, &root)
+        .resolve(&dsc_component("pkg", &dsc, &sha256))
+        .expect_err("a file that does not match its declared digest fails")
+        .to_string();
+    assert!(err.contains(&declared), "{err}");
+    assert!(err.contains("Nothing was unpacked"), "{err}");
+    // The `.dsc` stays cached — it was the file that verified — and the
+    // tarball that did not is removed, so a later run fetches it again.
+    assert!(root.join("tarballs").join(&sha256).is_file());
+    assert!(!root.join("tarballs").join(&declared).exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_source_package_src2deb_cannot_assemble_is_refused_with_the_alternative() {
+    if !curl_available() {
+        return;
+    }
+    // The one format that exists in practice and is not built: `1.0` with a
+    // patch file, which is a second patch mechanism for a fraction of a percent
+    // of the archive.
+    let root = scratch("dsc-diff");
+    let (orig, _) = write_quilt_files(&root);
+    let diff = root.join("pkg_1.2.3-4.diff.gz");
+    std::fs::write(&diff, b"not really gzip").unwrap();
+    let dsc = root.join("pkg_1.2.3-4.dsc");
+    let sha256 = write_dsc(&dsc, "1.0", &[&orig, &diff]);
+
+    let err = resolver_in(&root, &root)
+        .resolve(&dsc_component("pkg", &dsc, &sha256))
+        .expect_err("a .diff.gz is not applied")
+        .to_string();
+    assert!(err.contains("diff.gz"), "{err}");
+    assert!(err.contains("packaging overlay"), "{err}");
+    // It failed on reading the `.dsc`, so nothing else was even fetched.
+    assert!(!root.join("tarballs").join(digest(&orig)).exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_source_package_is_unpacked_afresh_each_run() {
+    if !curl_available() {
+        return;
+    }
+    // The guarantee a git checkout gets from `checkout --force` and a path
+    // source from its fresh copy: a file the package does not carry does not
+    // survive into the next run's tree.
+    let root = scratch("dsc-afresh");
+    let (orig, debian) = write_quilt_files(&root);
+    let dsc = root.join("pkg_1.2.3-4.dsc");
+    let sha256 = write_dsc(&dsc, "3.0 (quilt)", &[&orig, &debian]);
+    let comp = dsc_component("pkg", &dsc, &sha256);
+
+    let first = resolver_in(&root, &root).resolve(&comp).expect("resolve");
+    std::fs::write(first.tree.join("stray"), "left behind").unwrap();
+
+    let again = resolver_in(&root, &root).resolve(&comp).expect("resolve");
+    assert_eq!(again.tree, first.tree);
+    assert!(!again.tree.join("stray").exists(), "the stray survived");
+    // The second resolve took every file from the cache, so it needed no
+    // network — which is what makes a re-run cheap.
+    assert!(root.join("tarballs").join(&sha256).is_file());
+
+    let _ = std::fs::remove_dir_all(&root);
+}

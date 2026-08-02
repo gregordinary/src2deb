@@ -43,6 +43,7 @@ pub mod arch;
 pub mod build;
 pub mod cancel;
 pub mod check;
+mod dsc;
 pub mod engine;
 pub mod error;
 pub mod export;
@@ -70,6 +71,8 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use export::{ExportOptions, ExportReport};
 pub use fingerprint::{Fingerprint, SourceInput, SourceKind, SourceRole};
-pub use manifest::Manifest;
+pub use manifest::{BuildIdentity, Manifest};
 pub use pool::{PruneOptions, PruneReport};
 pub use recipe::{Component, Origin, Recipe, Source, VersionFrom, VersionSource};
+pub use source::VendorPass;
+pub use version::VersionStamp;

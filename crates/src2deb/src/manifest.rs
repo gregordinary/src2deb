@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, io_error};
 use crate::fingerprint::Fingerprint;
+use crate::version::VersionStamp;
 
 /// The directory within the work directory that holds every manifest.
 pub const MANIFEST_DIR: &str = "manifests";
@@ -334,6 +335,18 @@ pub struct ComponentRecord {
     /// that was asked for. See [`is_built_at`](Self::is_built_at).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// How the component's version was stamped, recorded only when it was not
+    /// the default.
+    ///
+    /// The second thing a run can change that produces different packages while
+    /// leaving every input the fingerprint names exactly where it was, and it is
+    /// recorded for the same reason the declared
+    /// [`version`](Self::version) is. Omitted when it is
+    /// [`VersionStamp::Supersede`], so a record written before the setting
+    /// existed reads back as what it in fact was and does not provoke a rebuild.
+    /// See [`is_built_at`](Self::is_built_at).
+    #[serde(default, skip_serializing_if = "is_default_version_stamp")]
+    pub version_stamp: VersionStamp,
     /// The `.buildinfo` the component's build wrote, present only when it built
     /// and wrote one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -402,10 +415,32 @@ impl BuildInfoRecord {
     }
 }
 
+/// What a run would build a component as: everything that decides the version
+/// its packages carry, short of the contents of the source tree itself.
+///
+/// The [`Fingerprint`] alone answered this until a recipe could change a
+/// package's version without changing a byte of what it resolved. Two settings
+/// now can — a declared [`version`](crate::Component::version), and the
+/// [`version_stamp`](crate::Component::version_stamp) that decides how it is
+/// stamped — so each is compared beside the fingerprint rather than folded into
+/// it. They are grouped here because they are always used together: a
+/// `--skip-published` run asks one question about all of them, and a manifest
+/// records all of them so the next run can ask it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildIdentity<'a> {
+    /// What the component's source resolved to.
+    pub source: &'a Fingerprint,
+    /// The upstream version the recipe declared, or `None` for a component that
+    /// takes one from its own `debian/changelog`.
+    pub version: Option<&'a str>,
+    /// How that version is stamped.
+    pub version_stamp: VersionStamp,
+}
+
 impl ComponentRecord {
-    /// Whether this record marks the component as built from `source` at
-    /// `version`, so a `--skip-published` run may skip it. A failed or skipped
-    /// record is not a reason to skip.
+    /// Whether this record marks the component as built at `identity`, so a
+    /// `--skip-published` run may skip it. A failed or skipped record is not a
+    /// reason to skip.
     ///
     /// An unpinned source is never skippable, however exactly it matches. Its
     /// value names where the tree was read from and not what the tree held, so
@@ -413,17 +448,25 @@ impl ComponentRecord {
     /// moved — and skipping on that basis would quietly publish yesterday's
     /// package as today's build.
     ///
-    /// `version` is the upstream version the recipe declared, or `None` for a
-    /// component that takes one from its own `debian/changelog`. It is compared
-    /// alongside the source because it is the one input to a package's version
-    /// that the fingerprint does not name: a recipe that declares `1.2.4` where
-    /// it declared `1.2.3` resolves byte-identical trees and must still build.
-    pub fn is_built_at(&self, source: &Fingerprint, version: Option<&str>) -> bool {
+    /// The two settings beside the source are compared for the reason
+    /// [`BuildIdentity`] groups them: a recipe that declares `1.2.4` where it
+    /// declared `1.2.3` resolves byte-identical trees and must still build, and
+    /// so does one that moves a component to [`VersionStamp::Backport`].
+    pub fn is_built_at(&self, identity: &BuildIdentity) -> bool {
         self.status == STATUS_BUILT
-            && source.is_pinned()
-            && &self.source == source
-            && self.version.as_deref() == version
+            && identity.source.is_pinned()
+            && &self.source == identity.source
+            && self.version.as_deref() == identity.version
+            && self.version_stamp == identity.version_stamp
     }
+}
+
+/// Whether a version stamp is the one a record leaves out.
+///
+/// Serde needs a predicate rather than a comparison, and the default is what a
+/// record written before the setting existed reads back as.
+fn is_default_version_stamp(version_stamp: &VersionStamp) -> bool {
+    *version_stamp == VersionStamp::default()
 }
 
 impl Manifest {
@@ -531,6 +574,16 @@ mod tests {
     use crate::fingerprint::{SourceInput, SourceRole};
 
     /// A git source at `commit`, the shape the resolver produces.
+    /// The identity a run would build a component at, so a test naming a
+    /// source and a version is not also restating the default stamp.
+    fn identity<'a>(source: &'a Fingerprint, version: Option<&'a str>) -> BuildIdentity<'a> {
+        BuildIdentity {
+            source,
+            version,
+            version_stamp: VersionStamp::default(),
+        }
+    }
+
     fn git(commit: &str) -> Fingerprint {
         Fingerprint::of(SourceInput::git(SourceRole::Source, commit))
     }
@@ -541,6 +594,7 @@ mod tests {
             status: STATUS_BUILT.to_string(),
             error: None,
             version: None,
+            version_stamp: VersionStamp::default(),
             buildinfo: None,
             source: git(commit),
             packages: vec![PackageRecord {
@@ -563,6 +617,7 @@ mod tests {
                     status: STATUS_FAILED.to_string(),
                     error: Some("boom".to_string()),
                     version: None,
+                    version_stamp: VersionStamp::default(),
                     buildinfo: None,
                     source: git("def456"),
                     packages: Vec::new(),
@@ -573,8 +628,8 @@ mod tests {
         let parsed = Manifest::load_from_str(&toml);
         assert_eq!(parsed.recipe, "cosmic-epoch");
         assert_eq!(parsed.components.len(), 2);
-        assert!(parsed.components[0].is_built_at(&git("abc123"), None));
-        assert!(!parsed.components[0].is_built_at(&git("other"), None));
+        assert!(parsed.components[0].is_built_at(&identity(&git("abc123"), None)));
+        assert!(!parsed.components[0].is_built_at(&identity(&git("other"), None)));
         assert_eq!(parsed.components[0].packages[0].version, "1.0-1");
         assert_eq!(parsed.components[1].status, STATUS_FAILED);
         assert_eq!(parsed.components[1].error.as_deref(), Some("boom"));
@@ -594,6 +649,7 @@ mod tests {
                 status: STATUS_BUILT.to_string(),
                 error: None,
                 version: None,
+                version_stamp: VersionStamp::default(),
                 buildinfo: None,
                 source: Fingerprint::over(vec![
                     SourceInput::git(SourceRole::Source, "abc123"),
@@ -679,6 +735,7 @@ mod tests {
                 status: STATUS_FAILED.to_string(),
                 error: Some("no such repository".to_string()),
                 version: None,
+                version_stamp: VersionStamp::default(),
                 buildinfo: None,
                 source: Fingerprint::none(),
                 packages: Vec::new(),
@@ -751,7 +808,7 @@ mod tests {
         // renamed through is gone — a leftover would accumulate one per run, and
         // a manifest left half-written would fail every later `load`.
         let loaded = Manifest::load(&path).unwrap().expect("a manifest is there");
-        assert!(loaded.components[0].is_built_at(&git("def"), None));
+        assert!(loaded.components[0].is_built_at(&identity(&git("def"), None)));
         let siblings: Vec<String> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -930,7 +987,7 @@ mod tests {
             .expect("the first survives");
         assert_eq!(first.recipe, "cosmic-epoch");
         assert_eq!(first.components.len(), 1);
-        assert!(first.components[0].is_built_at(&git("abc123"), None));
+        assert!(first.components[0].is_built_at(&identity(&git("abc123"), None)));
 
         let second = Manifest::load(&theme)
             .unwrap()
@@ -992,15 +1049,15 @@ mod tests {
     #[test]
     fn only_a_built_record_of_the_same_source_is_skippable() {
         let record = built("c", "abc", "1.0");
-        assert!(record.is_built_at(&git("abc"), None));
+        assert!(record.is_built_at(&identity(&git("abc"), None)));
         // A different commit, or a non-built status, is not skippable.
-        assert!(!record.is_built_at(&git("xyz"), None));
+        assert!(!record.is_built_at(&identity(&git("xyz"), None)));
         let mut failed = record.clone();
         failed.status = STATUS_FAILED.to_string();
-        assert!(!failed.is_built_at(&git("abc"), None));
+        assert!(!failed.is_built_at(&identity(&git("abc"), None)));
         let mut skipped = record;
         skipped.status = STATUS_SKIPPED.to_string();
-        assert!(!skipped.is_built_at(&git("abc"), None));
+        assert!(!skipped.is_built_at(&identity(&git("abc"), None)));
     }
 
     #[test]
@@ -1017,12 +1074,13 @@ mod tests {
             status: STATUS_BUILT.to_string(),
             error: None,
             version: None,
+            version_stamp: VersionStamp::default(),
             buildinfo: None,
             source: working_tree.clone(),
             packages: Vec::new(),
         };
         assert_eq!(record.source, working_tree);
-        assert!(!record.is_built_at(&working_tree, None));
+        assert!(!record.is_built_at(&identity(&working_tree, None)));
 
         // One unpinned input among pinned ones is enough: whatever else the
         // build consumed, part of it cannot be compared.
@@ -1034,7 +1092,7 @@ mod tests {
             source: overlaid.clone(),
             ..record
         };
-        assert!(!record.is_built_at(&overlaid, None));
+        assert!(!record.is_built_at(&identity(&overlaid, None)));
     }
 
     #[test]
@@ -1042,13 +1100,11 @@ mod tests {
         // Adding a patch series or a packaging overlay to a component makes it
         // a different source, so a prior run's record does not excuse a build.
         let record = built("c", "abc", "1.0");
-        assert!(!record.is_built_at(
-            &Fingerprint::over(vec![
-                SourceInput::git(SourceRole::Source, "abc"),
-                SourceInput::sha256(SourceRole::Packaging, "9f8e7d6"),
-            ]),
-            None,
-        ));
+        let gained = Fingerprint::over(vec![
+            SourceInput::git(SourceRole::Source, "abc"),
+            SourceInput::sha256(SourceRole::Packaging, "9f8e7d6"),
+        ]);
+        assert!(!record.is_built_at(&identity(&gained, None)));
     }
 
     #[test]
@@ -1062,17 +1118,17 @@ mod tests {
             version: Some("1.2.3".to_string()),
             ..built("c", "abc", "1.2.3+deb13.20260731.abc")
         };
-        assert!(record.is_built_at(&source, Some("1.2.3")));
-        assert!(!record.is_built_at(&source, Some("1.2.4")));
+        assert!(record.is_built_at(&identity(&source, Some("1.2.3"))));
+        assert!(!record.is_built_at(&identity(&source, Some("1.2.4"))));
         // Dropping the declaration is a move too: the version now comes from the
         // component's own changelog, which is a different answer.
-        assert!(!record.is_built_at(&source, None));
+        assert!(!record.is_built_at(&identity(&source, None)));
 
         // ...and a component that never declared one is unaffected, which is
         // every component whose packaging ships a changelog.
         let undeclared = built("c", "abc", "1.0-1");
-        assert!(undeclared.is_built_at(&source, None));
-        assert!(!undeclared.is_built_at(&source, Some("1.2.3")));
+        assert!(undeclared.is_built_at(&identity(&source, None)));
+        assert!(!undeclared.is_built_at(&identity(&source, Some("1.2.3"))));
     }
 
     #[test]

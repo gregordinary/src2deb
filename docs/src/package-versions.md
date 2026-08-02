@@ -28,7 +28,9 @@ The format is chosen for how `dpkg` compares versions.
 
 - **`+` opens the suffix.** An empty string sorts before any character except
   `~`, so a stamped build sorts *after* the plain upstream version it was built
-  from.
+  from. A component rebuilding a package the archive also ships opens it with `~`
+  instead, so the build sorts *before* it — see [Rebuilds of packages the archive
+  also ships](#rebuilds-of-packages-the-archive-also-ships).
 - **The suite appears as `deb13`, not `trixie`.** Spelled out, `forky` sorts
   before `trixie`, so a user moving from trixie to forky would see the forky
   packages as a downgrade and apt would refuse the upgrade. Release numbers sort
@@ -72,9 +74,65 @@ The source's revision is always first, which is what makes the leading
 abbreviation mean the same thing on every package src2deb builds.
 
 A component built from a [release archive](recipes.md#building-from-a-release-archive)
+or a [Debian source package](recipes.md#rebuilding-a-debian-source-package)
 carries the first seven characters of the digest it was verified against, in the
 place a commit would sit. It abbreviates the same way for the same reason: it
 pins exactly what the build consumed.
+
+## Rebuilds of packages the archive also ships
+
+Everything above assumes nothing else publishes the package you are building.
+That holds for software the archive does not carry, and it is why a stamped build
+outranks the version it was built from: each rebuild supersedes the last, and no
+one else is claiming the name.
+
+Rebuilding a package Debian ships is the other case. If your build of
+`0.98.2-4` outranks Debian's own `0.98.2-4`, it wins wherever both are
+available — including after an upgrade to the suite whose source you built from,
+where the machine keeps your binary forever instead of moving to the archive's.
+That is the trap Debian's `~bpo` convention exists to avoid.
+
+Set `version-stamp = "backport"`, on the recipe or on the component:
+
+```toml
+[[components]]
+name = "gtk2-engines-murrine"
+source.dsc = "https://deb.debian.org/debian/pool/main/g/.../gtk2-engines-murrine_0.98.2-4.dsc"
+source.sha256 = "85789dd8d50f..."
+version-stamp = "backport"
+```
+
+The stamp then opens with `~` rather than `+`:
+
+```text
+0.98.2-4~deb14.20260802.85789dd
+```
+
+`~` sorts before everything, including the end of a version, so this sits below
+the archive's plain `0.98.2-4`. That single character is the whole difference —
+nothing else about the stamp changes, and every ordering the stamp promises still
+holds:
+
+| | |
+| --- | --- |
+| below the archive's own package | `0.98.2-4~deb14.20260802.85789dd` < `0.98.2-4` |
+| above the archive's earlier versions | `0.98.2-3` < `0.98.2-4~deb14.20260802.85789dd` |
+| a later build supersedes an earlier one | `...~deb14.20260802...` < `...~deb14.20260803...` |
+| a later suite supersedes an earlier one | `...~deb13.20260802...` < `...~deb14.20260802...` |
+
+So your rebuild still reaches a machine that has the archive's older version, and
+still upgrades itself, and still steps aside the moment the archive catches up.
+
+### Choose it when you add the component
+
+Turning `backport` on for a package you have already published *lowers* its
+version, and apt does not offer a downgrade — machines that installed the earlier
+build keep it until something outranks it. Decide when the component is first
+declared.
+
+Because the setting changes a package's version while leaving every input
+byte-identical, it is recorded in the manifest and compared by
+`--skip-published`: changing it rebuilds and republishes rather than skipping.
 
 ### A local build says so
 

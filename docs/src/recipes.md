@@ -64,6 +64,17 @@ source.git = "https://github.com/pop-os/cosmic-settings"
   suite = "sid"
   version-tag = "debsid"
   ```
+- `version-stamp` — how this recipe's packages order against the archive's own
+  packages of the same version: `supersede` (the default) or `backport`.
+  Optional, and the default is right for software the archive does not carry. Set
+  `backport` for a recipe of rebuilds, such as one built from
+  [Debian source packages](#rebuilding-a-debian-source-package); a component's own
+  `version-stamp` overrides it. See
+  [Rebuilds of packages the archive also ships](package-versions.md#rebuilds-of-packages-the-archive-also-ships).
+
+  ```toml
+  version-stamp = "backport"
+  ```
 - `maintainer` — the identity src2deb signs a synthesized `debian/changelog`
   with, written as Debian writes it. Optional, and consulted only for a component
   that [declares its version](#components-with-no-changelog); a component's own
@@ -160,8 +171,8 @@ Each `[[components]]` entry is one buildable component: a source tree with a
 
 - `name` — the component name, unique within the recipe.
 - `source` — where the component's source comes from. A component names exactly
-  one origin: `source.git`, `source.path`, or `source.tarball`. Naming more than
-  one, or none, is refused.
+  one origin: `source.git`, `source.path`, `source.tarball`, or `source.dsc`.
+  Naming more than one, or none, is refused.
   - `source.git` — the git repository URL to clone.
   - `source.git-ref` — the branch, tag, or commit to check out. Defaults to the
     remote's default branch. It qualifies `source.git`, and setting it on a path
@@ -194,9 +205,21 @@ Each `[[components]]` entry is one buildable component: a source tree with a
 
     See [Building from a release archive](#building-from-a-release-archive)
     below.
-  - `source.sha256` — the SHA-256 the archive must hash to, in hexadecimal of
-    either case. Required for `source.tarball`, and setting it on any other
-    origin is refused rather than ignored.
+  - `source.dsc` — a Debian source package to fetch and unpack, named by the URL
+    of its `.dsc`.
+
+    ```toml
+    [[components]]
+    name = "gtk2-engines-murrine"
+    source.dsc = "https://deb.debian.org/debian/pool/main/g/gtk2-engines-murrine/gtk2-engines-murrine_0.98.2-4.dsc"
+    source.sha256 = "85789dd8d50f..."
+    ```
+
+    See [Rebuilding a Debian source
+    package](#rebuilding-a-debian-source-package) below.
+  - `source.sha256` — the SHA-256 the fetched file must hash to, in hexadecimal
+    of either case. Required for `source.tarball` and `source.dsc`, and setting
+    it on any other origin is refused rather than ignored.
   - `source.subdir` — a subdirectory within the source that holds the `debian/`
     tree, for a component that lives inside a larger superproject. The whole
     source is the tree when unset. It applies to every origin, and must stay
@@ -207,8 +230,8 @@ Each `[[components]]` entry is one buildable component: a source tree with a
   source that carries none of its own. Optional; see [Packaging
   overlays](#packaging-overlays) below. It takes the same settings `source`
   does — `packaging.git`, `packaging.git-ref`, `packaging.path`,
-  `packaging.tarball`, `packaging.sha256`, `packaging.subdir` — under the same
-  rules.
+  `packaging.tarball`, `packaging.dsc`, `packaging.sha256`, `packaging.subdir` —
+  under the same rules.
 - `patches` — patch files applied over the resolved source tree, in the order
   given. Optional; see [Patches](#patches) below.
 - `version` — the upstream version to build the component as, for packaging that
@@ -217,6 +240,10 @@ Each `[[components]]` entry is one buildable component: a source tree with a
   `version-from`.
 - `version-from` — where to derive that version instead of stating it. The one
   value is `git-describe`. Exclusive with `version`.
+- `version-stamp` — how this component's packages order against the archive's
+  own package of the same version: `supersede` or `backport`. Optional,
+  overriding the recipe's. See [Rebuilds of packages the archive also
+  ships](package-versions.md#rebuilds-of-packages-the-archive-also-ships).
 - `maintainer` — the identity a synthesized changelog is signed with, overriding
   the recipe's. Optional.
 - `extra-build-deps` — extra build-dependency package names beyond those
@@ -390,7 +417,7 @@ it must hash to:
 [[components]]
 name = "foo"
 source.tarball = "https://example.org/releases/foo-1.2.3.tar.xz"
-source.sha256 = "5f2e1a9c3b8d4e7a2f9016c5b3d8e4a71f0c9d2b6e5a8347c1b0f9e2d6a4c8b13"
+source.sha256 = "5f2e1a9c3b8d4e7a2f9016c5b3d8e4a71f0c9d2b6e5a8347c1b0f9e2d6a4c8b1"
 packaging.path = "packaging/foo"
 version = "1.2.3"
 ```
@@ -444,6 +471,121 @@ a different file rather than a stale one, and a host with no network — or no
 
 The unpacked tree, by contrast, is replaced on every run, so each build sees the
 archive as it stands rather than the leavings of the run before.
+
+### Archive formats src2deb reads
+
+An archive may be uncompressed or compressed with gzip, xz, or zstd, and must be
+a POSIX `ustar` or GNU tar archive. Those are what contemporary tooling produces,
+and between them they cover most of what upstreams publish.
+
+Pre-POSIX **v7** tar archives — the oldest format, which carries no magic in its
+headers — are not read. A small number of long-lived releases still ship one; if
+you meet it, the failure names the archive and the formats src2deb reads:
+
+```text
+pkg: unpacking https://example.org/releases/foo-1.2.3.tar.gz: ... is neither a
+recognized compression format nor a tar archive. src2deb reads ustar and GNU tar
+archives, optionally compressed with gzip, xz, or zstd
+```
+
+Build such a component from a git repository instead, with [packaging from
+elsewhere](#packaging-overlays) if upstream ships none.
+
+## Rebuilding a Debian source package
+
+A component may be built from a Debian source package — the `.dsc` and the
+tarballs it names. That makes src2deb a rebuild engine: take a package from one
+suite, build it for another, and publish it in your own pool.
+
+```toml
+version-stamp = "backport"
+
+[[components]]
+name = "gtk2-engines-murrine"
+source.dsc = "https://deb.debian.org/debian/pool/main/g/gtk2-engines-murrine/gtk2-engines-murrine_0.98.2-4.dsc"
+source.sha256 = "85789dd8d50f0030fb2202dd84a99500e695e39bc947cdfb36c53c3ecf64bc61"
+```
+
+That is the whole recipe entry. A source package already carries its own
+`debian/` directory and its own changelog, so it needs no packaging overlay and
+no declared version — everything a component normally has to be given, it brings.
+
+`version-stamp = "backport"` is not required, but it is almost always what you
+want here: the archive ships this package too, and the setting keeps your rebuild
+from outranking the archive's own copy forever. See [Rebuilds of packages the
+archive also
+ships](package-versions.md#rebuilds-of-packages-the-archive-also-ships).
+
+### One digest pins the whole package
+
+`source.sha256` is the digest of the `.dsc` itself. The `.dsc` in turn declares
+the SHA-256 of every file it names, and each of those is verified before it is
+unpacked — so the one hash in your recipe reaches the upstream tarball and the
+packaging tarball alike.
+
+A published `.dsc` is PGP-signed, and src2deb reads through the signature without
+checking it. That is deliberate: the signature says who published the file, and
+your declared digest says *which* file, which is the stronger claim and the only
+one that answers "did I get the bytes this recipe was written against". If you
+want the signature checked, check it once when you write the digest down.
+
+### The patch series is applied by the build, not by src2deb
+
+src2deb assembles the tree from the tarballs and stops there. A `3.0 (quilt)`
+package's patches arrive in `debian/patches/` unapplied, and
+`dpkg-buildpackage` applies them inside the cage — it calls `dpkg-source
+--before-build` as its first step, before it even checks build-dependencies.
+
+So the tool that owns the source format is the one that unpacks it, and nothing
+on your build host needs to understand quilt. The tree src2deb hands to the build
+is byte-for-byte what `dpkg-source -x --skip-patches` produces.
+
+### No vendor pass
+
+This is src2deb's one fully hermetic source kind. Every other source runs [pass
+1](how-a-build-runs.md#3-build-each-component) — `debian/rules clean` in a cage
+with the *host network*, so a component that vendors its dependencies has them
+before the offline build. A Debian source package already carries everything its
+build needs; that is what makes it a source package. So the pass is skipped, and
+the build runs start to finish in an isolated cage.
+
+### Formats
+
+`3.0 (quilt)`, `3.0 (native)`, and native `1.0` source packages are built, which
+between them is nearly the whole archive. Supplementary upstream tarballs
+(`foo_1.0.orig-docs.tar.xz`) are unpacked at their component's name, as
+`dpkg-source` does.
+
+A `1.0` package that carries a `.diff.gz` is refused, naming the alternative:
+
+```text
+pkg: https://.../foo_1.0-1.dsc: declares format "1.0" with the patch file
+"foo_1.0-1.diff.gz", which src2deb does not apply. Build this package from a
+source that carries its packaging as a tree — a git repository, or a packaging
+overlay — rather than from its .dsc
+```
+
+The [archive formats](#archive-formats-src2deb-reads) above apply to a source
+package's tarballs as they do to a release archive.
+
+### Taking only the packaging
+
+`packaging.dsc` takes a source package's `debian/` directory and nothing else,
+which is how you build upstream's own git against a distribution's packaging:
+
+```toml
+[[components]]
+name = "foo"
+source.git = "https://github.com/upstream/foo"
+packaging.dsc = "https://deb.debian.org/debian/pool/main/f/foo/foo_1.2.3-1.dsc"
+packaging.sha256 = "..."
+```
+
+Only the files that can carry a `debian/` are fetched, so an overlay does not
+download an upstream tarball it would then ignore. Note that the packaging's
+`debian/patches` were written against *its* upstream: if yours has moved, the
+build fails when `dpkg-source` cannot apply them, which is the right place to
+find out.
 
 ## Components with no changelog
 
