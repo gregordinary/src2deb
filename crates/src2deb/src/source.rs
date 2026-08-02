@@ -168,6 +168,10 @@ struct ResolvedTree {
 pub struct SourceResolver<'a> {
     sources_dir: PathBuf,
     packaging_dir: PathBuf,
+    /// Where fetched release archives are kept, named by their digests, so two
+    /// components declaring one archive fetch it once and a re-run fetches
+    /// nothing. See [`crate::tarball`].
+    tarballs_dir: PathBuf,
     recipe_dir: PathBuf,
     /// The recipe's maintainer identity, which a component's own overrides and
     /// its `debian/control` stands in for. See [Declared
@@ -187,6 +191,9 @@ impl<'a> SourceResolver<'a> {
     /// `<work_dir>/packaging/<component>`. They are kept apart because both are
     /// checkouts named for the component, and a component's source tree is
     /// bound into a cage while its packaging source is only ever read.
+    /// Fetched release archives are cached in `<work_dir>/tarballs`, shared by
+    /// every component that names one, since an archive is identified by its
+    /// digest rather than by the component that asked for it.
     ///
     /// `maintainer` and `stamp` are the recipe's identity and the run's date,
     /// which a component declaring its own version is given a `debian/changelog`
@@ -202,6 +209,7 @@ impl<'a> SourceResolver<'a> {
         SourceResolver {
             sources_dir: work_dir.join("sources"),
             packaging_dir: work_dir.join("packaging"),
+            tarballs_dir: work_dir.join("tarballs"),
             recipe_dir: recipe_dir.into(),
             maintainer,
             stamp,
@@ -373,13 +381,49 @@ impl<'a> SourceResolver<'a> {
         match component.source.origin() {
             Some(Origin::Git { url, git_ref }) => self.resolve_git(component, url, git_ref),
             Some(Origin::Path(path)) => self.resolve_path(component, path),
+            Some(Origin::Tarball { url, sha256 }) => self.resolve_tarball(component, url, sha256),
             None => Err(Error::Source {
                 component: component.name.clone(),
                 reason: "the component names no single source; set source.git to \
-                         clone a repository, or source.path to build a tree on disk"
+                         clone a repository, source.path to build a tree on disk, \
+                         or source.tarball with source.sha256 to build a release \
+                         archive"
                     .to_string(),
             }),
         }
+    }
+
+    /// Resolves an archive source: fetches it, verifies it against the declared
+    /// digest, and unpacks it into `sources/<component>`.
+    ///
+    /// The tree is the archive's own root directory when it has one — see
+    /// [`crate::tarball`] — and a [`subdir`](Source::subdir) descends within
+    /// that, so a component nested inside a release archive is reachable
+    /// without naming the release directory as well.
+    ///
+    /// The input is the digest the archive was verified against, which pins it:
+    /// what the URL serves may change, and a build that consumed something else
+    /// would have failed rather than reaching here.
+    fn resolve_tarball(
+        &self,
+        component: &Component,
+        url: &str,
+        sha256: &str,
+    ) -> Result<ResolvedTree> {
+        let unpacked = crate::tarball::unpack(
+            &component.name,
+            &self.tarballs_dir,
+            url,
+            sha256,
+            &self.sources_dir.join(&component.name),
+        )?;
+        let subdir = component.source.subdir.as_deref();
+        let tree = source_tree(&unpacked.tree, subdir);
+        refuse_missing_subdir(component, "source", subdir, &tree)?;
+        Ok(ResolvedTree {
+            tree,
+            input: SourceInput::sha256(SourceRole::Source, unpacked.digest),
+        })
     }
 
     /// Resolves a git source: clones the repository on first use and fetches on
@@ -606,11 +650,27 @@ impl<'a> SourceResolver<'a> {
                     input: SourceInput::tree(SourceRole::Packaging, digest),
                 })
             }
+            Some(Origin::Tarball { url, sha256 }) => {
+                let unpacked = crate::tarball::unpack(
+                    &component.name,
+                    &self.tarballs_dir,
+                    url,
+                    sha256,
+                    &self.packaging_dir.join(&component.name),
+                )?;
+                let tree = source_tree(&unpacked.tree, subdir);
+                refuse_missing_subdir(component, "packaging", subdir, &tree)?;
+                Ok(ResolvedTree {
+                    tree,
+                    input: SourceInput::sha256(SourceRole::Packaging, unpacked.digest),
+                })
+            }
             None => Err(Error::Source {
                 component: component.name.clone(),
                 reason: "the component names no single packaging source; set \
-                         packaging.git to clone a repository, or packaging.path to \
-                         overlay a tree on disk"
+                         packaging.git to clone a repository, packaging.path to \
+                         overlay a tree on disk, or packaging.tarball with \
+                         packaging.sha256 to overlay a release archive"
                     .to_string(),
             }),
         }

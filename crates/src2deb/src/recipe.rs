@@ -305,6 +305,27 @@ pub struct Source {
     /// default branch when unset, and applies only to [`git`](Self::git).
     #[serde(default)]
     pub git_ref: Option<String>,
+    /// A release archive to fetch and unpack. Exclusive with
+    /// [`git`](Self::git) and [`path`](Self::path), and requires
+    /// [`sha256`](Self::sha256).
+    ///
+    /// `http`, `https`, and `file` URLs are fetched; a redirect may reach only
+    /// the first two. The archive may be uncompressed or compressed with gzip,
+    /// xz, or zstd, which is read from its content rather than from the URL.
+    ///
+    /// The digest pins it, so an archive source is as reproducible as a
+    /// revision: what the URL serves may change, and a build that consumed
+    /// something else fails rather than producing a package.
+    #[serde(default)]
+    pub tarball: Option<String>,
+    /// The SHA-256 the [`tarball`](Self::tarball) must hash to, in hexadecimal
+    /// of either case.
+    ///
+    /// Required for an archive and refused on any other origin, since it says
+    /// nothing about a revision or a directory. Verified before anything is
+    /// unpacked, on every run.
+    #[serde(default)]
+    pub sha256: Option<String>,
     /// A tree already on disk, built without being cloned. Exclusive with
     /// [`git`](Self::git).
     ///
@@ -345,25 +366,40 @@ pub enum Origin<'a> {
     },
     /// A tree already on disk, copied under the work directory as it stands.
     Path(&'a Path),
+    /// A release archive, fetched and unpacked under the work directory.
+    Tarball {
+        /// The URL to fetch the archive from.
+        url: &'a str,
+        /// The SHA-256 the archive is verified against before it is unpacked.
+        sha256: &'a str,
+    },
 }
 
 impl Source {
-    /// Where this tree comes from, or `None` when it names neither a git
-    /// repository nor a path.
+    /// Where this tree comes from, or `None` when it does not name exactly one
+    /// origin.
     ///
     /// Never `None` for a validated recipe: [`Recipe::load`] refuses a
-    /// component whose source or packaging overlay names no origin, and refuses
-    /// one that names both, so exactly one arm applies. A caller that builds a
+    /// component whose source or packaging overlay names no origin, refuses one
+    /// that names more than one, and refuses an archive with no digest to
+    /// verify it against — so exactly one arm applies. A caller that builds a
     /// [`Source`] itself is outside that guarantee, which is why this reports
     /// rather than asserts.
     pub fn origin(&self) -> Option<Origin<'_>> {
-        match (&self.git, &self.path) {
-            (Some(url), None) => Some(Origin::Git {
+        match (&self.git, &self.path, &self.tarball) {
+            (Some(url), None, None) => Some(Origin::Git {
                 url,
                 git_ref: self.git_ref.as_deref(),
             }),
-            (None, Some(path)) => Some(Origin::Path(path)),
-            (Some(_), Some(_)) | (None, None) => None,
+            (None, Some(path), None) => Some(Origin::Path(path)),
+            (None, None, Some(url)) => Some(Origin::Tarball {
+                url,
+                // An archive with no digest names no origin: there would be
+                // nothing to verify what was fetched against, and the tree
+                // would be whatever the URL happened to serve.
+                sha256: self.sha256.as_deref()?,
+            }),
+            _ => None,
         }
     }
 }
@@ -533,25 +569,27 @@ impl Recipe {
                     component.name
                 )));
             }
-            // A component has one source. Naming both would leave which one it
+            // A component has one source. Naming two would leave which one it
             // is built from to whichever the resolver happened to look at
-            // first, and naming neither leaves nothing to build.
-            match (&component.source.git, &component.source.path) {
-                (Some(_), Some(_)) => {
-                    return Err(bad(format!(
-                        "component {:?} declares both source.git and source.path; \
-                         a component is built from one source",
-                        component.name
-                    )));
-                }
-                (None, None) => {
+            // first, and naming none leaves nothing to build.
+            match named_origins("source", &component.source).as_slice() {
+                [_] => {}
+                [] => {
                     return Err(bad(format!(
                         "component {:?} declares no source; set source.git to clone \
-                         a repository, or source.path to build a tree on disk",
+                         a repository, source.path to build a tree on disk, or \
+                         source.tarball to build a release archive",
                         component.name
                     )));
                 }
-                _ => {}
+                named => {
+                    return Err(bad(format!(
+                        "component {:?} declares {}; a component is built from one \
+                         source",
+                        component.name,
+                        named.join(" and "),
+                    )));
+                }
             }
             if let Some(reason) = source_error("source", &component.source) {
                 return Err(bad(format!("component {:?} {reason}", component.name)));
@@ -562,24 +600,25 @@ impl Recipe {
             // because the remedy is: an overlay is optional, and a table that
             // exists without naming an origin is a half-written one.
             if let Some(packaging) = &component.packaging {
-                match (&packaging.git, &packaging.path) {
-                    (Some(_), Some(_)) => {
-                        return Err(bad(format!(
-                            "component {:?} declares both packaging.git and \
-                             packaging.path; a packaging overlay comes from one \
-                             source",
-                            component.name
-                        )));
-                    }
-                    (None, None) => {
+                match named_origins("packaging", packaging).as_slice() {
+                    [_] => {}
+                    [] => {
                         return Err(bad(format!(
                             "component {:?} declares a packaging overlay with no \
-                             source; set packaging.git to clone a repository, or \
-                             packaging.path to overlay a tree on disk",
+                             source; set packaging.git to clone a repository, \
+                             packaging.path to overlay a tree on disk, or \
+                             packaging.tarball to overlay a release archive",
                             component.name
                         )));
                     }
-                    _ => {}
+                    named => {
+                        return Err(bad(format!(
+                            "component {:?} declares {}; a packaging overlay comes \
+                             from one source",
+                            component.name,
+                            named.join(" and "),
+                        )));
+                    }
                 }
                 if let Some(reason) = source_error("packaging", packaging) {
                     return Err(bad(format!("component {:?} {reason}", component.name)));
@@ -800,6 +839,38 @@ fn source_error(field: &str, source: &Source) -> Option<String> {
     {
         return Some(format!("{field}.git {git:?} {reason}"));
     }
+    // The archive URL reaches curl the same way, and is checked here for the
+    // same reason.
+    if let Some(tarball) = &source.tarball {
+        if let Some(reason) = argument_error(tarball) {
+            return Some(format!("{field}.tarball {tarball:?} {reason}"));
+        }
+        // An archive with nothing to verify it against is a tree that is
+        // whatever the URL happened to serve, which is the one thing an archive
+        // source exists to rule out. Refused at load, so a run does not fetch
+        // before discovering it cannot trust what it fetched.
+        if source.sha256.is_none() {
+            return Some(format!(
+                "sets {field}.tarball with no {field}.sha256 to verify it \
+                 against; an archive is pinned by its digest"
+            ));
+        }
+    }
+    if let Some(sha256) = &source.sha256 {
+        if let Some(reason) = sha256_error(sha256) {
+            return Some(format!("{field}.sha256 {sha256:?} {reason}"));
+        }
+        // A digest identifies a fetched archive, so it says nothing about a
+        // revision or a directory. Refused rather than ignored, as
+        // `git-ref` is: a recipe switched from an archive to a repository keeps
+        // its digest, and passing over it would build something other than what
+        // it reads as building.
+        if source.tarball.is_none() {
+            return Some(format!(
+                "sets {field}.sha256, which applies only to {field}.tarball"
+            ));
+        }
+    }
     if let Some(git_ref) = &source.git_ref {
         if let Some(reason) = argument_error(git_ref) {
             return Some(format!("{field}.git-ref {git_ref:?} {reason}"));
@@ -832,6 +903,50 @@ fn source_error(field: &str, source: &Source) -> Option<String> {
         return Some(format!("{field}.subdir {:?} {reason}", subdir.display()));
     }
     None
+}
+
+/// The origin settings a tree names, spelled as the recipe writes them —
+/// `source.git`, `packaging.tarball`, and so on.
+///
+/// Exactly one makes a resolvable tree. Reported as a list rather than as a
+/// count so an error quotes the recipe's own words back, and `field` names the
+/// table they came from so one rule serves a component's source and its
+/// packaging overlay alike.
+fn named_origins(field: &str, source: &Source) -> Vec<String> {
+    [
+        source.git.is_some().then_some("git"),
+        source.path.is_some().then_some("path"),
+        source.tarball.is_some().then_some("tarball"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|setting| format!("{field}.{setting}"))
+    .collect()
+}
+
+/// Reports why a declared SHA-256 cannot identify an archive, or `None` when it
+/// can.
+///
+/// A digest is 32 bytes written as 64 hexadecimal characters. Either case is
+/// accepted, since the two spell the same value and a digest is copied from
+/// wherever the release published it; src2deb records the lowercase form it
+/// measures.
+///
+/// Anything else is a mistake worth catching at load: a truncated digest, a
+/// digest of another algorithm, or the whole line of a `sha256sum` output with
+/// the file name still attached would each fail every fetch it was compared
+/// against, and would do so after the archive had been downloaded.
+fn sha256_error(sha256: &str) -> Option<&'static str> {
+    /// A SHA-256 is 32 bytes, and a byte is two hexadecimal characters.
+    const DIGITS: usize = 64;
+
+    if sha256.len() != DIGITS {
+        Some("is not 64 characters, which a SHA-256 in hexadecimal is")
+    } else if !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some("is not hexadecimal")
+    } else {
+        None
+    }
 }
 
 /// Reports why a value is unsafe to pass to a subprocess as a positional
@@ -1233,13 +1348,176 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{err}").contains("declares both source.git and source.path"),
+            format!("{err}").contains("declares source.git and source.path"),
+            "{err}"
+        );
+
+        // The error quotes back exactly the settings that were written, however
+        // many there are.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             source.path = \"/home/someone/c\"\n\
+             source.tarball = \"https://example/c.tar.gz\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("declares source.git and source.path and source.tarball"),
             "{err}"
         );
 
         let err =
             load("name = \"r\"\nsuite = \"trixie\"\n[[components]]\nname = \"c\"\n").unwrap_err();
         assert!(format!("{err}").contains("declares no source"), "{err}");
+        // ...and names every way to fix it, archives included.
+        assert!(format!("{err}").contains("source.tarball"), "{err}");
+    }
+
+    /// A representative digest, as a release publishes one.
+    const DIGEST: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0";
+
+    #[test]
+    fn an_archive_source_names_its_url_and_the_digest_it_is_pinned_by() {
+        let recipe = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\n\
+             source.tarball = \"https://example/c-1.2.3.tar.xz\"\n\
+             source.sha256 = \"{DIGEST}\"\n"
+        ))
+        .expect("an archive with a digest is a source");
+        assert_eq!(
+            recipe.components[0].source.origin(),
+            Some(Origin::Tarball {
+                url: "https://example/c-1.2.3.tar.xz",
+                sha256: DIGEST,
+            }),
+        );
+    }
+
+    #[test]
+    fn an_archive_with_nothing_to_verify_it_against_is_rejected() {
+        // The one thing an archive source exists to rule out is a tree that is
+        // whatever the URL happened to serve. Caught at load, so a run does not
+        // fetch before finding out it cannot trust what it fetched.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\n\
+             source.tarball = \"https://example/c.tar.gz\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("no source.sha256 to verify it against"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_digest_on_a_source_that_is_not_an_archive_is_rejected_rather_than_ignored() {
+        // The shape a recipe takes when it is switched from an archive to a
+        // repository and the digest is left behind — the same failure a
+        // leftover `git-ref` is, and refused for the same reason.
+        let err = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             source.sha256 = \"{DIGEST}\"\n"
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("applies only to source.tarball"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_digest_that_is_not_a_sha256_is_rejected() {
+        for (sha256, needle) in [
+            // Truncated, or a digest of another algorithm.
+            ("9f8e7d6c", "64 characters"),
+            ("d41d8cd98f00b204e9800998ecf8427e", "64 characters"),
+            // A whole `sha256sum` line, file name and all.
+            (
+                "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0  c.tar.gz",
+                "64 characters",
+            ),
+            (
+                "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+                "not hexadecimal",
+            ),
+        ] {
+            let err = load(&format!(
+                "name = \"r\"\nsuite = \"trixie\"\n\
+                 [[components]]\nname = \"c\"\n\
+                 source.tarball = \"https://example/c.tar.gz\"\n\
+                 source.sha256 = \"{sha256}\"\n"
+            ))
+            .unwrap_err();
+            let message = format!("{err}");
+            assert!(
+                message.contains("source.sha256") && message.contains(needle),
+                "{sha256:?} gave: {message}"
+            );
+        }
+
+        // Either case spells the same value, and a digest is copied from
+        // wherever the release published it.
+        load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\n\
+             source.tarball = \"https://example/c.tar.gz\"\n\
+             source.sha256 = \"{}\"\n",
+            DIGEST.to_uppercase()
+        ))
+        .expect("an uppercase digest is the same digest");
+    }
+
+    #[test]
+    fn a_packaging_overlay_may_come_from_an_archive_too() {
+        // `packaging` takes the same settings `source` does, which is a rule
+        // worth keeping true as origins are added rather than one to except
+        // the newest from.
+        let recipe = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             packaging.tarball = \"https://deb.example/c.debian.tar.xz\"\n\
+             packaging.sha256 = \"{DIGEST}\"\n"
+        ))
+        .expect("an archive is a packaging source");
+        assert_eq!(
+            recipe.components[0].packaging.as_ref().unwrap().origin(),
+            Some(Origin::Tarball {
+                url: "https://deb.example/c.debian.tar.xz",
+                sha256: DIGEST,
+            }),
+        );
+
+        // ...and it is held to the same rules, named against its own setting.
+        let err = load(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\nsource.git = \"https://example/c\"\n\
+             packaging.tarball = \"https://deb.example/c.debian.tar.xz\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("no packaging.sha256 to verify it against"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_option_like_archive_url_is_rejected() {
+        // It reaches curl as a positional argument, where a leading '-' would
+        // be read as a flag.
+        let err = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"c\"\n\
+             source.tarball = \"--output=/tmp/x\"\nsource.sha256 = \"{DIGEST}\"\n"
+        ))
+        .unwrap_err();
+        assert!(format!("{err}").contains("source.tarball"), "{err}");
+        assert!(
+            format!("{err}").contains("would read as an option"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1400,7 +1678,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{err}").contains("declares both packaging.git and packaging.path"),
+            format!("{err}").contains("declares packaging.git and packaging.path"),
             "{err}"
         );
     }

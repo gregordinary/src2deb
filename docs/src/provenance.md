@@ -83,12 +83,13 @@ names four things:
 - `role` — what part the input played in assembling the tree. The component's own
   source is `source`; a [packaging overlay](recipes.md#packaging-overlays) is
   `packaging`; a [patch series](recipes.md#patches) is `patches`.
-- `kind` — what sort of input it is. A git checkout is `git`; a source tree on
-  disk is `path`; a patch series is `patches`; a packaging directory on disk is
-  `tree`.
+- `kind` — what sort of input it is. A git checkout is `git`; a fetched release
+  archive is `sha256`; a source tree on disk is `path`; a patch series is
+  `patches`; a packaging directory on disk is `tree`.
 - `value` — what identifies it. For `git`, the exact `HEAD` the tree was checked
   out at, so a branch or default-branch ref is recorded as the concrete revision
-  it resolved to, not the moving ref that named it. For `path`, the canonical
+  it resolved to, not the moving ref that named it. For `sha256`, the digest the
+  archive was verified against before it was unpacked. For `path`, the canonical
   directory the tree was read from, so the record names one path however the
   recipe reached it. For `patches`, a SHA-256 over the series' members in the
   order they were applied. For `tree`, a SHA-256 over the contents of the
@@ -104,6 +105,12 @@ it held; a component's own source is an arbitrarily large tree the build writes
 into, so the record names where it was read from and says plainly that it pins
 nothing. The recipe stays the authority for *where* either was; the manifest is
 the authority for *what* the first held.
+
+`sha256` and `tree` are both digests and differ in where the digest came from.
+A `sha256` is one the recipe declared and src2deb verified against an archive it
+fetched, so the record names something that can be fetched again and checked; a
+`tree` is one src2deb measured off a directory the recipe pointed at. Both pin
+content, and only the first pins something a third party can obtain.
 
 A build from a tree on disk therefore records:
 

@@ -48,6 +48,7 @@ pub mod provision;
 pub mod recipe;
 mod schedule;
 pub mod source;
+mod tarball;
 pub mod toolchain;
 pub mod version;
 

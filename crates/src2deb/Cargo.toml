@@ -14,5 +14,10 @@ serde.workspace = true
 sha2.workspace = true
 toml.workspace = true
 
+[dev-dependencies]
+# The integration tests build release archives and declare the digests that pin
+# them, which means measuring one the way a recipe author would.
+sha2.workspace = true
+
 [lints]
 workspace = true

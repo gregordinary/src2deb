@@ -9,6 +9,9 @@
 - `git-lfs`, for components whose repositories keep assets in Git LFS. A build
   that needs it and cannot find it stops during resolve, so a package is never
   built against pointer stubs.
+- `curl`, for components built from a `source.tarball` release archive. Needed
+  only to fetch one that is not already cached, so a work directory that has the
+  archive builds without it.
 - A Rust toolchain, to build src2deb itself.
 
 That is the whole host requirement: src2deb provisions each build root itself,

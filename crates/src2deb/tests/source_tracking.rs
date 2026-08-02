@@ -1856,3 +1856,336 @@ fn a_declared_version_serves_a_component_packaged_from_a_second_repository() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Whether `curl` can be launched at all; the archive tests no-op when it
+/// cannot, as the git ones do without `git`.
+fn curl_available() -> bool {
+    Command::new("curl")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Writes an uncompressed ustar archive at `path` holding `entries`, each a
+/// path within the archive and its contents; a path ending in `/` is a
+/// directory.
+///
+/// Written here rather than shelled out to `tar`, so the tests need no archiver
+/// on the host and the bytes they exercise are fixed rather than whatever the
+/// local `tar` happens to emit.
+fn write_tar(path: &Path, entries: &[(&str, &str)]) {
+    /// Copies `text` into `header` at `offset`, leaving the rest of the field
+    /// as the NUL padding a ustar field takes.
+    fn put(header: &mut [u8; 512], offset: usize, text: &str) {
+        header[offset..offset + text.len()].copy_from_slice(text.as_bytes());
+    }
+
+    let mut archive = Vec::new();
+    for (name, contents) in entries {
+        let directory = name.ends_with('/');
+        let size = if directory { 0 } else { contents.len() };
+        let mut header = [0u8; 512];
+        put(&mut header, 0, name);
+        put(
+            &mut header,
+            100,
+            &format!("{:07o}", if directory { 0o755 } else { 0o644 }),
+        );
+        put(&mut header, 108, "0000000");
+        put(&mut header, 116, "0000000");
+        put(&mut header, 124, &format!("{size:011o}"));
+        put(&mut header, 136, "00000000000");
+        // The checksum field counts as spaces while the checksum is summed.
+        header[148..156].fill(b' ');
+        header[156] = if directory { b'5' } else { b'0' };
+        put(&mut header, 257, "ustar\0");
+        put(&mut header, 263, "00");
+        let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        put(&mut header, 148, &format!("{sum:06o}\0"));
+
+        archive.extend_from_slice(&header);
+        if !directory {
+            archive.extend_from_slice(contents.as_bytes());
+            archive.resize(archive.len().div_ceil(512) * 512, 0);
+        }
+    }
+    // Two zero blocks end an archive.
+    archive.resize(archive.len() + 1024, 0);
+    std::fs::write(path, archive).unwrap();
+}
+
+/// The SHA-256 of a file, as a recipe author reads one off a release.
+fn digest(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(std::fs::read(path).unwrap());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A release archive laid out the way one is: everything under a single
+/// directory named for the release, and no `debian/` of its own.
+fn write_release(path: &Path) {
+    write_tar(
+        path,
+        &[
+            ("pkg-1.2.3/", ""),
+            ("pkg-1.2.3/marker", "from the archive\n"),
+            ("pkg-1.2.3/src/", ""),
+            ("pkg-1.2.3/src/main.c", "int main(void) { return 0; }\n"),
+        ],
+    );
+}
+
+/// A component built from the archive at `path`, pinned by `sha256`.
+fn archive_component(name: &str, path: &Path, sha256: &str) -> Component {
+    Component {
+        name: name.to_string(),
+        source: Source {
+            tarball: Some(format!("file://{}", path.display())),
+            sha256: Some(sha256.to_string()),
+            ..Source::default()
+        },
+        ..Component::default()
+    }
+}
+
+#[test]
+fn an_archive_source_unpacks_and_is_pinned_by_its_digest() {
+    if !curl_available() {
+        return;
+    }
+    let root = scratch("archive");
+    let archive = root.join("pkg-1.2.3.tar");
+    write_release(&archive);
+    let sha256 = digest(&archive);
+
+    // The archive ships no `debian/`, which is the ordinary shape of a release
+    // tarball, so its packaging comes from beside the recipe.
+    let packaging = root.join("packaging");
+    write_packaging(&packaging, "from packaging");
+    let comp = overlaid_from_path(archive_component("pkg", &archive, &sha256), &packaging);
+    let resolved = resolver_in(&root, &root).resolve(&comp).expect("resolve");
+
+    // The tree is the archive's own root directory, so the release version does
+    // not have to be written into the recipe a second time as a `subdir`.
+    assert_eq!(resolved.tree, root.join("sources/pkg/pkg-1.2.3"));
+    assert_eq!(resolved_marker(&resolved.tree), "from the archive\n");
+    assert!(resolved.tree.join("src/main.c").is_file());
+    assert_eq!(packaging_marker(&resolved.tree), "from packaging");
+
+    // The digest pins the archive, so a build from one is as comparable as a
+    // build from a revision.
+    let source = &resolved.source.inputs()[0];
+    assert_eq!(source.kind(), src2deb::SourceKind::Sha256);
+    assert_eq!(source.role(), SourceRole::Source);
+    assert_eq!(source.value(), sha256);
+    assert!(resolved.source.is_pinned());
+    assert_eq!(
+        resolved.source.short(),
+        format!(
+            "{}.{}",
+            &sha256[..7],
+            &resolved.source.inputs()[1].value()[..7]
+        ),
+    );
+
+    // It was cached under its digest, so a second component naming it fetches
+    // nothing.
+    assert!(root.join("tarballs").join(&sha256).is_file());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_archive_that_does_not_hash_to_what_was_declared_is_never_unpacked() {
+    if !curl_available() {
+        return;
+    }
+    let root = scratch("archive-mismatch");
+    let archive = root.join("pkg-1.2.3.tar");
+    write_release(&archive);
+
+    let comp = archive_component("pkg", &archive, &"0".repeat(64));
+    let err = resolver_in(&root, &root)
+        .resolve(&comp)
+        .expect_err("an archive that is not the declared one is not a source")
+        .to_string();
+    assert!(err.contains("Nothing was unpacked"), "{err}");
+    assert!(
+        !root.join("sources/pkg").exists(),
+        "the archive was unpacked before its digest was checked",
+    );
+    // ...and nothing was left in the cache under a name it does not hash to.
+    assert!(!root.join("tarballs").join("0".repeat(64)).exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_archive_that_cannot_be_fetched_fails_the_component() {
+    if !curl_available() {
+        return;
+    }
+    let root = scratch("archive-missing");
+    let comp = archive_component("pkg", &root.join("absent.tar"), &"0".repeat(64));
+    let err = resolver_in(&root, &root)
+        .resolve(&comp)
+        .expect_err("an archive that is not there is not a source")
+        .to_string();
+    assert!(err.contains("failed"), "{err}");
+    assert!(!root.join("sources/pkg").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_cached_archive_is_reused_and_re_verified() {
+    if !curl_available() {
+        return;
+    }
+    let root = scratch("archive-cache");
+    let archive = root.join("pkg-1.2.3.tar");
+    write_release(&archive);
+    let sha256 = digest(&archive);
+    let packaging = root.join("packaging");
+    write_packaging(&packaging, "from packaging");
+    let comp = overlaid_from_path(archive_component("pkg", &archive, &sha256), &packaging);
+
+    let resolver = resolver_in(&root, &root);
+    resolver.resolve(&comp).expect("first resolve");
+
+    // The URL stops serving, and the run carries on from the cache: an archive
+    // is identified by its digest, so what is already there is what was asked
+    // for.
+    std::fs::remove_file(&archive).unwrap();
+    let again = resolver.resolve(&comp).expect("resolve from the cache");
+    assert_eq!(resolved_marker(&again.tree), "from the archive\n");
+
+    // ...but a cached archive that no longer hashes to its own name is not
+    // trusted for having once been verified, and is cleared so a later run can
+    // fetch it again.
+    let cached = root.join("tarballs").join(&sha256);
+    std::fs::write(&cached, "not the archive it was").unwrap();
+    let err = resolver
+        .resolve(&comp)
+        .expect_err("a corrupted cache entry is not a source")
+        .to_string();
+    assert!(err.contains("Nothing was unpacked"), "{err}");
+    assert!(
+        !cached.exists(),
+        "the corrupted archive was left in the cache"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_archive_is_unpacked_afresh_each_run() {
+    if !curl_available() {
+        return;
+    }
+    // What a patch series depends on: a patch applied twice over one tree does
+    // not apply. A git source gets this from `git checkout --force` and a path
+    // source from its fresh copy.
+    let root = scratch("archive-afresh");
+    let archive = root.join("pkg-1.2.3.tar");
+    write_release(&archive);
+    let sha256 = digest(&archive);
+    let packaging = root.join("packaging");
+    write_packaging(&packaging, "from packaging");
+    let comp = overlaid_from_path(archive_component("pkg", &archive, &sha256), &packaging);
+
+    let resolver = resolver_in(&root, &root);
+    let first = resolver.resolve(&comp).expect("first resolve");
+    std::fs::write(first.tree.join("vendor.tar"), "left by pass 1").unwrap();
+    std::fs::write(first.tree.join("marker"), "edited in place\n").unwrap();
+
+    let again = resolver.resolve(&comp).expect("second resolve");
+    assert_eq!(resolved_marker(&again.tree), "from the archive\n");
+    assert!(
+        !again.tree.join("vendor.tar").exists(),
+        "a prior run's output survived into a fresh unpack",
+    );
+    assert_eq!(again.source, first.source);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_subdir_descends_within_an_archives_own_root() {
+    if !curl_available() {
+        return;
+    }
+    // The two compose: the archive's root directory is found, and `subdir`
+    // names a component within it — a member of a release that ships several.
+    let root = scratch("archive-subdir");
+    let archive = root.join("suite-1.0.tar");
+    write_tar(
+        &archive,
+        &[
+            ("suite-1.0/", ""),
+            ("suite-1.0/members/", ""),
+            ("suite-1.0/members/pkg/", ""),
+            ("suite-1.0/members/pkg/marker", "the member\n"),
+        ],
+    );
+    let sha256 = digest(&archive);
+    let packaging = root.join("packaging");
+    write_packaging(&packaging, "from packaging");
+
+    let mut comp = overlaid_from_path(archive_component("pkg", &archive, &sha256), &packaging);
+    comp.source.subdir = Some(PathBuf::from("members/pkg"));
+    let resolved = resolver_in(&root, &root).resolve(&comp).expect("resolve");
+
+    assert_eq!(
+        resolved.tree,
+        root.join("sources/pkg/suite-1.0/members/pkg")
+    );
+    assert_eq!(resolved_marker(&resolved.tree), "the member\n");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_packaging_overlay_may_come_from_an_archive() {
+    if !curl_available() {
+        return;
+    }
+    // A distribution publishes its packaging as a `.debian.tar.xz` beside the
+    // orig tarball, so an overlay takes the same origins a source does.
+    let root = scratch("archive-packaging");
+    let upstream = root.join("working-tree");
+    write_bare_tree(&upstream, "v1");
+    let archive = root.join("pkg.debian.tar");
+    write_tar(
+        &archive,
+        &[
+            ("debian/", ""),
+            ("debian/control", CONTROL),
+            ("debian/marker", "from an archive\n"),
+        ],
+    );
+    let sha256 = digest(&archive);
+
+    let mut comp = path_component("pkg", &upstream);
+    comp.packaging = Some(Source {
+        tarball: Some(format!("file://{}", archive.display())),
+        sha256: Some(sha256.clone()),
+        ..Source::default()
+    });
+    let resolved = resolver_in(&root, &root).resolve(&comp).expect("resolve");
+
+    assert_eq!(packaging_marker(&resolved.tree), "from an archive");
+    let overlay = &resolved.source.inputs()[1];
+    assert_eq!(overlay.role(), SourceRole::Packaging);
+    assert_eq!(overlay.kind(), src2deb::SourceKind::Sha256);
+    assert_eq!(overlay.value(), sha256);
+
+    let _ = std::fs::remove_dir_all(&root);
+}

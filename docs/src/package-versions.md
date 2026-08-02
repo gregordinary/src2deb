@@ -71,6 +71,11 @@ besides reads:
 The source's revision is always first, which is what makes the leading
 abbreviation mean the same thing on every package src2deb builds.
 
+A component built from a [release archive](recipes.md#building-from-a-release-archive)
+carries the first seven characters of the digest it was verified against, in the
+place a commit would sit. It abbreviates the same way for the same reason: it
+pins exactly what the build consumed.
+
 ### A local build says so
 
 A component built from a `source.path` tree has no revision to abbreviate — a

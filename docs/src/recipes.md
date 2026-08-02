@@ -160,7 +160,8 @@ Each `[[components]]` entry is one buildable component: a source tree with a
 
 - `name` — the component name, unique within the recipe.
 - `source` — where the component's source comes from. A component names exactly
-  one origin, `source.git` or `source.path`; naming both, or neither, is refused.
+  one origin: `source.git`, `source.path`, or `source.tarball`. Naming more than
+  one, or none, is refused.
   - `source.git` — the git repository URL to clone.
   - `source.git-ref` — the branch, tag, or commit to check out. Defaults to the
     remote's default branch. It qualifies `source.git`, and setting it on a path
@@ -181,9 +182,24 @@ Each `[[components]]` entry is one buildable component: a source tree with a
     such in their version and in the manifest, and `--skip-published` never
     skips one. See [Building from a tree on
     disk](sources-and-toolchain.md#building-from-a-tree-on-disk).
+  - `source.tarball` — a release archive to fetch and unpack, over `https`,
+    `http`, or `file`.
+
+    ```toml
+    [[components]]
+    name = "foo"
+    source.tarball = "https://example.org/releases/foo-1.2.3.tar.xz"
+    source.sha256 = "5f2e1a9c3b8d..."
+    ```
+
+    See [Building from a release archive](#building-from-a-release-archive)
+    below.
+  - `source.sha256` — the SHA-256 the archive must hash to, in hexadecimal of
+    either case. Required for `source.tarball`, and setting it on any other
+    origin is refused rather than ignored.
   - `source.subdir` — a subdirectory within the source that holds the `debian/`
     tree, for a component that lives inside a larger superproject. The whole
-    source is the tree when unset. It applies to either origin, and must stay
+    source is the tree when unset. It applies to every origin, and must stay
     inside the source: a `..` component or an absolute path is refused, since the
     tree it names is what the vendor pass binds into a cage that runs upstream's
     own `debian/rules clean`.
@@ -191,7 +207,8 @@ Each `[[components]]` entry is one buildable component: a source tree with a
   source that carries none of its own. Optional; see [Packaging
   overlays](#packaging-overlays) below. It takes the same settings `source`
   does — `packaging.git`, `packaging.git-ref`, `packaging.path`,
-  `packaging.subdir` — under the same rules.
+  `packaging.tarball`, `packaging.sha256`, `packaging.subdir` — under the same
+  rules.
 - `patches` — patch files applied over the resolved source tree, in the order
   given. Optional; see [Patches](#patches) below.
 - `version` — the upstream version to build the component as, for packaging that
@@ -361,6 +378,72 @@ overlay supplied. That is deliberately the only way to do it: a second overlay
 winning per file would let the packaging you layered over drift out from under
 you with no signal at all, while a patch that no longer applies fails the
 component and names itself.
+
+## Building from a release archive
+
+Most projects that are not Rust ones publish a release tarball rather than
+expecting you to build from a tag, and an upstream tarball beside a separate
+`debian/` directory is the native Debian model. Name the archive and the digest
+it must hash to:
+
+```toml
+[[components]]
+name = "foo"
+source.tarball = "https://example.org/releases/foo-1.2.3.tar.xz"
+source.sha256 = "5f2e1a9c3b8d4e7a2f9016c5b3d8e4a71f0c9d2b6e5a8347c1b0f9e2d6a4c8b13"
+packaging.path = "packaging/foo"
+version = "1.2.3"
+```
+
+`https`, `http`, and `file` URLs are all fetched, so a local mirror works as well
+as a release page. The archive may be uncompressed or compressed with gzip, xz,
+or zstd, read from its content rather than from the URL.
+
+A release archive ships no `debian/`, so it needs [packaging from
+elsewhere](#packaging-overlays) and a [declared
+version](#components-with-no-changelog). Both are shown above.
+
+### The digest is what makes it a source
+
+`source.sha256` is required, and the archive is verified against it before
+anything is unpacked — on every run, not only the first. Nothing about the
+transport is trusted: a hostile mirror, a broken proxy, and a truncated download
+all produce something that does not hash to what you declared, and the component
+fails rather than building it.
+
+That is what makes an archive as good an input as a revision. What a URL serves
+can change; what it hashes to cannot.
+
+```text
+pkg: the archive fetched from https://example.org/releases/foo-1.2.3.tar.xz
+hashes to 91af22c..., and the recipe declares sha256 = "5f2e1a9...". Nothing
+was unpacked.
+```
+
+A mismatch is worth reading twice. If the archive is the one you meant, correct
+the recipe. If it is not, you have found a mirror serving something other than
+what it did when the digest was written down.
+
+### The release directory is found for you
+
+A release archive conventionally puts everything under one directory named for
+the release — `foo-1.2.3/` — and src2deb descends into it, so the version does
+not go into the recipe twice. An archive laid out any other way is taken as it
+stands, and `source.subdir` applies within whichever you get.
+
+The one directory never treated as a wrapper is `debian/`: a distribution
+publishes its packaging as an archive holding exactly that, and there the single
+directory is what is being supplied rather than something wrapped around it.
+
+### Fetched once, kept by digest
+
+Archives are cached under `<work>/tarballs/`, named by their digests. Two
+components naming one archive fetch it once, a recipe that changes a digest names
+a different file rather than a stale one, and a host with no network — or no
+`curl` — still builds from what is already there.
+
+The unpacked tree, by contrast, is replaced on every run, so each build sees the
+archive as it stands rather than the leavings of the run before.
 
 ## Components with no changelog
 

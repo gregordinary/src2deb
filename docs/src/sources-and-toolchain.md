@@ -15,9 +15,10 @@ than by layering a preferences engine on top.
 
 ## Component sources
 
-Each component names one source: a git repository to clone, or a tree already on
-disk. What gets built is assembled from that source, then any packaging overlay,
-then any patch series — in that order, before anything reads the tree.
+Each component names one source: a git repository to clone, a tree already on
+disk, or a release archive to fetch. What gets built is assembled from that
+source, then any packaging overlay, then any patch series — in that order,
+before anything reads the tree.
 
 A **git source** is cloned into the work directory on first use and fetched on
 later use, then checked out detached at the requested ref. A branch or an unset
@@ -29,6 +30,10 @@ never the moving ref that named it.
 A **path source** is a tree already on disk, built without being cloned. It is
 the difference between "edit, commit, push, run" and "run" while working on a
 packaging tree.
+
+An **archive source** is a release tarball, fetched and unpacked. It is how most
+projects that are not Rust ones publish, and an upstream tarball beside a
+separate `debian/` is the native Debian model.
 
 ### Building from a tree on disk
 
@@ -63,6 +68,30 @@ If the tree is a git checkout holding unmaterialized Git LFS pointers, the
 component fails rather than building a package around the stubs, and the error
 names the tree to run `git lfs pull` in. src2deb does not fetch on your behalf
 here: the tree is yours.
+
+### Building from a release archive
+
+An archive source names a URL and the SHA-256 the archive must hash to. `https`,
+`http`, and `file` URLs are fetched with `curl`, and the archive may be
+uncompressed or compressed with gzip, xz, or zstd — read from its content rather
+than from the URL.
+
+The digest is the whole of the trust: the archive is verified against it before
+anything is unpacked, on every run and not only the first, so a hostile mirror, a
+broken proxy, and a truncated download each fail the component rather than
+building something no one asked for. Nothing about the transport carries any part
+of that claim, which is what makes `curl` an acceptable answer to fetching over
+TLS rather than a compromise.
+
+Archives are cached under the work directory, named by the digest that pins them,
+so two components naming one archive fetch it once and a re-run fetches nothing —
+a host with no network, or no `curl`, still builds from what is there. The
+unpacked tree, by contrast, is replaced on every run, so each build sees the
+archive as it stands.
+
+A release archive ships no `debian/` of its own, so it needs packaging from
+elsewhere and a declared version. See [Building from a release
+archive](recipes.md#building-from-a-release-archive).
 
 ### Packaging from somewhere else
 

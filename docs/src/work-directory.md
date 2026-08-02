@@ -11,6 +11,7 @@ work/
 ├── manifests/                 provenance, per recipe, suite, and architecture
 ├── sources/                   each component's resolved source tree
 ├── packaging/                 packaging overlays cloned from a repository
+├── tarballs/                  fetched release archives, named by digest
 ├── cache/                     downloaded .debs, shared by every build root
 ├── base/, base.plan, base.lock   the shared base build root
 ├── uppers/                    per-component overlay layers, during a build
@@ -25,8 +26,9 @@ work/
 | `out/` | Each component's `.deb`, `.changes`, and `.buildinfo` | Yes | The artifacts themselves. The same packages remain in `pool/` |
 | `pool/` | The `dists/`-structured archive later builds resolve against | Yes | Every package built so far. A selective re-run can no longer resolve against them, and a signed pool loses its signature |
 | `manifests/` | One TOML record per recipe, suite, and architecture | Yes | The run's provenance, and the state `--skip-published` reads. The next run rebuilds everything |
-| `sources/` | One tree per component: a git checkout with submodules and LFS content, or a copy of a `source.path` tree | Yes | A full re-clone of every git component on the next run. A path component is re-copied either way |
-| `packaging/` | One checkout per component that takes its `debian/` from a `packaging.git` repository. A `packaging.path` overlay is read where it lies and appears here not at all | Yes | A re-clone of each on the next run |
+| `sources/` | One tree per component: a git checkout with submodules and LFS content, a copy of a `source.path` tree, or an unpacked `source.tarball` archive | Yes | A full re-clone of every git component on the next run. A path or archive component is re-copied or re-unpacked either way |
+| `packaging/` | One tree per component that takes its `debian/` from a `packaging.git` repository or a `packaging.tarball` archive. A `packaging.path` overlay is read where it lies and appears here not at all | Yes | A re-clone or re-unpack of each on the next run |
+| `tarballs/` | Fetched release archives, each named by the SHA-256 it was verified against and shared by every component that declares it | Yes | A re-fetch of every archive the next run resolves, which needs `curl` and the network |
 | `cache/` | Downloaded `.deb` files, keyed by content and shared across roots | Yes | A re-download of every package the next provision installs |
 | `base/` | The shared base build root, with `base.plan` recording the package set it was provisioned from and `base.lock` guarding its preparation | Yes, all three together | One base bootstrap — several hundred packages — on the next run |
 | `uppers/` | A component's overlay layer, and its overlay work directory, while it builds | Between runs | Nothing. A layer is staged fresh for every build, and the next run clears whatever a killed one left |
