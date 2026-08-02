@@ -1081,7 +1081,7 @@ impl Engine {
         let pool = LocalPool::new(
             crate::pool::pool_dir(&self.work_dir, &recipe.suite, &recipe.architecture),
             recipe.suite.clone(),
-            "main",
+            crate::pool::POOL_COMPONENT,
             recipe.architecture.clone(),
         );
 
@@ -1398,6 +1398,27 @@ impl Engine {
     ) -> Result<crate::export::ExportReport> {
         let _lock = self.lock_work_dir()?;
         crate::export::export(&self.work_dir, recipe, options)
+    }
+
+    /// Removes superseded packages from the pools the recipe's suite holds,
+    /// keeping the newest [`keep`](crate::pool::PruneOptions::keep) versions of
+    /// each binary package.
+    ///
+    /// Scoped to a suite rather than to a recipe: a pool is one archive, and
+    /// every recipe built into a work directory for that suite and architecture
+    /// publishes into it. The recipe names the suite and, through
+    /// [`PruneOptions`](crate::pool::PruneOptions), narrows the architectures.
+    ///
+    /// Takes the work-directory lock. Pruning removes files a client that read
+    /// an earlier `Release` may still be fetching, so it must not run while a
+    /// build is publishing into the same pool.
+    pub fn prune(
+        &self,
+        recipe: &Recipe,
+        options: &crate::pool::PruneOptions,
+    ) -> Result<crate::pool::PruneReport> {
+        let _lock = self.lock_work_dir()?;
+        crate::pool::prune(&self.work_dir, &recipe.suite, options)
     }
 
     /// Resolves every component's source, reads its `debian/control`, and

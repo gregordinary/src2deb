@@ -1,13 +1,15 @@
 # Command line
 
-Three subcommands: `build` runs a recipe, `plan` resolves and orders one without
-building, and `export` copies what a work directory holds out for an archive.
-All three take a recipe directory and the same target options.
+Four subcommands: `build` runs a recipe, `plan` resolves and orders one without
+building, `export` copies what a work directory holds out for an archive, and
+`prune` removes what the pool no longer serves. All four take a recipe directory
+and the same target options.
 
 ```sh
 src2deb build  RECIPE_DIR [options]
 src2deb plan   RECIPE_DIR [options]
 src2deb export RECIPE_DIR --to DIR [options]
+src2deb prune  RECIPE_DIR [options]
 ```
 
 `RECIPE_DIR` is a directory containing a `recipe.toml`. Exactly one is required,
@@ -25,13 +27,14 @@ it builds against.
 | --- | --- | --- |
 | `--work DIR` | all | The working directory for sources, build roots, the package cache, the pool, and output. Defaults to `./work` |
 | `--suite SUITE` | all | Build for a Debian suite such as `trixie` or `forky`, superseding the recipe's `suite` and the `version-tag` that described it |
-| `--architecture ARCH` | all | Build for a Debian architecture such as `amd64` or `arm64`. A recipe naming none builds for the host. For `export` it narrows what is read rather than retargeting anything |
-| `--arch-indep-owner ARCH` | all | Leave the recipe's `Architecture: all` packages to `ARCH`. Unset, every run produces its own |
+| `--architecture ARCH` | all | Build for a Debian architecture such as `amd64` or `arm64`. A recipe naming none builds for the host. For `export` and `prune` it narrows what is read rather than retargeting anything |
+| `--arch-indep-owner ARCH` | `build`, `plan`, `export` | Leave the recipe's `Architecture: all` packages to `ARCH`. Unset, every run produces its own |
 | `--version-tag TAG` | `build`, `plan` | Stamp built versions with `TAG`, such as `deb13`, overriding both the recipe's `version-tag` and the tag derived from the suite |
 
-`--version-tag` is not accepted where it would do nothing: an `export` carries
-packages a run already stamped, so it has no version to tag. Naming it there is
-a usage error rather than a silently ignored flag.
+The last two are not accepted where they would do nothing: an `export` carries
+packages a run already stamped and a `prune` reads a pool, so neither has a
+version to tag, and a prune has no arch-indep output to hand anywhere. Naming
+one there is a usage error rather than a silently ignored flag.
 
 Every value is validated as it is parsed, so a malformed one is a usage error
 against the flag rather than a failure partway into the run. Each suite and
@@ -50,6 +53,7 @@ several targets share one `--work` directory. See
 | `--from C` | Build component `C` and every component after it in the build order |
 | `--skip-published` | Skip a component whose source resolves to what a prior run recorded as built, at the same declared version. A source that is not pinned to exact content is always rebuilt |
 | `--build-date DATE` | Stamp every version with `DATE` (`YYYY-MM-DD`) instead of today, and hand the build the same `SOURCE_DATE_EPOCH`. `--build-date manifest` takes the date the prior run recorded |
+| `--keep N` | Prune the run's pool to the newest `N` versions of each binary package once the run has finished. Unset, nothing is pruned |
 
 `--only` and `--from` are mutually exclusive, and `--jobs` takes an integer of 1
 or more.
@@ -91,6 +95,17 @@ An export carries every component the work directory records as **built**, not
 only what the last run produced, and replaces whatever the export before it left
 in the same directory. See [Publishing to an archive](publishing.md).
 
+## Prune options
+
+| Option | Effect |
+| --- | --- |
+| `--keep N` | Keep the newest `N` versions of each binary package. Defaults to `1`, the version the pool's index names |
+| `--dry-run` | Report what would be removed without removing it |
+| `--architecture ARCH` | Prune only `ARCH`'s pool. By default every pool the suite holds is pruned |
+
+Pruning covers the pool for a suite, which is shared by every recipe built into
+the work directory for it. See [Pruning the pool](using-the-pool.md#pruning-the-pool).
+
 ## Verbosity
 
 | Option | Prints |
@@ -130,7 +145,7 @@ spaces. Under `--jobs N` each line also carries its component's name. See
 
 | Status | Meaning |
 | --- | --- |
-| `0` | Every selected component built, or was skipped as already built; or an export finished |
+| `0` | Every selected component built, or was skipped as already built; or an export or prune finished |
 | `1` | A component failed, or the run stopped before the build phase |
 | `2` | A usage error: an unknown option, a malformed value, a missing `--to`, or a selection naming a component the recipe does not have |
 | `130` | The run was cancelled with Ctrl-C or `SIGTERM` |

@@ -24,7 +24,7 @@ work/
 | Entry | Holds | Safe to delete | Cost of deleting it |
 | --- | --- | --- | --- |
 | `out/` | Each component's `.deb`, `.changes`, and `.buildinfo` | Yes | The artifacts themselves. The same packages remain in `pool/` |
-| `pool/` | The `dists/`-structured archive later builds resolve against | Yes | Every package built so far. A selective re-run can no longer resolve against them, and a signed pool loses its signature |
+| `pool/` | The `dists/`-structured archive later builds resolve against | Yes | Every package built so far. A selective re-run can no longer resolve against them, and a signed pool loses its signature. To reclaim only what it no longer serves, [prune](using-the-pool.md#pruning-the-pool) it instead |
 | `manifests/` | One TOML record per recipe, suite, and architecture | Yes | The run's provenance, and the state `--skip-published` reads. The next run rebuilds everything |
 | `sources/` | One tree per component: a git checkout with submodules and LFS content, a copy of a `source.path` tree, or an unpacked `source.tarball` archive | Yes | A full re-clone of every git component on the next run. A path or archive component is re-copied or re-unpacked either way |
 | `packaging/` | One tree per component that takes its `debian/` from a `packaging.git` repository or a `packaging.tarball` archive. A `packaging.path` overlay is read where it lies and appears here not at all | Yes | A re-clone or re-unpack of each on the next run |
@@ -55,12 +55,14 @@ The outputs are the small part. On a recipe of two trivial packages:
 installed from, and they are near enough constant: they are sized by the suite,
 not by the recipe. What grows with the recipe is `sources/` — one tree per
 component, including vendored Rust crates left in the tree between runs — and
-`pool/`, which [grows without
-bound](how-a-build-runs.md#the-pool-directory-grows-without-bound) as every run
-adds a fresh set of `.deb` files and removes none.
+`pool/`, which [grows until it is
+pruned](how-a-build-runs.md#the-pool-directory-grows-until-it-is-pruned) as
+every run adds a fresh set of `.deb` files and removes none.
 
 Budget for the base and the cache once per work directory, and watch `sources/`
-and `pool/` over time.
+over time. For `pool/`, run
+[`src2deb prune`](using-the-pool.md#pruning-the-pool), or pass `--keep N` to the
+build that fills it.
 
 ## What a re-run reuses
 

@@ -63,4 +63,5 @@ pub use error::{Error, Result};
 pub use export::{ExportOptions, ExportReport};
 pub use fingerprint::{Fingerprint, SourceInput, SourceKind, SourceRole};
 pub use manifest::Manifest;
+pub use pool::{PruneOptions, PruneReport};
 pub use recipe::{Component, Origin, Recipe, Source, VersionFrom, VersionSource};

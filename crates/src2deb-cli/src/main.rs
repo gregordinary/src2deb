@@ -33,6 +33,8 @@ Usage:
                            [--build-deps]
   src2deb export RECIPE_DIR --to DIR [--work DIR] [--suite SUITE]
                            [--architecture ARCH] [--arch-indep-owner ARCH]
+  src2deb prune RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]
+                           [--keep N] [--dry-run]
 
 Arguments:
   RECIPE_DIR            A directory containing a recipe.toml
@@ -58,6 +60,9 @@ Build options:
                        two runs from the same sources produce the same versions.
                        Pass \"manifest\" to take the date the prior run recorded,
                        which reproduces that build without transcribing it
+  --keep N             Prune the pool to the newest N versions of each binary
+                       package once the run has finished. Unset, nothing is
+                       pruned and the pool keeps every version it has ever held
 
   Both --only and --from narrow a run to part of its recipe, so whatever the
   components they select build-depend on has to come from the archive or from
@@ -85,6 +90,20 @@ Export options:
   only what the last run produced, and replaces whatever the export before it
   left in the same directory. Several recipes may export into one directory;
   each replaces only its own files.
+
+Prune options:
+  --keep N             Keep the newest N versions of each binary package
+                       (default: 1, which is the version the pool's index
+                       names)
+  --dry-run            Report what would be removed without removing it
+  --architecture ARCH  Prune only ARCH's pool. By default every pool the suite
+                       holds is pruned
+
+  A pool's index names one version of each package, so every version below the
+  newest is already unreachable through apt; pruning removes those files. A
+  file the index names is never removed, and no index is rewritten. The pool is
+  shared by every recipe built into the work directory for that suite and
+  architecture, so pruning covers all of them.
 
 Common options:
   --suite SUITE        Build for SUITE, a Debian suite name such as trixie or
@@ -176,6 +195,8 @@ enum Command {
     Plan(PlanArgs),
     /// Copy a recipe's built packages out for an archive.
     Export(ExportArgs),
+    /// Remove superseded packages from the pool.
+    Prune(PruneArgs),
 }
 
 /// How much a run prints.
@@ -217,6 +238,9 @@ struct BuildArgs {
     skip_published: bool,
     /// The date to stamp every version with.
     build_date: src2deb::BuildDate,
+    /// How many versions of each binary package to leave in the pool once the
+    /// run has finished, or `None` to leave the pool alone.
+    keep: Option<usize>,
     /// How much to print.
     verbosity: Verbosity,
 }
@@ -290,11 +314,12 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
 
     let (command, rest) = args
         .split_first()
-        .ok_or_else(|| "a subcommand is required: build, plan, export".to_string())?;
+        .ok_or_else(|| "a subcommand is required: build, plan, export, prune".to_string())?;
     let command = match command.as_str() {
         "build" => Command::Build(parse_build(rest)?),
         "plan" => Command::Plan(parse_plan(rest)?),
         "export" => Command::Export(parse_export(rest)?),
+        "prune" => Command::Prune(parse_prune(rest)?),
         other => return Err(format!("unknown subcommand {other}")),
     };
     Ok(Cli { command })
@@ -304,11 +329,12 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
 /// accepted.
 ///
 /// `--work`, `--suite`, and `--architecture` mean something to every
-/// subcommand; the others need not. An `export` carries packages a run already
-/// stamped, so it has no version to tag. Accepting a flag that would then do
-/// nothing is the shape this project refuses everywhere else, so it is refused
-/// here too: the flag is not a flag of that subcommand, and naming it is a
-/// usage error.
+/// subcommand; the other two do not. An `export` takes packages a run already
+/// stamped and a `prune` reads a pool, so neither has a version to tag — and a
+/// prune has no `Architecture: all` output to hand anywhere. Accepting a flag
+/// that would then do nothing is the shape this project refuses everywhere
+/// else, so it is refused here too: the flag is not a flag of that subcommand,
+/// and naming it is a usage error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Retargets {
     /// Whether `--arch-indep-owner ARCH` is accepted.
@@ -454,6 +480,7 @@ fn parse_build(rest: &[String]) -> Result<BuildArgs, String> {
     let mut from: Option<String> = None;
     let mut skip_published = false;
     let mut build_date: Option<src2deb::BuildDate> = None;
+    let mut keep: Option<usize> = None;
     let common = common_args(rest, Retargets::BUILD, |flag, iter| match flag {
         "--keep-going" => {
             keep_going = true;
@@ -491,6 +518,10 @@ fn parse_build(rest: &[String]) -> Result<BuildArgs, String> {
             skip_published = true;
             Ok(true)
         }
+        "--keep" => {
+            keep = Some(parse_keep(iter)?);
+            Ok(true)
+        }
         "--build-date" => {
             let value = iter
                 .next()
@@ -518,6 +549,7 @@ fn parse_build(rest: &[String]) -> Result<BuildArgs, String> {
         keep_going,
         jobs,
         build_date: build_date.unwrap_or_default(),
+        keep,
         selection,
         skip_published,
         verbosity: common.verbosity,
@@ -544,6 +576,71 @@ fn parse_plan(rest: &[String]) -> Result<PlanArgs, String> {
         show_build_deps,
         verbosity: common.verbosity,
     })
+}
+
+/// The arguments to the `prune` subcommand.
+#[derive(Debug, PartialEq, Eq)]
+struct PruneArgs {
+    /// The directory holding `recipe.toml`.
+    recipe_dir: PathBuf,
+    /// The working directory holding the pool to prune.
+    work: PathBuf,
+    /// The target suite, overriding the recipe's own when given.
+    suite: Option<String>,
+    /// The single architecture to prune, or `None` for every pool the suite
+    /// holds.
+    architecture: Option<String>,
+    /// How many versions of each binary package to keep.
+    keep: usize,
+    /// Report what would be removed without removing it.
+    dry_run: bool,
+    /// How much to print.
+    verbosity: Verbosity,
+}
+
+/// Parses the `prune` subcommand's arguments.
+fn parse_prune(rest: &[String]) -> Result<PruneArgs, String> {
+    let mut keep: Option<usize> = None;
+    let mut dry_run = false;
+    let common = common_args(rest, Retargets::READS, |flag, iter| match flag {
+        "--keep" => {
+            keep = Some(parse_keep(iter)?);
+            Ok(true)
+        }
+        "--dry-run" => {
+            dry_run = true;
+            Ok(true)
+        }
+        _ => Ok(false),
+    })?;
+    Ok(PruneArgs {
+        recipe_dir: common.recipe_dir,
+        work: common.work,
+        suite: common.suite,
+        architecture: common.architecture,
+        // One is the version the pool's index names, so the default leaves the
+        // pool on disk exactly matching the archive it serves.
+        keep: keep.unwrap_or(1),
+        dry_run,
+        verbosity: common.verbosity,
+    })
+}
+
+/// Parses a `--keep N` value: a positive integer.
+///
+/// Zero is refused here rather than inside the run: a pool kept at nothing is
+/// not a pool, and the flag is where that reads as a usage error.
+fn parse_keep(iter: &mut std::slice::Iter<'_, String>) -> Result<usize, String> {
+    let value = iter
+        .next()
+        .ok_or_else(|| "--keep requires a value".to_string())?;
+    let keep: usize = value
+        .parse()
+        .map_err(|_| format!("--keep value {value:?} is not a positive integer"))?;
+    if keep == 0 {
+        return Err("--keep must be at least 1".to_string());
+    }
+    Ok(keep)
 }
 
 /// Parses the `export` subcommand's arguments.
@@ -595,6 +692,7 @@ fn execute(args: &[String]) -> Result<ExitCode, Fault> {
         Command::Build(args) => build(args),
         Command::Plan(args) => plan(args),
         Command::Export(args) => export(args),
+        Command::Prune(args) => prune(args),
     }
 }
 
@@ -761,6 +859,21 @@ fn build(args: BuildArgs) -> Result<ExitCode, Fault> {
 
     let report = outcome?;
     print_summary(&report);
+    // Pruned once the run has finished rather than as each component publishes:
+    // a superseded package may still be being fetched by a build root
+    // provisioning against the pool, and by here nothing is. A cancelled run is
+    // left alone — it stopped where it was asked to, and reclaiming space is not
+    // what it was asked for.
+    if let Some(keep) = args.keep
+        && !report.cancelled
+    {
+        let options = src2deb::PruneOptions {
+            keep,
+            architectures: vec![recipe.architecture.clone()],
+            dry_run: false,
+        };
+        print_prune(&engine.prune(&recipe, &options)?, args.verbosity);
+    }
     Ok(ExitCode::from(exit_status(&report)))
 }
 
@@ -887,6 +1000,57 @@ fn human_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Runs the `prune` subcommand: removes the pool's superseded packages.
+///
+/// `--architecture` narrows which pools are visited rather than retargeting the
+/// recipe, so the recipe is loaded without it — the same shape `export` takes,
+/// and for the same reason.
+fn prune(args: PruneArgs) -> Result<ExitCode, Fault> {
+    let recipe = load_recipe(&args.recipe_dir, args.suite, None, None, None)?;
+    let options = src2deb::PruneOptions {
+        keep: args.keep,
+        architectures: args.architecture.into_iter().collect(),
+        dry_run: args.dry_run,
+    };
+    let engine = Engine::new(args.work);
+    print_prune(&engine.prune(&recipe, &options)?, args.verbosity);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Prints what pruning removed, a line per pool and then the total.
+///
+/// A dry run says "would remove" throughout, so a report cannot be mistaken for
+/// work that has happened.
+fn print_prune(report: &src2deb::PruneReport, verbosity: Verbosity) {
+    let verb = if report.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
+    if verbosity != Verbosity::Quiet {
+        for pool in &report.pools {
+            if verbosity == Verbosity::Verbose {
+                for file in &pool.removed {
+                    eprintln!("src2deb:   {} {} {}", verb, file.package, file.version);
+                }
+            }
+            eprintln!(
+                "src2deb: {}: {verb} {} file(s), {}, of {} package(s)",
+                pool.architecture,
+                pool.removed.len(),
+                human_bytes(pool.bytes),
+                pool.packages,
+            );
+        }
+    }
+    eprintln!(
+        "src2deb: {} pool(s) pruned: {verb} {} file(s), {}",
+        report.pools.len(),
+        report.removed(),
+        human_bytes(report.bytes()),
+    );
 }
 
 /// Which per-package phase of provisioning a counter is reporting.
@@ -1416,6 +1580,14 @@ mod tests {
         }
     }
 
+    /// Unwraps a parsed `prune` command's arguments.
+    fn prune_args(args: &[&str]) -> PruneArgs {
+        match parse(args).unwrap().command {
+            Command::Prune(prune) => prune,
+            other => panic!("expected a prune command, got {other:?}"),
+        }
+    }
+
     #[test]
     fn export_requires_a_destination_and_carries_every_architecture_by_default() {
         let args = export_args(&["export", "recipes/cosmic", "--to", "/srv/drop/rk1"]);
@@ -1451,10 +1623,17 @@ mod tests {
 
     #[test]
     fn a_target_option_a_subcommand_could_not_act_on_is_refused() {
-        // Rather than accepted and ignored: an export carries packages a run
-        // already stamped, so it has no version to tag.
-        let err = parse(&["export", "r", "--to", "d", "--version-tag", "deb13"]).unwrap_err();
-        assert!(err.contains("unrecognized option"), "{err}");
+        // Rather than accepted and ignored. An export takes packages a run
+        // already stamped and a prune reads a pool, so neither has a version to
+        // tag; a prune has no arch-indep output to hand anywhere either.
+        for command in [
+            vec!["export", "r", "--to", "d", "--version-tag", "deb13"],
+            vec!["prune", "r", "--version-tag", "deb13"],
+            vec!["prune", "r", "--arch-indep-owner", "amd64"],
+        ] {
+            let err = parse(&command).unwrap_err();
+            assert!(err.contains("unrecognized option"), "{command:?}: {err}");
+        }
         // The two that do act on them still take them.
         assert_eq!(
             build_args(&["build", "r", "--version-tag", "deb13"]).version_tag,
@@ -1465,6 +1644,49 @@ mod tests {
                 .arch_indep_owner,
             Some("amd64".to_string())
         );
+    }
+
+    #[test]
+    fn prune_keeps_one_version_unless_told_otherwise() {
+        let args = prune_args(&["prune", "r"]);
+        assert_eq!(args.keep, 1);
+        assert!(!args.dry_run);
+        assert_eq!(args.architecture, None);
+
+        let args = prune_args(&["prune", "r", "--keep", "3", "--dry-run"]);
+        assert_eq!(args.keep, 3);
+        assert!(args.dry_run);
+    }
+
+    #[test]
+    fn a_keep_that_would_empty_the_pool_is_a_usage_error() {
+        // Zero is refused at the flag, on both subcommands that take it: a pool
+        // kept at nothing is not a pool.
+        for command in [["prune", "r", "--keep", "0"], ["build", "r", "--keep", "0"]] {
+            assert!(
+                parse(&command).unwrap_err().contains("at least 1"),
+                "{command:?}"
+            );
+        }
+        assert!(
+            parse(&["prune", "r", "--keep", "many"])
+                .unwrap_err()
+                .contains("not a positive integer")
+        );
+        assert!(
+            parse(&["prune", "r", "--keep"])
+                .unwrap_err()
+                .contains("--keep requires a value")
+        );
+    }
+
+    #[test]
+    fn build_prunes_only_when_asked() {
+        // Nothing is removed from a pool a run was not told to prune: a build
+        // that quietly deleted a version someone was serving would be a
+        // surprise, and the pool is not the run's to reclaim uninvited.
+        assert_eq!(build_args(&["build", "r"]).keep, None);
+        assert_eq!(build_args(&["build", "r", "--keep", "2"]).keep, Some(2));
     }
 
     #[test]

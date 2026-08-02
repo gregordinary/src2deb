@@ -296,20 +296,20 @@ knowing before serving a pool to anything but the next build:
 Both follow from the index being merged under the pool's lock, which is what lets
 one component resolve against the pool while another publishes into it.
 
-### The pool directory grows without bound
+### The pool directory grows until it is pruned
 
 The index keeps only the highest version of each package name, but nothing
 removes the file a higher version superseded. Because every build carries the
 build date in its [version](package-versions.md), each run writes a fresh set of
 `.deb` files and leaves the previous set on disk, indexed by nothing. A recipe
-rebuilt daily accretes its full artifact set per day, indefinitely.
+rebuilt daily accretes its full artifact set per day.
 
-That is the pool's design — a publish is additive and takes no view on what came
-before — so pruning is an operational task rather than something a run does. A
-superseded file is safe to delete once no index names it, which for a pool that
-has published since means every `.deb` of a package other than its highest
-version. Plan for it wherever the pool is served from, and watch the directory's
-size rather than the index's.
+That is the pool's design: a publish is additive and takes no view on what came
+before. Removing what it superseded is a separate step —
+[`src2deb prune`](using-the-pool.md#pruning-the-pool), or `--keep N` on a build,
+which runs it once the run has finished. Watch the directory's size rather than
+the index's, which stays one entry per package however many versions sit
+behind it.
 
 The pool is not the largest thing in a work directory, though: the shared base
 and the package cache usually are. See

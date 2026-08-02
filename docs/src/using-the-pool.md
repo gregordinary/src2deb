@@ -112,17 +112,70 @@ Two things about a src2deb pool decide when signing happens:
 See [Signing follows a run, never precedes
 it](how-a-build-runs.md#signing-follows-a-run-never-precedes-it).
 
+## Pruning the pool
+
+A pool's index names **one version of each package**. Publishing merges each
+run's `.debs` into the index by highest version, so a package superseded by a
+later build stops being named the moment that build publishes — but the file
+stays where it was written. Every build carries the build date in its
+[version](package-versions.md), so a recipe built nightly writes a fresh set of
+`.deb` files each night and leaves the previous set on disk, reachable by
+nothing.
+
+`src2deb prune` removes them:
+
+```sh
+src2deb prune recipes/cosmic-epoch --work /mnt/build/work
+```
+
+By default it keeps one version of each binary package — the version the index
+names — so the pool on disk ends up exactly matching the archive it serves.
+`--keep N` leaves the newest `N` instead, which is worth doing only to have a
+superseded `.deb` to hand to someone or to roll back to by hand: apt is never
+offered it, because the index names one.
+
+`--dry-run` reports what would go without removing it:
+
+```text
+src2deb: arm64: would remove 78 file(s), 3.1 GiB, of 26 package(s)
+src2deb: 1 pool(s) pruned: would remove 78 file(s), 3.1 GiB
+```
+
+Two guarantees hold whatever is pruned:
+
+- **A file the index names is never removed.** The index is the pool's contract
+  with every client resolving against it.
+- **No index is rewritten.** Nothing indexed is removed, so the `Release`, the
+  `Packages`, and any signature written over them still describe the pool
+  exactly.
+
+A build prunes its own pool when told to, once the run has finished:
+
+```sh
+src2deb build recipes/cosmic-epoch --skip-published --keep 2
+```
+
+After the run rather than as each component publishes, because a superseded file
+may still be being fetched by a build root provisioning against the pool. For
+the same reason, prune when no build is running: a client that read an earlier
+`Release` may still be fetching a file the prune removes. A pool is pruned
+across every recipe that publishes into it, since a pool for a suite and
+architecture is one archive whoever built it.
+
 ## Before serving a pool to anything but the next build
 
-Three properties of the pool matter more once something other than src2deb is
-reading it, and each is covered in [How a build runs](how-a-build-runs.md):
+Two properties of the pool matter more once something other than src2deb is
+reading it, and both are covered in [How a build runs](how-a-build-runs.md):
 
 - [Publishing is incremental and
   forward-only](how-a-build-runs.md#publishing-is-incremental-and-forward-only):
   a lower version does not publish, and there is no unpublish.
-- [The pool directory grows without
-  bound](how-a-build-runs.md#the-pool-directory-grows-without-bound): pruning
-  superseded `.deb` files is an operational task, not something a run does.
 - [Package versions](package-versions.md): every build carries the suite, the
   build date, and the source revision, which is what makes a rebuild reach a
   machine that already installed the last one.
+
+## Handing the packages to an archive
+
+Serving the pool directly is one destination for a run's output; ingesting it
+into a managed archive is the other. See
+[Publishing to an archive](publishing.md).

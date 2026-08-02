@@ -113,9 +113,10 @@ refused, since that means the destination is not the one intended.
 
 Keeping an export beyond the next one is a matter of choosing where it goes:
 `--to /srv/drop/rk1-$(date +%F)` writes a fresh directory each time. It is worth
-knowing what that buys before reaching for it — the pool upstream holds every
-version it has ever published, and an archive tool downstream keeps snapshots,
-so the export itself is usually the one copy not worth archiving.
+knowing what that buys before reaching for it — the pool upstream keeps as many
+versions as [`--keep`](using-the-pool.md#pruning-the-pool) is told to, and an
+archive tool downstream keeps snapshots, so the export itself is usually the one
+copy not worth archiving.
 
 ## A scheduled build and publish
 
@@ -125,12 +126,12 @@ The whole cycle, as a build host runs it overnight:
 #!/bin/sh
 set -eu
 src2deb build recipes/cosmic-epoch --work /mnt/build/work \
-    --suite trixie --skip-published
+    --suite trixie --skip-published --keep 2
 src2deb export recipes/cosmic-epoch --work /mnt/build/work \
     --suite trixie --to /srv/drop/rk1
 ```
 
-`--skip-published` builds only what moved, and the export replaces the drop
-directory's contents with the archive's current state. What the publisher then
-does with `/srv/drop/rk1/trixie` — ingest, snapshot,
+`--skip-published` builds only what moved, `--keep 2` bounds the pool, and the
+export replaces the drop directory's contents with the archive's current state.
+What the publisher then does with `/srv/drop/rk1/trixie` — ingest, snapshot,
 sign, publish — is outside src2deb.

@@ -26,16 +26,24 @@
 //! [`publish`](LocalPool::publish) accordingly takes `&self`, so a parallel
 //! build shares one `LocalPool` across its workers with no lock of its own.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferroday_cage::provision::debian::{Pool, Repository};
 
 use crate::build::Artifact;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, io_error};
 
 /// The directory within the work directory that holds every pool.
 pub const POOL_DIR: &str = "pool";
+
+/// The archive component every pool publishes under.
+///
+/// One component, because a pool is one recipe's build output served as an
+/// archive, and splitting it would mean deciding which packages are `contrib`
+/// on a basis src2deb has no way to know.
+pub const POOL_COMPONENT: &str = "main";
 
 /// The path of the pool for `suite` and `architecture` under `work_dir`:
 /// `pool/<suite>/<architecture>/`.
@@ -192,6 +200,30 @@ impl LocalPool {
             .collect())
     }
 
+    /// The pool-relative paths of every file the pool's index names, empty when
+    /// the pool holds nothing or does not exist yet.
+    ///
+    /// What [`prune`] must not remove. Read from the index directly for the
+    /// same reason as [`indexed_packages`](Self::indexed_packages): the
+    /// question is about the pool as it stands, not about a build root
+    /// provisioned from it.
+    pub fn indexed_files(&self) -> Result<std::collections::BTreeSet<String>> {
+        let path = self.index_path()?;
+        let index = match std::fs::read_to_string(&path) {
+            Ok(index) => index,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(err) => {
+                return Err(Error::Pool(format!("reading {}: {err}", path.display())));
+            }
+        };
+        Ok(index
+            .lines()
+            .filter_map(|line| line.strip_prefix("Filename:"))
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect())
+    }
+
     /// The path of this pool's `Packages` index for its own component and
     /// architecture.
     fn index_path(&self) -> Result<PathBuf> {
@@ -222,6 +254,315 @@ impl LocalPool {
             .map_err(Error::Debian)?;
         Ok(Some(repository))
     }
+}
+
+/// What to prune, and how much to keep.
+#[derive(Debug, Clone)]
+pub struct PruneOptions {
+    /// How many versions of each binary package to keep. At least one: a pool
+    /// pruned to nothing is not a pool.
+    pub keep: usize,
+    /// The architectures to prune, or empty for every pool the suite holds.
+    pub architectures: Vec<String>,
+    /// Report what would be removed without removing anything.
+    pub dry_run: bool,
+}
+
+impl Default for PruneOptions {
+    /// Keeps the version each pool's index names, and no other, across every
+    /// architecture the suite holds.
+    fn default() -> PruneOptions {
+        PruneOptions {
+            keep: 1,
+            architectures: Vec::new(),
+            dry_run: false,
+        }
+    }
+}
+
+/// What pruning removed, across every pool it visited.
+#[derive(Debug, Clone)]
+pub struct PruneReport {
+    /// One entry per pool visited, in architecture order.
+    pub pools: Vec<PrunedPool>,
+    /// Whether anything was actually removed.
+    pub dry_run: bool,
+}
+
+impl PruneReport {
+    /// How many files were removed, across every pool.
+    pub fn removed(&self) -> usize {
+        self.pools.iter().map(|pool| pool.removed.len()).sum()
+    }
+
+    /// How many bytes were reclaimed, across every pool.
+    pub fn bytes(&self) -> u64 {
+        self.pools.iter().map(|pool| pool.bytes).sum()
+    }
+}
+
+/// One pool's pruning.
+#[derive(Debug, Clone)]
+pub struct PrunedPool {
+    /// The architecture the pool serves.
+    pub architecture: String,
+    /// The pool's directory.
+    pub dir: PathBuf,
+    /// The files removed, in package and then version order.
+    pub removed: Vec<PrunedFile>,
+    /// The bytes the removed files held.
+    pub bytes: u64,
+    /// The distinct binary packages the pool holds.
+    pub packages: usize,
+}
+
+/// One superseded package file.
+#[derive(Debug, Clone)]
+pub struct PrunedFile {
+    /// The binary package name.
+    pub package: String,
+    /// The version removed.
+    pub version: String,
+    /// The file's path.
+    pub path: PathBuf,
+}
+
+/// Removes superseded `.deb` files from every pool the suite holds under
+/// `work_dir`, keeping the newest [`keep`](PruneOptions::keep) versions of each
+/// binary package.
+///
+/// # Why a pool accumulates
+///
+/// A pool's index names **one version of each package**: publishing merges the
+/// new `.debs` into the index by highest version, so a package superseded by a
+/// later build stops being named the moment that build publishes. The file
+/// stays where it was written. Nothing resolves against it — apt reads the
+/// index — and nothing removes it, so a work directory that has run nightly for
+/// a month holds a month of packages behind an index naming one.
+///
+/// Pruning is what removes them. Keeping one version leaves the pool on disk
+/// exactly matching its index; keeping more leaves a superseded `.deb` to hand
+/// to someone or to roll back to, which is the only thing keeping it is good
+/// for, since apt is never offered it.
+///
+/// # What is never removed
+///
+/// **A file the index names.** The index is the pool's contract with every
+/// client resolving against it, and a file it names that is not there is a
+/// broken archive rather than a reclaimed byte. Retention selects among the
+/// versions on disk, and the indexed version is by construction the highest, so
+/// this guard never fires — it is what makes that a property rather than an
+/// assumption.
+///
+/// Because nothing indexed is removed, the index still describes the pool
+/// exactly, and pruning rewrites nothing: no `Release`, no `Packages`, and no
+/// signature a caller wrote over either.
+///
+/// # Concurrency
+///
+/// The caller holds the work directory. Pruning removes files a client that
+/// read an *earlier* `Release` may still be fetching, so it is not safe to run
+/// while a build is publishing into the same pool — which is why a build prunes
+/// after its last component publishes rather than as each one does.
+pub fn prune(work_dir: &Path, suite: &str, options: &PruneOptions) -> Result<PruneReport> {
+    if options.keep == 0 {
+        return Err(Error::Prune(
+            "at least one version of each package must be kept".to_string(),
+        ));
+    }
+    let architectures = select_architectures(work_dir, suite, &options.architectures)?;
+    let mut pools = Vec::new();
+    for architecture in architectures {
+        pools.push(prune_pool(work_dir, suite, &architecture, options)?);
+    }
+    Ok(PruneReport {
+        pools,
+        dry_run: options.dry_run,
+    })
+}
+
+/// The architectures to prune: those named, checked against the pools the work
+/// directory holds, or every one it holds.
+fn select_architectures(work_dir: &Path, suite: &str, named: &[String]) -> Result<Vec<String>> {
+    let held = pool_architectures(work_dir, suite)?;
+    if held.is_empty() {
+        return Err(Error::Prune(format!(
+            "there is no pool for suite {suite:?} under {}",
+            work_dir.display()
+        )));
+    }
+    if named.is_empty() {
+        return Ok(held);
+    }
+    let mut selected = Vec::new();
+    for architecture in named {
+        if !held.iter().any(|known| known == architecture) {
+            return Err(Error::Prune(format!(
+                "there is no {suite}/{architecture} pool; the work directory holds: {}",
+                held.join(", ")
+            )));
+        }
+        if !selected.contains(architecture) {
+            selected.push(architecture.clone());
+        }
+    }
+    selected.sort();
+    Ok(selected)
+}
+
+/// The architectures the work directory holds a pool for at `suite`, in name
+/// order.
+pub fn pool_architectures(work_dir: &Path, suite: &str) -> Result<Vec<String>> {
+    let dir = work_dir.join(POOL_DIR).join(suite);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(Error::Pool(format!("reading {}: {err}", dir.display())));
+        }
+    };
+    let mut architectures = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| Error::Pool(format!("reading {}: {err}", dir.display())))?;
+        if entry.path().is_dir()
+            && let Some(name) = entry.file_name().to_str()
+        {
+            architectures.push(name.to_string());
+        }
+    }
+    architectures.sort();
+    Ok(architectures)
+}
+
+/// Prunes one pool.
+fn prune_pool(
+    work_dir: &Path,
+    suite: &str,
+    architecture: &str,
+    options: &PruneOptions,
+) -> Result<PrunedPool> {
+    let dir = pool_dir(work_dir, suite, architecture);
+    let pool = LocalPool::new(&dir, suite, POOL_COMPONENT, architecture);
+    let indexed = pool.indexed_files()?;
+
+    // Every `.deb` the pool holds, grouped by the package name its file name
+    // carries. By name alone rather than by name and architecture: a package
+    // may be `Architecture: all` at one version and architecture-dependent at
+    // the next, and it is one package throughout — the index names it once, and
+    // apt resolves it by name.
+    let mut versions: BTreeMap<String, Vec<PoolFile>> = BTreeMap::new();
+    for path in deb_files(&dir.join(POOL_DIR))? {
+        let Some(file) = PoolFile::of(path) else {
+            continue;
+        };
+        versions.entry(file.package.clone()).or_default().push(file);
+    }
+
+    let packages = versions.len();
+    let mut removed = Vec::new();
+    let mut bytes = 0;
+    for (package, mut files) in versions {
+        // Newest first, so what is kept is the head of the list. Two files may
+        // carry one version — a package that was `Architecture: all` at a
+        // version and architecture-dependent at the same one has two names in
+        // one directory — so the path breaks the tie and the order is total.
+        // Without it the order would be the directory's, which is arbitrary,
+        // and which of two equal versions survived would vary between runs.
+        files.sort_by(|a, b| {
+            crate::version::compare(&b.version, &a.version).then_with(|| a.path.cmp(&b.path))
+        });
+        for file in files.into_iter().skip(options.keep) {
+            // The index's own vocabulary is a pool-relative path, so the
+            // comparison is made in it.
+            if file
+                .relative(&dir)
+                .is_some_and(|relative| indexed.contains(&relative))
+            {
+                continue;
+            }
+            bytes += std::fs::metadata(&file.path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            if !options.dry_run {
+                std::fs::remove_file(&file.path)
+                    .map_err(|err| io_error("removing a superseded package", &file.path, err))?;
+            }
+            removed.push(PrunedFile {
+                package: package.clone(),
+                version: file.version,
+                path: file.path,
+            });
+        }
+    }
+    Ok(PrunedPool {
+        architecture: architecture.to_string(),
+        dir,
+        removed,
+        bytes,
+        packages,
+    })
+}
+
+/// A `.deb` in the pool, with the package and version its file name names.
+#[derive(Debug)]
+struct PoolFile {
+    path: PathBuf,
+    package: String,
+    version: String,
+}
+
+impl PoolFile {
+    /// Reads a pool file's identity from its name, or `None` when the name is
+    /// not `name_version_arch.deb`.
+    ///
+    /// From the name rather than from the `.deb`'s own control stanza: the pool
+    /// stores a package at a path built from that name, so it is what tells two
+    /// versions apart, and reading a control member out of every archive in the
+    /// pool to learn what the path already says would cost a run's worth of
+    /// decompression.
+    fn of(path: PathBuf) -> Option<PoolFile> {
+        let name = path.file_name()?.to_str()?;
+        let stem = name.strip_suffix(".deb")?;
+        let mut fields = stem.splitn(3, '_');
+        let package = fields.next()?;
+        let version = fields.next()?;
+        // The pool encodes an epoch's colon in the file name, since a `:` is
+        // not a character every filesystem carries; the version compares in its
+        // own spelling.
+        fields.next()?;
+        Some(PoolFile {
+            package: package.to_string(),
+            version: version.replace("%3a", ":"),
+            path,
+        })
+    }
+
+    /// The file's path relative to the pool root, as the index spells it.
+    fn relative(&self, pool_dir: &Path) -> Option<String> {
+        Some(self.path.strip_prefix(pool_dir).ok()?.to_str()?.to_string())
+    }
+}
+
+/// Every `.deb` under `dir`, recursively. An absent directory holds none.
+fn deb_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(io_error("reading the pool", dir, err)),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|err| io_error("reading the pool", dir, err))?
+            .path();
+        if path.is_dir() {
+            files.extend(deb_files(&path)?);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("deb") {
+            files.push(path);
+        }
+    }
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -299,5 +640,254 @@ mod tests {
             pool_dir(work, "forky", "arm64").strip_prefix("/w/pool"),
             crate::build::output_dir(work, "forky", "arm64").strip_prefix("/w/out"),
         );
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    /// A unique scratch work directory for one test.
+    fn scratch(label: &str) -> PathBuf {
+        use std::sync::atomic::AtomicUsize;
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("src2deb-prune-{label}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Writes a `.deb` into the pool at the layout the writer uses, holding its
+    /// own name so its size varies and its identity is checkable.
+    fn published(
+        work: &Path,
+        architecture: &str,
+        name: &str,
+        version: &str,
+        arch: &str,
+    ) -> PathBuf {
+        let file = format!("{name}_{}_{arch}.deb", version.replace(':', "%3a"));
+        let prefix = name.chars().next().unwrap().to_string();
+        let dir = pool_dir(work, "trixie", architecture)
+            .join(POOL_DIR)
+            .join(POOL_COMPONENT)
+            .join(prefix)
+            .join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(&file);
+        std::fs::write(&path, file.as_bytes()).unwrap();
+        path
+    }
+
+    /// Writes a `Packages` index naming `files`, as the writer would.
+    fn index(work: &Path, architecture: &str, files: &[&Path]) {
+        let dir = pool_dir(work, "trixie", architecture);
+        let binary = dir
+            .join("dists")
+            .join("trixie")
+            .join(POOL_COMPONENT)
+            .join(format!("binary-{architecture}"));
+        std::fs::create_dir_all(&binary).unwrap();
+        let text: String = files
+            .iter()
+            .map(|path| {
+                let relative = path.strip_prefix(&dir).unwrap().to_str().unwrap();
+                format!("Package: p\nFilename: {relative}\n\n")
+            })
+            .collect();
+        std::fs::write(binary.join("Packages"), text).unwrap();
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_versions_in_debian_order() {
+        let work = scratch("order");
+        // Deliberately out of both alphabetical and creation order: retention
+        // is by version comparison, not by name or by mtime. `1.10` above `1.9`
+        // is the case a lexical sort gets wrong.
+        for version in ["1.9", "1.10", "1.0~rc1", "1.2"] {
+            published(&work, "arm64", "p", version, "arm64");
+        }
+        let newest = published(&work, "arm64", "p", "2.0", "arm64");
+        index(&work, "arm64", &[&newest]);
+
+        let report = prune(&work, "trixie", &PruneOptions::default()).unwrap();
+        assert_eq!(report.removed(), 4);
+        assert!(newest.is_file());
+        let left: Vec<String> = deb_files(&pool_dir(&work, "trixie", "arm64").join(POOL_DIR))
+            .unwrap()
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["p_2.0_arm64.deb"]);
+
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn keeping_more_than_one_leaves_the_versions_below_the_newest() {
+        let work = scratch("keep");
+        for version in ["1.0", "1.1", "1.2"] {
+            published(&work, "arm64", "p", version, "arm64");
+        }
+        let newest = published(&work, "arm64", "p", "1.3", "arm64");
+        index(&work, "arm64", &[&newest]);
+
+        let options = PruneOptions {
+            keep: 2,
+            ..PruneOptions::default()
+        };
+        let report = prune(&work, "trixie", &options).unwrap();
+        let removed: Vec<&str> = report.pools[0]
+            .removed
+            .iter()
+            .map(|file| file.version.as_str())
+            .collect();
+        assert_eq!(removed, ["1.1", "1.0"]);
+        assert_eq!(report.pools[0].packages, 1);
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn two_files_at_one_version_are_ordered_by_path_rather_than_by_the_directory() {
+        let work = scratch("tie");
+        // A package that was `Architecture: all` at a version and
+        // architecture-dependent at the same one: two names in one directory,
+        // one version. Which survives must not depend on the order the
+        // directory happens to list them in.
+        let all = published(&work, "arm64", "p", "1.0", "all");
+        let arm = published(&work, "arm64", "p", "1.0", "arm64");
+        index(&work, "arm64", &[]);
+
+        let report = prune(&work, "trixie", &PruneOptions::default()).unwrap();
+        assert_eq!(report.removed(), 1);
+        // Sorted by path within the tie, so the `all` file is the one kept —
+        // and it is kept whichever order the filesystem enumerated them in.
+        assert!(all.is_file());
+        assert!(!arm.exists());
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn a_file_the_index_names_is_never_removed() {
+        let work = scratch("indexed");
+        // An index naming a version that is not the newest on disk cannot arise
+        // from publishing, which indexes by highest version. The guard is what
+        // makes "pruning never breaks the index" a property of the code rather
+        // than a consequence of how the pool happens to be written.
+        let older = published(&work, "arm64", "p", "1.0", "arm64");
+        published(&work, "arm64", "p", "2.0", "arm64");
+        index(&work, "arm64", &[&older]);
+
+        let report = prune(&work, "trixie", &PruneOptions::default()).unwrap();
+        assert_eq!(report.removed(), 0);
+        assert!(older.is_file());
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn a_package_is_one_package_whatever_architecture_its_versions_carry() {
+        let work = scratch("archall");
+        // A component whose package became `Architecture: all` between builds:
+        // one package, so retention keeps the newest across both spellings
+        // rather than the newest of each.
+        let old = published(&work, "arm64", "p", "1.0", "arm64");
+        let new = published(&work, "arm64", "p", "2.0", "all");
+        index(&work, "arm64", &[&new]);
+
+        let report = prune(&work, "trixie", &PruneOptions::default()).unwrap();
+        assert_eq!(report.removed(), 1);
+        assert!(!old.exists());
+        assert!(new.is_file());
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn an_epoch_orders_by_its_value_and_not_by_its_encoded_name() {
+        let work = scratch("epoch");
+        // The pool encodes the colon, so the file names read `1%3a1.0`. Sorted
+        // as written, `2.0` would look like the later version; as versions,
+        // the epoch outranks it.
+        let plain = published(&work, "arm64", "p", "2.0", "arm64");
+        let epoch = published(&work, "arm64", "p", "1:1.0", "arm64");
+        index(&work, "arm64", &[&epoch]);
+
+        let report = prune(&work, "trixie", &PruneOptions::default()).unwrap();
+        assert_eq!(report.removed(), 1);
+        assert_eq!(report.pools[0].removed[0].version, "2.0");
+        assert!(!plain.exists());
+        assert!(epoch.is_file());
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn a_dry_run_reports_what_it_would_remove_and_removes_nothing() {
+        let work = scratch("dry");
+        let old = published(&work, "arm64", "p", "1.0", "arm64");
+        let new = published(&work, "arm64", "p", "2.0", "arm64");
+        index(&work, "arm64", &[&new]);
+
+        let options = PruneOptions {
+            dry_run: true,
+            ..PruneOptions::default()
+        };
+        let report = prune(&work, "trixie", &options).unwrap();
+        assert!(report.dry_run);
+        assert_eq!(report.removed(), 1);
+        assert_eq!(report.bytes(), std::fs::metadata(&old).unwrap().len());
+        assert!(old.is_file());
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn every_architecture_is_pruned_unless_one_is_named() {
+        let work = scratch("arches");
+        for architecture in ["amd64", "arm64"] {
+            published(&work, architecture, "p", "1.0", architecture);
+            let new = published(&work, architecture, "p", "2.0", architecture);
+            index(&work, architecture, &[&new]);
+        }
+        let report = prune(&work, "trixie", &PruneOptions::default()).unwrap();
+        assert_eq!(report.pools.len(), 2);
+        assert_eq!(report.removed(), 2);
+
+        // Named, only that pool is visited.
+        for architecture in ["amd64", "arm64"] {
+            published(&work, architecture, "p", "1.5", architecture);
+        }
+        let options = PruneOptions {
+            architectures: vec!["arm64".to_string()],
+            ..PruneOptions::default()
+        };
+        let report = prune(&work, "trixie", &options).unwrap();
+        assert_eq!(report.pools.len(), 1);
+        assert_eq!(report.pools[0].architecture, "arm64");
+        assert_eq!(report.removed(), 1);
+        std::fs::remove_dir_all(&work).unwrap();
+    }
+
+    #[test]
+    fn a_suite_or_architecture_with_no_pool_says_so() {
+        let work = scratch("none");
+        let err = prune(&work, "trixie", &PruneOptions::default()).unwrap_err();
+        assert!(format!("{err}").contains("no pool for suite"), "{err}");
+
+        published(&work, "arm64", "p", "1.0", "arm64");
+        let options = PruneOptions {
+            architectures: vec!["amd64".to_string()],
+            ..PruneOptions::default()
+        };
+        let err = prune(&work, "trixie", &options).unwrap_err();
+        assert!(format!("{err}").contains("arm64"), "{err}");
+
+        // Keeping nothing is refused rather than emptying the pool.
+        let options = PruneOptions {
+            keep: 0,
+            ..PruneOptions::default()
+        };
+        let err = prune(&work, "trixie", &options).unwrap_err();
+        assert!(format!("{err}").contains("at least one"), "{err}");
+        std::fs::remove_dir_all(&work).unwrap();
     }
 }
