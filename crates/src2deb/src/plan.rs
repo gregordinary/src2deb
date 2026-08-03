@@ -9,6 +9,12 @@
 //! sort yields the build order. Dependencies the set does not produce are left
 //! to archive and pool resolution at provision time.
 //!
+//! Every reading of a `debian/control` here goes through one parser: the stanza
+//! reader this module shares with [`crate::check`], or a single bounded pass
+//! over the source stanza for the two fields taken from that alone. So a field
+//! is matched without regard to case as `dpkg` matches it, and a value folded
+//! across continuation lines reads as one value wherever it is read.
+//!
 //! # Build-dependency alternatives
 //!
 //! [`build_depend_names`] returns only the first alternative of each `a | b` group,
@@ -91,10 +97,9 @@ fn source_field<'a>(control: &'a str, name: &str) -> Option<&'a str> {
 /// The binary package names a `debian/control` produces: the value of every
 /// `Package:` field (the binary stanzas; the source stanza has none).
 pub fn binary_packages(control: &str) -> Vec<String> {
-    control
-        .lines()
-        .filter_map(|line| line.strip_prefix("Package:"))
-        .map(|value| value.trim().to_string())
+    crate::check::stanzas(control)
+        .into_iter()
+        .filter_map(|stanza| stanza.get("package").cloned())
         .filter(|name| !name.is_empty())
         .collect()
 }
@@ -109,29 +114,21 @@ pub fn binary_packages(control: &str) -> Vec<String> {
 /// producing an empty result.
 ///
 /// Read stanza by stanza, so each `Architecture` is the one belonging to the
-/// `Package` above it rather than to whichever binary happens to be declared
-/// first. A binary stanza with no `Architecture` field at all is malformed
-/// control; it counts as architecture-dependent, because the reading that
-/// builds the component is the one that cannot lose a package.
+/// `Package` of its own stanza rather than to whichever binary happens to be
+/// declared first. A binary stanza with no `Architecture` field at all is
+/// malformed control; it counts as architecture-dependent, because the reading
+/// that builds the component is the one that cannot lose a package.
 pub fn has_architecture_dependent_packages(control: &str) -> bool {
-    let (mut is_binary, mut architecture) = (false, None);
-    // A trailing empty line closes the last stanza, so the judgement is written
-    // once rather than repeated after the loop.
-    for line in control.lines().chain(std::iter::once("")) {
-        if line.trim().is_empty() {
-            if is_binary && architecture != Some("all") {
-                return true;
-            }
-            (is_binary, architecture) = (false, None);
-        } else if line.starts_with("Package:") {
-            // The source stanza has none, so it never judges as a binary: its
-            // fields describe the source and not a package this build emits.
-            is_binary = true;
-        } else if let Some(value) = line.strip_prefix("Architecture:") {
-            architecture = Some(value.trim());
-        }
-    }
-    false
+    crate::check::stanzas(control)
+        .into_iter()
+        // The source stanza declares no binary package, so it never judges: its
+        // fields describe the source and not a package this build emits.
+        .filter(|stanza| stanza.contains_key("package"))
+        .any(|stanza| {
+            stanza
+                .get("architecture")
+                .is_none_or(|architecture| architecture.trim() != "all")
+        })
 }
 
 /// One runtime relationship a component's packaging declares, and the binary
@@ -561,6 +558,25 @@ mod tests {
         // dependent or independent whatever fields it carries.
         assert!(!has_architecture_dependent_packages(
             "Source: s\nBuild-Depends: debhelper\nVcs-Git: https://example/s\n"
+        ));
+    }
+
+    #[test]
+    fn a_control_is_read_the_same_way_wherever_it_is_read() {
+        // One parser serves every reading of a control here, so a field spelled
+        // in another case is matched as `dpkg` matches it and a value folded
+        // across lines is one value — in the reading that builds the graph as
+        // much as in the one that reads relationships.
+        let control = "Source: s\n\
+                       \npackage: p\narchitecture:\n any\n\
+                       \nPackage: p-data\nArchitecture: all\n";
+        assert_eq!(binary_packages(control), ["p", "p-data"]);
+        assert!(has_architecture_dependent_packages(control));
+
+        // And a component of nothing but arch-indep packages is still one
+        // however its fields are spelled.
+        assert!(!has_architecture_dependent_packages(
+            "Source: s\n\npackage: theme\narchitecture: all\n"
         ));
     }
 
