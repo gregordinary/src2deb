@@ -124,6 +124,14 @@ pub struct LocalPool {
     /// worker never observes it stale in a way that matters: the scheduler
     /// releases a component only once every in-set producer's `publish` has
     /// returned, so a component that needs the pool always sees it populated.
+    ///
+    /// What is not fixed is what a component that does *not* need the pool sees.
+    /// It is released as soon as a worker is free, so on a cold pool whether it
+    /// declares the pool at all — and, warm or cold, which packages the pool
+    /// held when it did — follows from how the run was scheduled. That is
+    /// inherent to a feed-forward pool built in parallel rather than something
+    /// this flag decides, and it is visible only where the pool carries a name
+    /// the archive also carries. See `docs/src/how-a-build-runs.md`.
     has_packages: AtomicBool,
 }
 

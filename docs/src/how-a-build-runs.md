@@ -182,6 +182,23 @@ publishes internally while making each one visible to a reader all at once, so a
 component may resolve against the pool while another publishes into it. A single
 job (the default) reproduces the sequential order exactly.
 
+What a build root sees of the pool follows from when it was provisioned. A
+component whose build-dependencies the recipe produces is released only after its
+producers have published, so it always resolves against their packages — that is
+what the scheduler is for. A component that depends on none of them is released
+as soon as a worker is free, so whether a sibling's packages had reached the pool
+by then depends on how the run happened to be scheduled.
+
+That is visible only where the pool holds a package name the archive also
+carries — a [rebuild of a package the archive
+ships](package-versions.md#rebuilds-of-packages-the-archive-also-ships), whose
+default stamp outranks the archive's own copy wherever both are read. A recipe
+holding one may resolve its other components differently between two otherwise
+identical parallel runs, and may miss the [build-root
+cache](build-roots.md#the-build-root-cache) for the same reason, since a root's
+plan key names every package it resolved. `--jobs 1` builds in a fixed order and
+so resolves against a fixed pool.
+
 ## 4. Record
 
 Each architecture writes a provenance manifest to
