@@ -1143,21 +1143,17 @@ fn report_check(recipe: &Recipe, event: src2deb::CheckProgress, verbosity: Verbo
     if verbosity == Verbosity::Quiet {
         return;
     }
-    match event {
-        src2deb::CheckProgress::Resolving {
-            architecture,
-            packages,
-        } => eprintln!(
-            "src2deb: resolving {packages} package(s) in {}/{architecture} against the archive",
+    // The event type is non-exhaustive, so anything added later is passed over
+    // rather than breaking this build — as the run reporter does.
+    if let src2deb::CheckProgress::Reading {
+        architecture,
+        packages,
+    } = event
+    {
+        eprintln!(
+            "src2deb: reading the archives for {}/{architecture} to check {packages} package(s)",
             recipe.suite,
-        ),
-        src2deb::CheckProgress::ResolvingNames { names } => eprintln!(
-            "src2deb: {names} dependency name(s) the install set did not account for; \
-             resolving them directly"
-        ),
-        // The event type is non-exhaustive, so anything added later is passed
-        // over rather than breaking this build — as the run reporter does.
-        _ => {}
+        );
     }
 }
 
@@ -1194,6 +1190,11 @@ fn check_after_build(
 /// An unsatisfiable dependency is printed whatever the verbosity, including
 /// quiet: it is the answer the check exists to give, and the one thing a caller
 /// that asked for nothing else still needs.
+///
+/// A dependency satisfied only by a provider is printed at `--verbose` alone. It
+/// installs, so it is not an answer the check exists to give; it is context for
+/// one, since which provider apt picks is apt's decision rather than the
+/// packaging's.
 fn print_check(report: &src2deb::CheckReport, verbosity: Verbosity) {
     for pool in &report.pools {
         for entry in &pool.unsatisfied {
@@ -1204,6 +1205,18 @@ fn print_check(report: &src2deb::CheckReport, verbosity: Verbosity) {
                 entry.relationship.field(),
                 entry.clause,
             );
+        }
+        if verbosity == Verbosity::Verbose {
+            for entry in &pool.provided {
+                eprintln!(
+                    "src2deb: {}: {}: {}: {} is virtual, provided by {}",
+                    pool.architecture,
+                    entry.package,
+                    entry.relationship.field(),
+                    entry.name,
+                    entry.providers.join(", "),
+                );
+            }
         }
         if verbosity != Verbosity::Quiet {
             eprintln!(

@@ -14,7 +14,7 @@ src2deb check recipes/cosmic-epoch --work /mnt/build/work
 ```
 
 ```text
-src2deb: resolving 27 package(s) in trixie/arm64 against the archive
+src2deb: reading the archives for trixie/arm64 to check 27 package(s)
 src2deb: arm64: cosmic-settings: Depends: network-manager-gnome
 src2deb: arm64: cosmic-initial-setup-casper: Depends: casper
 src2deb: arm64: 27 package(s), 214 dependencies, 2 unsatisfiable
@@ -62,9 +62,19 @@ Two consequences worth knowing:
   the check takes it at its word. A client that does not have that repository
   configured still cannot install the package.
 
-Alternatives and virtual packages are honoured, because the resolver that
-answers is the one that provisions build roots. `a | b` is satisfied by either;
-`x-terminal-emulator` is satisfied by anything that `Provides` it.
+Alternatives and virtual packages are honoured, over exactly the archives that
+provision build roots. `a | b` is satisfied by either; `x-terminal-emulator` is
+satisfied by anything that `Provides` it.
+
+A dependency satisfied only by a provider is reported at `--verbose`, because it
+is a weaker satisfaction than a direct one — the clause installs because apt
+picks one of several providers, and which it picks is apt's decision rather than
+the packaging's:
+
+```text
+src2deb: arm64: pop-icon-theme: Depends: adwaita-icon-theme-full is virtual,
+provided by adwaita-icon-theme
+```
 
 ## What is checked
 
@@ -88,7 +98,7 @@ architecture that built something, and no others:
 
 ```text
 src2deb: 26 built, 0 failed, 1 skipped
-src2deb: resolving 27 package(s) in trixie/arm64 against the archive
+src2deb: reading the archives for trixie/arm64 to check 27 package(s)
 src2deb: arm64: 27 package(s), 214 dependencies, all satisfiable
 src2deb: 1 pool(s) checked: 27 package(s), every dependency satisfiable
 ```
@@ -124,28 +134,20 @@ of the package rather than of src2deb:
   takes over.
 
 A dependency reported for one suite and not another is the ordinary case, not a
-contradiction: suites move, and that is the whole reason the check resolves
-against the suite the packages were built for.
+contradiction: suites move, and that is the whole reason the check reads the
+suite the packages were built for.
 
 ## What it costs
 
-One resolve against the archive, which fetches the suite's package index and
-closes over it — a few seconds on a warm link.
+One pass over the archives per pool: each one's release and package index,
+fetched and projected down to the names it offers. A couple of seconds on a warm
+link, for a pool of any size — the cost is the index, not the number of
+dependencies asked about.
 
-A dependency that index cannot account for is resolved by name, and the check
-says when it is doing that:
-
-```text
-src2deb: 7 dependency name(s) the install set did not account for; resolving
-them directly
-```
-
-That is ordinary for a pool with virtual dependencies, and costs one more
-resolve. It costs one resolve per name only when something genuinely is missing,
-which is bounded by how much is missing.
-
-The index is fetched once per check however many resolves it takes, so every
-answer in one report describes the same archive.
+Nothing is resolved. A check computes no install closure and downloads no
+package; it reads what the archives carry and answers each dependency against
+that. So a pool for a foreign architecture is checked as readily as one for the
+host's.
 
 ## In a scheduled build
 
