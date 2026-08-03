@@ -484,9 +484,15 @@ pub fn compare(a: &str, b: &str) -> std::cmp::Ordering {
 ///
 /// A `:` with anything but digits before it is not an epoch separator — it is a
 /// character of the upstream version, which policy admits once an epoch is
-/// present — so the split is only taken when what precedes it reads as one. An
-/// epoch too large to hold is treated as absent rather than saturated, which
-/// keeps a malformed version from ordering above every well-formed one.
+/// present — so the split is only taken when what precedes it reads as one.
+///
+/// A digit run too large for the epoch to hold is read as `0`, and its text is
+/// dropped along with the separator, so such a version compares as though it
+/// carried no epoch at all. Saturating instead would order a malformed version
+/// above every well-formed one, which is the outcome worth ruling out. `dpkg`
+/// refuses such a version rather than ordering it, and no version src2deb reads
+/// is one — every version it compares was written by dpkg into a file name or a
+/// manifest — so what matters here is only that the ordering stays total.
 fn split_version(version: &str) -> (u64, &str, &str) {
     let (epoch, rest) = match version.split_once(':') {
         Some((epoch, rest)) if !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit()) => {
@@ -809,6 +815,14 @@ cosmic-comp (1.0.0~alpha.7-1) trixie; urgency=medium
         // that the ordering stays total and treats the whole string as the
         // upstream version rather than reading `1.0` as an epoch.
         orders_below("1.0", "1.0:2");
+        // An epoch too large to hold is read as none at all rather than
+        // saturated, so a malformed version does not outrank every well-formed
+        // one. The digits go with the separator: what is left is the version.
+        assert_eq!(
+            compare("99999999999999999999999999:1.0", "1.0"),
+            std::cmp::Ordering::Equal
+        );
+        orders_below("99999999999999999999999999:1.0", "1:0.1");
     }
 
     #[test]
