@@ -26,18 +26,30 @@
 //! download per run and one per component per run, since the upper a pass writes
 //! into is discarded when the component finishes.
 //!
+//! # One resolve per root
+//!
+//! A bootstrap resolves once. [`Debian::resolve`] reports the exact,
+//! archive-verified package set a bootstrap would install, and that one plan is
+//! used twice over: as the cache key below, and as the install set the bootstrap
+//! is pinned to (`pinned_provisioner`). Resolving a second time inside the
+//! bootstrap would leave a window in which the archive could publish, handing
+//! the root a package set that its recorded key does not describe.
+//!
+//! A layered increment already resolves once — `stage_layer` computes its own
+//! delta against the base's installed set — so only the two bootstrap paths,
+//! [`LayeredProvision`]'s shared base and [`FullReprovision`]'s per-component
+//! roots, had a second resolve to remove.
+//!
 //! # The build-root cache
 //!
 //! A build root that a build does not mutate is cached on its resolved plan:
-//! [`Debian::resolve`] reports the exact, archive-verified package set a
-//! bootstrap would install, `ensure_for_plan` provisions the root when that
-//! set's `plan_key` differs from the one recorded beside it, and `record_plan_key`
-//! writes the key once the root is genuinely reusable. A later run reuses the
-//! root only when the key still matches, and rebuilds from clean when the
-//! dependency set changed — the staleness
-//! [`ensure`](ferroday_cage::provision::ensure), keyed only on the directory
-//! existing, would miss. This keys [`FullReprovision`]'s per-component roots and
-//! [`LayeredProvision`]'s shared base.
+//! `ensure_for_plan` provisions the root when the plan's `plan_key` differs from
+//! the one recorded beside it, and `record_plan_key` writes the key once the
+//! root is genuinely reusable. A later run reuses the root only when the key
+//! still matches, and rebuilds from clean when the dependency set changed — the
+//! staleness [`ensure`](ferroday_cage::provision::ensure), keyed only on the
+//! directory existing, would miss. This keys [`FullReprovision`]'s per-component
+//! roots and [`LayeredProvision`]'s shared base.
 //!
 //! The plan key names the suite and the architecture, so a root provisioned for
 //! one target never matches another's key. Roots are therefore kept per target
@@ -496,6 +508,44 @@ fn resolve_plan(
     debian.observe(&mut sink).resolve().map_err(Error::Debian)
 }
 
+/// A provisioner that installs `plan` verbatim, over the archives `pool_repo`
+/// and `config` name.
+///
+/// The second half of resolving a bootstrap once. [`resolve_plan`] produced the
+/// plan a moment earlier from these same archives, and handing it back closes
+/// two things at once:
+///
+/// - **The divergence window.** Resolving again would let the archive publish
+///   between the two, provisioning the root with a package set that is not the
+///   one the recorded [`plan_key`] describes — so the key would claim a root is
+///   current for a plan it does not hold.
+/// - **The second index.** A bootstrap that installs a plan fetches no release
+///   and no index, which is around 9 MB for a Debian suite.
+///
+/// The builder carries no `include`, `exclude`, or `base_priority`: a plan
+/// already names every package to install, so the provisioner refuses those
+/// alongside one. Everything that shapes *how* rather than *what* still applies
+/// — the cache directory, the identity map, and the repositories, which the plan
+/// names its packages' sources by index into.
+///
+/// **The trust model narrows, and only here.** Installing from a plan skips the
+/// release and the index, so the package digests no longer chain to an archive
+/// signature at install time. This plan was archive-verified seconds earlier, in
+/// this run, by this process, and each `.deb` is still verified against the
+/// digest it records. That is the narrow case where the trade is sound; it is
+/// not an argument for replaying a plan kept from an earlier run.
+fn pinned_provisioner(
+    config: &ProvisionConfig,
+    pool_repo: Option<Repository>,
+    plan: Plan,
+) -> Result<Debian<'static>> {
+    let mut builder = config.debian_builder()?;
+    if let Some(repository) = pool_repo {
+        builder = builder.repository(repository);
+    }
+    builder.plan(plan).build().map_err(Error::Debian)
+}
+
 /// Provisions `dir` for `key` unless it already holds a root provisioned for the
 /// same key, rebuilding from clean when a prior run left it provisioned for a
 /// different plan.
@@ -799,19 +849,19 @@ impl BuildRootProvider for FullReprovision {
             .config
             .include_toolchain(self.config.debian_builder()?)
             .include(build_deps.iter().cloned());
-        if let Some(repository) = pool_repo {
+        if let Some(repository) = pool_repo.clone() {
             builder = builder.repository(repository);
         }
 
-        // Provision the root only when no root already matches this component's
-        // archive-verified plan; a changed dependency set rebuilds it, so a
-        // reused root is never one baked for a different plan.
-        let mut debian = builder.build().map_err(Error::Debian)?;
+        // Resolve once. The plan is the cache key and the install set both:
+        // provision the root only when no root already matches this component's
+        // archive-verified plan, and provision it from that exact plan rather
+        // than resolving a second time. See `pinned_provisioner`.
+        let mut resolver = builder.build().map_err(Error::Debian)?;
         let rustup_version = self.config.rustup_version();
-        let key = plan_key(
-            &resolve_plan(&mut debian, Some(name), reporter)?,
-            rustup_version,
-        );
+        let plan = resolve_plan(&mut resolver, Some(name), reporter)?;
+        let key = plan_key(&plan, rustup_version);
+        let mut debian = pinned_provisioner(&self.config, pool_repo, plan)?;
         let mut observer = Bootstrap::new(Some(name), &self.cancel, reporter);
         let provisioned = ensure_for_plan(&root_dir, &mut debian, &key, &mut observer)?;
         // Only a freshly-provisioned root needs the toolchain: a reused one was
@@ -904,13 +954,21 @@ impl BuildRootProvider for LayeredProvision {
         // is never written by a build, so keying it on its plan is safe — a
         // stale base (a changed toolchain resolution) rebuilds, an unchanged one
         // is reused across runs.
-        let mut debian = self
+        //
+        // Resolved once and installed from that plan, as a full root is: the
+        // base is the one bootstrap a layered run performs, so it is where the
+        // second resolve was. See `pinned_provisioner`.
+        let mut resolver = self
             .config
             .include_toolchain(self.config.debian_builder()?)
             .build()
             .map_err(Error::Debian)?;
         let rustup_version = self.config.rustup_version();
-        let key = plan_key(&resolve_plan(&mut debian, None, reporter)?, rustup_version);
+        let plan = resolve_plan(&mut resolver, None, reporter)?;
+        let key = plan_key(&plan, rustup_version);
+        // The base resolves against the archive alone: it is bootstrapped before
+        // any component builds, so the pool holds nothing to feed into it.
+        let mut debian = pinned_provisioner(&self.config, None, plan)?;
         let mut observer = Bootstrap::new(None, &self.cancel, reporter);
         let provisioned = ensure_for_plan(&self.base_dir, &mut debian, &key, &mut observer)?;
         // Install the pinned toolchain into the base while it is still being
@@ -967,6 +1025,13 @@ impl BuildRootProvider for LayeredProvision {
         // component's own build-deps as the delta; the extra repositories and the
         // pool feed earlier components' and backported `.debs` into that
         // resolution.
+        //
+        // No plan is pinned here, and none can be. `stage_layer` resolves its
+        // own delta against the base's installed set and never consults a plan
+        // the builder carries — a plan describes a full bootstrap, and the
+        // combination is accepted at build time and then ignored, so setting one
+        // would read as pinning while pinning nothing. The layer needs none
+        // regardless: it resolves once, where a bootstrap resolved twice.
         let mut builder = self
             .config
             .debian_builder()?

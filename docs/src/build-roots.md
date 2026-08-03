@@ -73,6 +73,24 @@ A run with nothing to build resolves nothing. The skip decision is made before
 any root is provisioned, so a `--skip-published` re-run over unchanged sources
 neither bootstraps the base nor consults the archive.
 
+### One resolve, then the install
+
+A bootstrap that needs to run installs the plan that was just resolved, rather
+than resolving again from scratch. That matters for more than the second index
+fetch it saves:
+
+- **The set installed is the set the key describes.** Between two resolves the
+  archive could publish, and the root would then hold a package set that the key
+  recorded beside it does not describe — a root claiming to be current for a plan
+  it does not hold.
+- **The digests are the ones that were verified.** Every `.deb` is still checked
+  against the digest the plan records, and that digest came from an index whose
+  own digest the signed release covered, minutes earlier in the same run.
+
+A layered increment resolves once already — it computes its delta against the
+base's installed set and installs that — so this applies to the two bootstraps: a
+fully-reprovisioned root, and the shared base.
+
 ## Stopping mid-provision
 
 A bootstrap — the shared base, or a fully-reprovisioned root — is stopped at the

@@ -104,7 +104,10 @@ For each component, in order:
 
 - A build root is provisioned — the base system, the toolchain, and that
   component's build-dependencies, resolved against the archive sources and the
-  local pool. See [Build roots](build-roots.md), and
+  local pool. The archive is read once for it: a bootstrap installs the plan
+  that resolve produced rather than resolving again, so the packages that land
+  are the ones whose digests were verified against the release. See
+  [Build roots](build-roots.md), and
   [Provisioning progress](#provisioning-progress) below for what it reports
   while it works.
 - The component is built in two cage passes, for packages that vendor Rust
