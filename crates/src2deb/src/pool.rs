@@ -78,12 +78,44 @@ pub fn pool_dir(work_dir: &Path, suite: &str, architecture: &str) -> PathBuf {
     work_dir.join(POOL_DIR).join(suite).join(architecture)
 }
 
+/// What a publish stamps into the pool's `Release` beyond the coordinates: when
+/// the archive was made, and who says it is theirs.
+///
+/// The date is not optional. apt reports `W: Invalid 'Date' entry in Release
+/// file` for every pool that omits one, on every `apt update`, and a `Release`
+/// with no date cannot be compared against the one a client already holds.
+///
+/// The three identity fields are, and have no defaults. `Origin` and `Label`
+/// name an organization and its archive, and inventing either would put a name
+/// in an archive that its owner did not choose; a recipe that wants them says
+/// so. See [`Recipe::origin`](crate::Recipe::origin).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolRelease {
+    /// The `Date`, in seconds since the Unix epoch.
+    ///
+    /// The run's build stamp rather than the moment of the publish, so a run
+    /// pinned with `--build-date` writes the same `Release` twice over. A
+    /// publish clock would leave two runs of one pinned build differing in the
+    /// one file the pin cannot reach. See
+    /// [`BuildStamp::seconds`](crate::BuildStamp::seconds).
+    pub date: i64,
+    /// The `Origin`, or `None` to write none.
+    pub origin: Option<String>,
+    /// The `Label`, or `None` to write none.
+    pub label: Option<String>,
+    /// The `Description`, or `None` to write none.
+    pub description: Option<String>,
+}
+
 /// A local `dists/`-structured `.deb` pool.
 pub struct LocalPool {
     dir: PathBuf,
     suite: String,
     component: String,
     architecture: String,
+    /// The release fields a publish stamps in, or `None` for a pool opened to
+    /// read. See [`LocalPool::new`] and [`LocalPool::publishing`].
+    release: Option<PoolRelease>,
     /// Whether the pool holds any package to resolve against. Seeded from the
     /// pool on disk at [`init`](Self::init) — so a resumed run sees a prior run's
     /// packages — and set by [`publish`](Self::publish).
@@ -96,7 +128,14 @@ pub struct LocalPool {
 }
 
 impl LocalPool {
-    /// Creates a pool rooted at `dir` for `suite`/`component`/`architecture`.
+    /// Opens the pool rooted at `dir` for `suite`/`component`/`architecture` to
+    /// read: its index, and its declaration as a repository.
+    ///
+    /// Reading needs the coordinates alone, since they are what locate the index
+    /// and name the repository. A pool opened this way carries no release
+    /// fields, so publishing through it would write a `Release` with no `Date`
+    /// and no identity — [`publishing`](Self::publishing) is the constructor for
+    /// a pool that is written to.
     pub fn new(
         dir: impl Into<PathBuf>,
         suite: impl Into<String>,
@@ -108,7 +147,23 @@ impl LocalPool {
             suite: suite.into(),
             component: component.into(),
             architecture: architecture.into(),
+            release: None,
             has_packages: AtomicBool::new(false),
+        }
+    }
+
+    /// Opens the same pool to publish into, stamping `release` into the
+    /// `Release` that [`init`](Self::init) and [`publish`](Self::publish) emit.
+    pub fn publishing(
+        dir: impl Into<PathBuf>,
+        suite: impl Into<String>,
+        component: impl Into<String>,
+        architecture: impl Into<String>,
+        release: PoolRelease,
+    ) -> LocalPool {
+        LocalPool {
+            release: Some(release),
+            ..LocalPool::new(dir, suite, component, architecture)
         }
     }
 
@@ -136,12 +191,31 @@ impl LocalPool {
         Ok(())
     }
 
-    /// The ferroday-cage pool writer for this pool's coordinates.
+    /// The ferroday-cage pool writer for this pool's coordinates, carrying the
+    /// release fields when the pool was opened to publish.
+    ///
+    /// The read-only paths go through this too, for the archive layout it
+    /// computes — the index path and the `file://` mirror URL. Neither depends
+    /// on the release fields, so a pool opened to read locates exactly the same
+    /// files as the one that wrote them.
     fn writer(&self) -> Pool {
-        Pool::at(&self.dir)
+        let mut pool = Pool::at(&self.dir)
             .suite(self.suite.as_str())
             .component(self.component.as_str())
-            .architecture(self.architecture.as_str())
+            .architecture(self.architecture.as_str());
+        if let Some(release) = &self.release {
+            pool = pool.date(release.date);
+            if let Some(origin) = &release.origin {
+                pool = pool.origin(origin.as_str());
+            }
+            if let Some(label) = &release.label {
+                pool = pool.label(label.as_str());
+            }
+            if let Some(description) = &release.description {
+                pool = pool.description(description.as_str());
+            }
+        }
+        pool
     }
 
     /// Publishes freshly-built artifacts to the pool, adding each `.deb` and
@@ -631,6 +705,99 @@ mod tests {
         // Nested rather than joined into one name, so identities that would
         // collide when flattened stay apart: "a" / "b-c" is not "a-b" / "c".
         assert_ne!(pool_dir(work, "a", "b-c"), pool_dir(work, "a-b", "c"));
+    }
+
+    #[test]
+    fn a_published_release_is_dated_and_names_the_identity_the_recipe_gave_it() {
+        let dir = scratch("release");
+        let pool = LocalPool::publishing(
+            &dir,
+            "forky",
+            "main",
+            "arm64",
+            PoolRelease {
+                // 2026-07-31 00:00:00 UTC.
+                date: 1_785_456_000,
+                origin: Some("Texor".to_string()),
+                label: Some("COSMIC for Debian".to_string()),
+                description: Some("COSMIC desktop packages for Debian forky".to_string()),
+            },
+        );
+        pool.init().unwrap();
+        let release = std::fs::read_to_string(pool.writer().release_path().unwrap()).unwrap();
+
+        // The date apt reads. Without it every `apt update` against the pool
+        // reports `W: Invalid 'Date' entry in Release file`.
+        assert!(
+            release.contains("Date: Fri, 31 Jul 2026 00:00:00 UTC"),
+            "{release}",
+        );
+        // The fields `apt policy` renders and an apt pin matches on.
+        assert!(release.contains("Origin: Texor"), "{release}");
+        assert!(release.contains("Label: COSMIC for Debian"), "{release}");
+        assert!(
+            release.contains("Description: COSMIC desktop packages for Debian forky"),
+            "{release}",
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_recipe_that_names_no_identity_gets_a_release_carrying_none() {
+        // The three identity fields have no defaults: an origin names the
+        // organization behind an archive, and src2deb has none to offer. The
+        // date is written regardless, since apt warns on a pool that omits it.
+        let dir = scratch("anonymous");
+        let pool = LocalPool::publishing(
+            &dir,
+            "forky",
+            "main",
+            "arm64",
+            PoolRelease {
+                date: 1_785_456_000,
+                origin: None,
+                label: None,
+                description: None,
+            },
+        );
+        pool.init().unwrap();
+        let release = std::fs::read_to_string(pool.writer().release_path().unwrap()).unwrap();
+
+        assert!(release.contains("Date: "), "{release}");
+        for absent in ["Origin:", "Label:", "Description:"] {
+            assert!(!release.contains(absent), "{absent} in {release}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn two_publishes_at_one_build_date_write_one_release() {
+        // What the date being the run's build stamp rather than the publish
+        // clock buys: a run pinned with `--build-date` produces a pool that is
+        // byte-identical to the one the run before it produced, `Release`
+        // included. A publish clock would leave the one file the pin cannot
+        // reach differing every time.
+        let release_at = |label: &str| {
+            let dir = scratch(label);
+            let pool = LocalPool::publishing(
+                &dir,
+                "forky",
+                "main",
+                "arm64",
+                PoolRelease {
+                    date: 1_785_456_000,
+                    origin: Some("Texor".to_string()),
+                    label: None,
+                    description: None,
+                },
+            );
+            pool.init().unwrap();
+            let text = std::fs::read_to_string(pool.writer().release_path().unwrap()).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            text
+        };
+        assert_eq!(release_at("pinned-a"), release_at("pinned-b"));
     }
 
     #[test]

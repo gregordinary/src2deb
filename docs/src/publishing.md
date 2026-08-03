@@ -10,6 +10,13 @@ with snapshots and a signing key behind it.
 directory laid out for an archive tool to ingest, so a publisher never reads
 anything under the work directory.
 
+An export carries `.deb` files and metadata, never an index, so the pool's own
+`Release` — its date and the [identity](using-the-pool.md#what-the-release-declares)
+the recipe gave it — does not travel with them. The archive tool writes its own,
+and the two should agree: give the recipe the same `origin` and `label` the
+publisher declares, so a package reaches a client under one identity whether it
+came from the pool directly or through the archive.
+
 ```sh
 src2deb export recipes/cosmic-epoch --work /mnt/build/work --to /srv/drop/rk1
 ```

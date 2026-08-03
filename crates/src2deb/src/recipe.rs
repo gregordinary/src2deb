@@ -99,6 +99,31 @@ pub struct Recipe {
     /// provisioner when unset.
     #[serde(default)]
     pub mirror: Option<String>,
+    /// The `Origin` the pool's `Release` declares, when the recipe names one.
+    ///
+    /// Origin, [`label`](Self::label), and [`description`](Self::description)
+    /// are what `apt policy` renders a repository as, and the first two are what
+    /// an apt pin matches on. A pool that declares none is pinnable only by its
+    /// URL, which is the form apt's documentation reaches for last.
+    ///
+    /// There is no default. An origin names the organization behind an archive,
+    /// and src2deb inventing one would put a name in the archive that its owner
+    /// did not choose.
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// The `Label` the pool's `Release` declares, when the recipe names one.
+    ///
+    /// The archive's own name for itself, where [`origin`](Self::origin) names
+    /// who publishes it. Unset by default, for the reason given there.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The `Description` the pool's `Release` declares, when the recipe names
+    /// one.
+    ///
+    /// One line of prose, shown by tools that list an archive. Unset by default,
+    /// for the reason given at [`origin`](Self::origin).
+    #[serde(default)]
+    pub description: Option<String>,
     /// The Rust toolchain to build with. Defaults to the one the archive
     /// sources provide (`provider = "debian"`).
     #[serde(default)]

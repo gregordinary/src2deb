@@ -233,6 +233,8 @@ pub fn parse_changelog(text: &str) -> Option<ChangelogHead> {
 pub struct BuildStamp {
     /// The suite tag, such as `deb13`.
     tag: String,
+    /// The instant the stamp was made at, in seconds since the Unix epoch.
+    seconds: i64,
     /// The build date as `YYYYMMDD`.
     date: String,
     /// The same instant formatted for a changelog trailer (RFC 2822).
@@ -265,6 +267,7 @@ impl BuildStamp {
         );
         BuildStamp {
             tag: tag.into(),
+            seconds,
             date: format!("{year:04}{month:02}{day:02}"),
             timestamp: format!(
                 "{}, {day:02} {} {year:04} {hour:02}:{minute:02}:{second:02} +0000",
@@ -277,6 +280,18 @@ impl BuildStamp {
     /// The suite tag this stamp carries.
     pub fn tag(&self) -> &str {
         &self.tag
+    }
+
+    /// The run's instant, in seconds since the Unix epoch.
+    ///
+    /// The one clock a run has. The stamped version carries its date, the
+    /// changelog trailer carries it in full, `dpkg-buildpackage` derives
+    /// `SOURCE_DATE_EPOCH` from that trailer, and the pool's `Release` carries
+    /// it as the archive `Date`. A second clock anywhere would mean a run pinned
+    /// to one instant still produced output that differed between two runs of
+    /// it, which is the whole thing the pin exists to prevent.
+    pub fn seconds(&self) -> i64 {
+        self.seconds
     }
 
     /// The run's instant formatted for a `debian/changelog` trailer (RFC 2822,

@@ -18,6 +18,16 @@
 name = "cosmic-epoch"
 suite = "trixie"
 
+# What the pool's Release declares itself to be. `apt policy` renders these, and
+# an apt pin matches on the first two, so a pool that names them can be pinned
+# the way apt's own documentation leads with.
+#
+# These three recipes are built into one pool, so they name one identity: the
+# pool has a single Release, and the last recipe to publish writes it.
+origin = "texor.io"
+label = "COSMIC for Debian"
+description = "COSMIC desktop packages for Debian"
+
 # COSMIC needs a newer Rust than trixie's archive ships (`let_chains` and other
 # recently stabilized features), so the build root installs a pinned rustup
 # toolchain rather than using the archive's rustc.

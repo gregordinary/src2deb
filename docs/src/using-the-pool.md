@@ -34,6 +34,40 @@ apart.
 The pool is **unsigned**. src2deb writes the `Release` but signs nothing, which
 matters for every client below.
 
+## What the `Release` declares
+
+```text
+Origin: texor.io
+Label: COSMIC for Debian
+Suite: trixie
+Codename: trixie
+Architectures: amd64
+Components: main
+Description: COSMIC desktop packages for Debian
+Date: Fri, 31 Jul 2026 00:00:00 UTC
+```
+
+The **date** is the run's build date, not the moment of the publish. That is what
+makes a run pinned with [`--build-date`](package-versions.md#pinning-the-date)
+produce a byte-identical pool every time: a publish clock would leave the one
+file the pin cannot reach differing between two runs of the same build.
+
+`Origin`, `Label`, and `Description` come from the recipe and are written only
+when it names them:
+
+```toml
+origin = "texor.io"
+label = "COSMIC for Debian"
+description = "COSMIC desktop packages for Debian"
+```
+
+They have no defaults. An origin names the organization behind an archive, and
+src2deb has none to offer on your behalf. A pool that declares none is still a
+valid archive; it is pinnable only by its URL.
+
+Recipes built into one pool should declare one identity. A pool has a single
+`Release`, so the last recipe to publish writes the one every client reads.
+
 ## Serving it
 
 Over HTTP, from the pool directory:
@@ -82,6 +116,33 @@ Then:
 sudo apt update
 sudo apt install cosmic-desktop
 ```
+
+### Pinning against the pool
+
+A recipe that named an origin and a label can be pinned on them, which is the
+form apt's own documentation leads with:
+
+```text
+# /etc/apt/preferences.d/cosmic
+Package: *
+Pin: release o=texor.io,l=COSMIC for Debian
+Pin-Priority: 1001
+```
+
+A priority above 1000 installs the pool's package even where that means
+downgrading one the archive also ships — which is what a
+[backport](package-versions.md#rebuilds-of-packages-the-archive-also-ships)
+stamp otherwise arranges by version alone.
+
+`apt policy` shows what a client resolved:
+
+```text
+500 http://build-host.example:8000 trixie/main amd64 Packages
+    release o=texor.io,l=COSMIC for Debian,c=main,b=amd64
+```
+
+A pool that declared no identity renders that line with the fields blank, and
+can be pinned only by its URL: `Pin: origin build-host.example`.
 
 ### What `Trusted: yes` gives up
 

@@ -1404,11 +1404,22 @@ impl Engine {
         // package's file name carries no architecture, so one pool shared across
         // them would overwrite a file and strand the other architecture's index
         // on a stale checksum. See `pool::pool_dir`.
-        let pool = LocalPool::new(
+        //
+        // Its `Release` is dated with the run's own stamp, which is settled
+        // before any architecture starts, so every pool a run publishes carries
+        // one date and a run pinned with `--build-date` writes the same
+        // `Release` every time.
+        let pool = LocalPool::publishing(
             crate::pool::pool_dir(&self.work_dir, &recipe.suite, architecture),
             recipe.suite.clone(),
             crate::pool::POOL_COMPONENT,
             architecture.to_string(),
+            crate::pool::PoolRelease {
+                date: context.stamp.seconds(),
+                origin: recipe.origin.clone(),
+                label: recipe.label.clone(),
+                description: recipe.description.clone(),
+            },
         );
 
         // 1. Decide which components to build, from this architecture's prior

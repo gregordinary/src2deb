@@ -97,6 +97,19 @@ source.git = "https://github.com/pop-os/cosmic-settings"
   ```toml
   mirror = "http://ftp.uk.debian.org/debian"
   ```
+- `origin`, `label`, `description` — what the pool's `Release` declares itself to
+  be. All optional, and all unwritten by default: an origin names the
+  organization behind an archive, and src2deb has none to offer on your behalf.
+  Name them to make the pool pinnable the way apt's documentation leads with, and
+  give the same values to every recipe built into one pool — a pool has a single
+  `Release`, so the last recipe to publish writes it. See
+  [What the `Release` declares](using-the-pool.md#what-the-release-declares).
+
+  ```toml
+  origin = "texor.io"
+  label = "COSMIC for Debian"
+  description = "COSMIC desktop packages for Debian"
+  ```
 
 ## Toolchain
 

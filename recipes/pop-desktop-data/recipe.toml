@@ -17,6 +17,12 @@
 name = "pop-desktop-data"
 suite = "trixie"
 
+# The pool's Release identity, the same three values the other recipes built
+# into this pool declare. See recipes/cosmic-epoch/recipe.toml.
+origin = "texor.io"
+label = "COSMIC for Debian"
+description = "COSMIC desktop packages for Debian"
+
 # Recommended by cosmic-settings and depended on by cosmic-settings-daemon.
 [[components]]
 name = "adw-gtk3"
