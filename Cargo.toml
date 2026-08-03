@@ -28,7 +28,10 @@ sha2 = "0.10"
 # turn Ctrl-C into a request the run consults rather than a killed process.
 # The library takes the flag as an input and installs nothing itself.
 signal-hook = { version = "0.3.18", default-features = false }
-toml = "0.8"
+# Recipes and provenance manifests are TOML, read and written through serde as
+# whole documents. Nothing here edits one in place, so the plain parser is all
+# that is needed and no order-preserving map is pulled in behind it.
+toml = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
