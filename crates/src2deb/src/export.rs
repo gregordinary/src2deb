@@ -589,8 +589,16 @@ fn deduplicate(outputs: &mut [ComponentOutput], owner: Option<&str>) -> Vec<Dupl
 
     for output in outputs.iter_mut() {
         output.packages.retain(|file| {
-            keep.get(&file.package)
-                .is_none_or(|kept| kept == &output.architecture)
+            // The decision was made over arch-indep files alone, so it applies
+            // to those alone. Debian policy permits one source to declare a
+            // package `Architecture: all` and another to declare an
+            // architecture-dependent one of the same name, and the second is
+            // never a duplicate of anything: its file name carries its
+            // architecture, so no two of them collide.
+            !file.arch_indep
+                || keep
+                    .get(&file.package)
+                    .is_none_or(|kept| kept == &output.architecture)
         });
         // A component whose every package went elsewhere contributes nothing,
         // not even the records beside them: they describe a build whose output
@@ -986,6 +994,49 @@ mod tests {
         let mut outputs = vec![output("c", "amd64", "c-data", "1.0")];
         assert!(deduplicate(&mut outputs, None).is_empty());
         assert_eq!(outputs[0].packages.len(), 1);
+    }
+
+    /// The same as [`output`], for a package whose file name carries an
+    /// architecture.
+    fn dependent_output(
+        component: &str,
+        architecture: &str,
+        package: &str,
+        version: &str,
+    ) -> ComponentOutput {
+        let mut output = output(component, architecture, package, version);
+        let name = format!("{package}_{version}_{architecture}.deb");
+        output.packages[0].arch_indep = false;
+        output.packages[0].carried = Carried {
+            source: PathBuf::from(&name),
+            name,
+        };
+        output
+    }
+
+    #[test]
+    fn an_architecture_dependent_package_is_never_dropped_as_a_duplicate() {
+        // Debian policy permits one source to declare `p` as `Architecture:
+        // all` and another to declare an architecture-dependent `p`. The
+        // arch-indep copies deduplicate against each other; the arch-dependent
+        // one carries its architecture in its file name and collides with
+        // nothing, so the decision must not reach it.
+        let mut outputs = vec![
+            output("c", "amd64", "p", "1.0"),
+            output("c", "arm64", "p", "1.0"),
+            dependent_output("d", "amd64", "p", "1.0"),
+        ];
+        let duplicates = deduplicate(&mut outputs, Some("arm64"));
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].kept, "arm64");
+        assert_eq!(duplicates[0].dropped, ["amd64"]);
+        // The `all` copy the non-owner built goes...
+        assert!(outputs[0].packages.is_empty());
+        assert_eq!(outputs[1].packages.len(), 1);
+        // ...and the architecture-dependent package of the same name stays,
+        // records and all.
+        assert_eq!(outputs[2].packages.len(), 1);
+        assert_eq!(outputs[2].records.len(), 1);
     }
 
     #[test]
