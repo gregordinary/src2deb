@@ -83,9 +83,10 @@
 //! declines to *start* one instead.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use ferroday_cage::provision::debian::{
-    BuildLayer, Debian, DebianBuilder, DebianEvent, Plan, Repository,
+    BuildLayer, Debian, DebianBuilder, DebianEvent, Plan, Repository, ResolvedArchive,
 };
 use ferroday_cage::provision::{self, Provision, ProvisionEvent, ProvisionObserver};
 use ferroday_cage::{Cage, CageBuilder};
@@ -665,6 +666,67 @@ fn archive_repository(
     builder.build().map_err(Error::Debian)
 }
 
+/// The distinct archive states a run's resolves observed.
+///
+/// A run resolves many times — once for the shared base, once for each
+/// component's root — and every one of those resolves reports the state of every
+/// archive it read: the mirror that actually served, the digest of the release
+/// body that was verified, that release's own `Date`, and the key that verified
+/// it. Those states should be identical across a run, and a run where they are
+/// not is the interesting case: the archive published while the run was building
+/// against it.
+///
+/// So the states are collected rather than assumed, and only the distinct ones
+/// are kept. One entry per configured repository is the ordinary result; two for
+/// one mirror is a run that saw the archive move, which the record shows rather
+/// than flattens.
+///
+/// Behind a lock because a parallel run's workers resolve concurrently. The lock
+/// is held only to compare and push, never across a fetch.
+#[derive(Debug, Default)]
+struct ArchiveLog {
+    seen: Mutex<Vec<ResolvedArchive>>,
+}
+
+impl ArchiveLog {
+    /// Records any of `archives` not already held.
+    ///
+    /// A poisoned lock is passed over. This is a provenance record rather than
+    /// build state, and losing an entry to a panicking worker is not a reason to
+    /// fail a run that is otherwise fine — the worker's own failure is reported
+    /// on its own terms.
+    fn observe(&self, archives: &[ResolvedArchive]) {
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        for archive in archives {
+            if !seen.contains(archive) {
+                seen.push(archive.clone());
+            }
+        }
+    }
+
+    /// Every state observed, in an order no scheduling can vary: by mirror, then
+    /// by suite, then by the digest of the release that was verified.
+    ///
+    /// Sorted rather than kept in observation order, because a parallel run
+    /// observes them in whichever order its workers happen to finish and a
+    /// provenance record must not vary with that. Where one mirror and suite
+    /// yield two entries, the release `Date` each carries is what orders them in
+    /// time, and it is the archive's own fact rather than an artefact of how the
+    /// run was scheduled.
+    fn resolved(&self) -> Vec<ResolvedArchive> {
+        let Ok(seen) = self.seen.lock() else {
+            return Vec::new();
+        };
+        let mut archives = seen.clone();
+        archives.sort_by(|a, b| {
+            (&a.mirror, &a.suite, &a.release_sha256).cmp(&(&b.mirror, &b.suite, &b.release_sha256))
+        });
+        archives
+    }
+}
+
 /// A provisioned build root, ready to root a build cage.
 pub trait BuildRoot {
     /// Returns a [`CageBuilder`] already rooted at this build environment: a
@@ -716,6 +778,13 @@ pub trait BuildRootProvider {
         pool_repo: Option<Repository>,
         reporter: &mut dyn FnMut(Progress),
     ) -> Result<Box<dyn BuildRoot>>;
+
+    /// Every distinct archive state this provider's resolves observed, in a
+    /// stable order. See [`ArchiveLog`].
+    ///
+    /// Read once the run's roots are all provisioned, so it accounts for every
+    /// resolve the run made rather than for whichever came first.
+    fn archives(&self) -> Vec<ResolvedArchive>;
 }
 
 /// The provisioning settings a [`FullReprovision`] or [`LayeredProvision`]
@@ -808,6 +877,7 @@ pub struct FullReprovision {
     config: ProvisionConfig,
     roots_dir: PathBuf,
     cancel: Cancel,
+    archives: ArchiveLog,
 }
 
 impl FullReprovision {
@@ -823,6 +893,7 @@ impl FullReprovision {
             config,
             roots_dir: roots_dir.into(),
             cancel,
+            archives: ArchiveLog::default(),
         }
     }
 }
@@ -830,6 +901,10 @@ impl FullReprovision {
 impl BuildRootProvider for FullReprovision {
     fn prepare(&mut self, _reporter: &mut dyn FnMut(Progress)) -> Result<()> {
         Ok(())
+    }
+
+    fn archives(&self) -> Vec<ResolvedArchive> {
+        self.archives.resolved()
     }
 
     fn build_root(
@@ -860,6 +935,7 @@ impl BuildRootProvider for FullReprovision {
         let mut resolver = builder.build().map_err(Error::Debian)?;
         let rustup_version = self.config.rustup_version();
         let plan = resolve_plan(&mut resolver, Some(name), reporter)?;
+        self.archives.observe(&plan.archives);
         let key = plan_key(&plan, rustup_version);
         let mut debian = pinned_provisioner(&self.config, pool_repo, plan)?;
         let mut observer = Bootstrap::new(Some(name), &self.cancel, reporter);
@@ -925,6 +1001,7 @@ pub struct LayeredProvision {
     /// Holds one disposable overlay upper per component.
     uppers_dir: PathBuf,
     cancel: Cancel,
+    archives: ArchiveLog,
 }
 
 impl LayeredProvision {
@@ -942,11 +1019,16 @@ impl LayeredProvision {
             base_dir: base_dir.into(),
             uppers_dir: uppers_dir.into(),
             cancel,
+            archives: ArchiveLog::default(),
         }
     }
 }
 
 impl BuildRootProvider for LayeredProvision {
+    fn archives(&self) -> Vec<ResolvedArchive> {
+        self.archives.resolved()
+    }
+
     fn prepare(&mut self, reporter: &mut dyn FnMut(Progress)) -> Result<()> {
         reporter(Progress::Provisioning { component: None });
         // Bootstrap the shared base once, toolchain baked in. Every component's
@@ -965,6 +1047,7 @@ impl BuildRootProvider for LayeredProvision {
             .map_err(Error::Debian)?;
         let rustup_version = self.config.rustup_version();
         let plan = resolve_plan(&mut resolver, None, reporter)?;
+        self.archives.observe(&plan.archives);
         let key = plan_key(&plan, rustup_version);
         // The base resolves against the archive alone: it is bootstrapped before
         // any component builds, so the pool holds nothing to feed into it.
@@ -1046,9 +1129,19 @@ impl BuildRootProvider for LayeredProvision {
         // the only way to see an increment being resolved, downloaded, and
         // unpacked, which on the preferred strategy is every per-component root
         // there is.
+        //
+        // The sink is also where the layer's archive state comes from. A layer
+        // resolves inside `stage_layer` and hands back no plan, so the resolved
+        // event carrying one is the only view of it — and it is the view that
+        // matters, since the pool is a repository the base never saw.
         let mut debian = builder.build().map_err(Error::Debian)?;
         let mut root = RootProgress::new(Some(name));
-        let mut sink = |event: DebianEvent<'_>| root.report(&event, reporter);
+        let mut sink = |event: DebianEvent<'_>| {
+            if let DebianEvent::Resolved { plan, .. } = &event {
+                self.archives.observe(&plan.archives);
+            }
+            root.report(&event, reporter);
+        };
         let layer = debian
             .observe(&mut sink)
             .stage_layer(&upper)
@@ -1356,6 +1449,68 @@ mod tests {
             pinned,
             format_plan_key("trixie", "amd64", Some("1.97.0"), packages.iter().copied()),
         );
+    }
+
+    /// An archive state as a resolve reports one, varied by `digest`.
+    ///
+    /// Built through the plan document rather than by construction:
+    /// `ResolvedArchive` is `#[non_exhaustive]`, so a consumer cannot make one,
+    /// and parsing is how a caller outside the crate comes by a value at all.
+    fn archive(mirror: &str, digest: &str) -> ResolvedArchive {
+        let document = format!(
+            "Format: ferroday-cage-plan 1\nSuite: trixie\nArchitecture: amd64\n\n\
+             Archive: 0\nMirror: {mirror}\nSuite: trixie\nComponents: main\n\
+             Release-SHA256: {digest}\nSigned-By: \n"
+        );
+        Plan::parse_document(&document)
+            .expect("a well-formed plan document")
+            .archives
+            .remove(0)
+    }
+
+    #[test]
+    fn an_archive_state_is_recorded_once_however_many_roots_observed_it() {
+        // Every root a run provisions resolves against the same archives, so a
+        // 26-component run observes each of them 27 times. The record holds one
+        // entry, not 27.
+        let log = ArchiveLog::default();
+        let debian = archive("http://deb.debian.org/debian", "aaaa");
+        for _ in 0..27 {
+            log.observe(std::slice::from_ref(&debian));
+        }
+        assert_eq!(log.resolved(), [debian]);
+    }
+
+    #[test]
+    fn an_archive_that_published_mid_run_is_recorded_as_the_two_states_it_was() {
+        // The interesting case, and the reason the states are compared rather
+        // than assumed identical: the archive moved while the run was building
+        // against it, so some roots hold packages selected from one state and
+        // some from another.
+        let log = ArchiveLog::default();
+        let before = archive("http://deb.debian.org/debian", "aaaa");
+        let after = archive("http://deb.debian.org/debian", "bbbb");
+        log.observe(std::slice::from_ref(&before));
+        log.observe(std::slice::from_ref(&after));
+        assert_eq!(log.resolved(), [before, after]);
+    }
+
+    #[test]
+    fn the_recorded_order_does_not_depend_on_which_root_resolved_first() {
+        // A parallel run's workers observe archives in whichever order they
+        // finish. A provenance record must not vary with that, so the states are
+        // ordered by what they are rather than by when they were seen.
+        let pool = archive("file:///work/pool/trixie/amd64", "cccc");
+        let debian = archive("http://deb.debian.org/debian", "aaaa");
+
+        let one_way = ArchiveLog::default();
+        one_way.observe(&[pool.clone(), debian.clone()]);
+        let other_way = ArchiveLog::default();
+        other_way.observe(&[debian.clone(), pool.clone()]);
+
+        assert_eq!(one_way.resolved(), other_way.resolved());
+        // `file://` before `http://`, which is the mirror ordering.
+        assert_eq!(one_way.resolved(), [pool, debian]);
     }
 
     #[test]

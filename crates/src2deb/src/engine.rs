@@ -1426,10 +1426,12 @@ impl Engine {
         //    manifest: it is what `--skip-published` consults, and what the
         //    manifest written below folds forward so untouched components stay
         //    recorded.
-        let (prior_build_date, prior_sandbox, prior_records) = match prior.manifest {
+        let (prior_build_date, prior_sandbox, prior_archives, prior_records) = match prior.manifest
+        {
             Some(manifest) => (
                 manifest.build_date,
                 manifest.sandbox,
+                manifest.archives,
                 manifest
                     .components
                     .into_iter()
@@ -1439,6 +1441,7 @@ impl Engine {
             None => (
                 None,
                 None,
+                Vec::new(),
                 BTreeMap::<String, manifest::ComponentRecord>::new(),
             ),
         };
@@ -1613,6 +1616,19 @@ impl Engine {
         // prior record: the packages the manifest still calls built were built
         // under it, and dropping it would leave them unaccounted for.
         let sandbox = sandbox.map(|(_, record)| record).or(prior_sandbox);
+        // The archives every root this architecture provisioned resolved
+        // against, read once every root is provisioned. A run that provisioned
+        // nothing resolved nothing and keeps what the prior manifest holds, the
+        // same carry-forward the sandbox record gets.
+        let archives: Vec<manifest::ArchiveRecord> = provider
+            .archives()
+            .iter()
+            .map(manifest::ArchiveRecord::of)
+            .collect();
+        let archives = match archives.is_empty() {
+            false => archives,
+            true => prior_archives,
+        };
 
         // A cancelled run stops before reaching every component it selected.
         // Record those, and the one it stopped partway through, so the manifest
@@ -1657,6 +1673,7 @@ impl Engine {
             &self.work_dir,
         )
         .with_sandbox(sandbox)
+        .with_archives(archives)
         .with_build_date(build_date)
         .write(&report.manifest_path)?;
         reporter(Progress::Manifest {

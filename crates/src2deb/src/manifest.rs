@@ -28,6 +28,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use ferroday_cage::provision::debian::ResolvedArchive;
 use ferroday_cage::{ResolvedInputs, ResolvedMount};
 use serde::{Deserialize, Serialize};
 
@@ -116,9 +117,94 @@ pub struct Manifest {
     /// nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxRecord>,
+    /// The archive states the run's build roots resolved against.
+    ///
+    /// Carried forward like the sandbox record and for the same reason: a run
+    /// that provisions nothing resolves nothing, and the archives the packages
+    /// this manifest still calls built came from are the ones already recorded.
+    #[serde(rename = "archive", default, skip_serializing_if = "Vec::is_empty")]
+    pub archives: Vec<ArchiveRecord>,
     /// Each component's record, in build order.
     #[serde(rename = "component", default)]
     pub components: Vec<ComponentRecord>,
+}
+
+/// One archive state a run's build roots resolved against.
+///
+/// The plan key a component records is a digest over names, versions, and
+/// package digests. It says which packages a root holds and nothing about what
+/// they were selected *from* — and the same suite resolves to different versions
+/// a week apart, so a record naming only the selection cannot say what the
+/// selection was made from. This is that: the mirror that actually served, the
+/// digest of the release body that was verified, that release's own dates, and
+/// the key that verified it.
+///
+/// # One entry per archive, usually
+///
+/// A run resolves once for the shared base and once per component's root, so it
+/// observes each configured archive several times. The states are compared rather
+/// than assumed identical, and only the distinct ones are recorded: one entry per
+/// repository is the ordinary result, and two for one mirror and suite is a run
+/// that saw the archive publish while it was building against it. Each carries
+/// the release's own `Date`, which is what orders the two in time.
+///
+/// A projection of ferroday-cage's `ResolvedArchive` into the manifest's own
+/// vocabulary, as the mount records are, so the manifest's schema stays
+/// src2deb's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveRecord {
+    /// The mirror URL that served the release, which is where the packages were
+    /// fetched from.
+    ///
+    /// The one that answered rather than the configured list: a repository with
+    /// a fallback resolves against whichever mirror served, and recording the
+    /// list would describe a choice rather than the choice made.
+    pub mirror: String,
+    /// The suite as the repository requested it, which for an additional
+    /// repository need not be the run's own.
+    pub suite: String,
+    /// The components resolved from this archive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<String>,
+    /// The SHA-256 of the release body that was verified, lowercase hex.
+    ///
+    /// For a signed archive this is the digest of the cleartext the signature
+    /// covers, so it names the exact archive state that signature vouched for.
+    #[serde(rename = "release-sha256")]
+    pub release_sha256: String,
+    /// The release's `Date` field, as written, when it carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// The release's `Valid-Until` field, as written, when it carried one.
+    #[serde(
+        rename = "valid-until",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub valid_until: Option<String>,
+    /// The fingerprints of the key that verified the release, uppercase hex.
+    ///
+    /// Written empty rather than omitted for an archive trusted unsigned, where
+    /// nothing was verified — the local pool is one. An empty list is a fact
+    /// about the archive; an absent key could not be told from a record written
+    /// before the field existed.
+    #[serde(rename = "signed-by")]
+    pub signed_by: Vec<String>,
+}
+
+impl ArchiveRecord {
+    /// Records an archive as a resolve found it.
+    pub fn of(archive: &ResolvedArchive) -> ArchiveRecord {
+        ArchiveRecord {
+            mirror: archive.mirror.clone(),
+            suite: archive.suite.clone(),
+            components: archive.components.clone(),
+            release_sha256: archive.release_sha256.clone(),
+            date: archive.date.clone(),
+            valid_until: archive.valid_until.clone(),
+            signed_by: archive.signed_by.clone(),
+        }
+    }
 }
 
 /// The sandbox inputs a run's builds ran under: the environment the build
@@ -483,6 +569,7 @@ impl Manifest {
             architecture: architecture.into(),
             build_date: None,
             sandbox: None,
+            archives: Vec::new(),
             components: records,
         }
     }
@@ -491,6 +578,14 @@ impl Manifest {
     /// nothing has none to record.
     pub fn with_sandbox(mut self, sandbox: Option<SandboxRecord>) -> Manifest {
         self.sandbox = sandbox;
+        self
+    }
+
+    /// Records the archive states the run's build roots resolved against. A run
+    /// that provisioned nothing resolved nothing and keeps what is already
+    /// there; see [`Manifest::archives`].
+    pub fn with_archives(mut self, archives: Vec<ArchiveRecord>) -> Manifest {
+        self.archives = archives;
         self
     }
 
@@ -901,6 +996,76 @@ mod tests {
         let toml = manifest.to_toml();
         assert!(!toml.contains("sandbox"), "{toml}");
         assert!(Manifest::load_from_str(&toml).sandbox.is_none());
+    }
+
+    /// An archive record as a run resolving against the Debian CDN produces one.
+    fn signed_archive() -> ArchiveRecord {
+        ArchiveRecord {
+            mirror: "http://deb.debian.org/debian".to_string(),
+            suite: "trixie".to_string(),
+            components: vec!["main".to_string()],
+            release_sha256: "74122baf".to_string(),
+            date: Some("Sat, 11 Jul 2026 09:02:23 UTC".to_string()),
+            valid_until: Some("Sat, 18 Jul 2026 09:02:23 UTC".to_string()),
+            signed_by: vec!["4CB50190207B4758A3F73A796ED0E7B82643E131".to_string()],
+        }
+    }
+
+    /// One as the run's own `file://` pool produces: trusted unsigned, so
+    /// nothing verified it.
+    fn unsigned_pool() -> ArchiveRecord {
+        ArchiveRecord {
+            mirror: "file:///work/pool/trixie/amd64".to_string(),
+            suite: "trixie".to_string(),
+            components: vec!["main".to_string()],
+            release_sha256: "c50692c3".to_string(),
+            date: Some("Mon, 03 Aug 2026 06:41:35 UTC".to_string()),
+            valid_until: None,
+            signed_by: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_manifest_records_the_archive_state_each_root_resolved_against() {
+        let manifest = Manifest::new("r", "trixie", "amd64", Vec::new())
+            .with_archives(vec![unsigned_pool(), signed_archive()]);
+        let toml = manifest.to_toml();
+
+        // The signing key the release was verified against, which is what the
+        // plan key alone could never say: it digests the selection and not what
+        // the selection was made from.
+        assert!(
+            toml.contains("signed-by = [\"4CB50190207B4758A3F73A796ED0E7B82643E131\"]"),
+            "{toml}",
+        );
+        // The run's own pool verifies nothing, and records that as an empty list
+        // rather than by leaving the key out — an absent key could not be told
+        // from a record written before the field existed.
+        assert!(toml.contains("signed-by = []"), "{toml}");
+
+        let parsed = Manifest::load_from_str(&toml);
+        assert_eq!(parsed.archives, [unsigned_pool(), signed_archive()]);
+    }
+
+    #[test]
+    fn a_manifest_that_resolved_nothing_omits_the_archives() {
+        // A run that provisions nothing resolves nothing. It says so by leaving
+        // the section out, as it does for the sandbox record.
+        let toml = Manifest::new("r", "trixie", "amd64", Vec::new()).to_toml();
+        assert!(!toml.contains("archive"), "{toml}");
+        assert!(Manifest::load_from_str(&toml).archives.is_empty());
+    }
+
+    #[test]
+    fn a_valid_until_the_release_did_not_carry_is_left_out() {
+        // Debian's own releases carry one and a locally written pool does not,
+        // and the two are different facts about an archive rather than one
+        // rendered two ways.
+        let toml =
+            Manifest::new("r", "trixie", "amd64", Vec::new()).with_archives(vec![unsigned_pool()]);
+        let toml = toml.to_toml();
+        assert!(!toml.contains("valid-until"), "{toml}");
+        assert_eq!(Manifest::load_from_str(&toml).archives[0].valid_until, None);
     }
 
     #[test]

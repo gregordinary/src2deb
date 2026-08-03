@@ -71,7 +71,7 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use export::{ExportOptions, ExportReport};
 pub use fingerprint::{Fingerprint, SourceInput, SourceKind, SourceRole};
-pub use manifest::{BuildIdentity, Manifest};
+pub use manifest::{ArchiveRecord, BuildIdentity, Manifest};
 pub use pool::{PoolRelease, PruneOptions, PruneReport};
 pub use recipe::{Component, Origin, Recipe, Source, VersionFrom, VersionSource};
 pub use source::VendorPass;

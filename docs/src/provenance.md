@@ -28,11 +28,11 @@ architecture.
 ## Contents
 
 The manifest records the recipe's identity, the date the run's versions were
-stamped with, the sandbox the run's builds ran in, and one entry per component,
-in build order. A component that built carries its produced packages and their
-versions; a component that failed carries the failure reason. Both carry what
-their source resolved to, so a run that stops partway still records the exact
-inputs it reached.
+stamped with, the sandbox the run's builds ran in, the archives its build roots
+resolved against, and one entry per component, in build order. A component that
+built carries its produced packages and their versions; a component that failed
+carries the failure reason. Both carry what their source resolved to, so a run
+that stops partway still records the exact inputs it reached.
 
 ```toml
 recipe = "cosmic-epoch"
@@ -40,7 +40,7 @@ suite = "trixie"
 architecture = "amd64"
 build-date = "2026-07-31"
 
-# The [sandbox] section goes here; see below.
+# The [sandbox] and [[archive]] sections go here; see below.
 
 [[component]]
 name = "cosmic-randr"
@@ -314,6 +314,60 @@ Only the build pass is recorded. The vendor pass runs with the host network to
 fetch sources into the tree; it does not produce packages, so what it ran under
 says nothing about what the packages were built from. See
 [How a build runs](how-a-build-runs.md).
+
+## The archive record
+
+A component's packages were built against a set of build-dependencies, and those
+came from somewhere. Each `[[archive]]` entry says where, as the resolver found
+it:
+
+```toml
+[[archive]]
+mirror = "http://deb.debian.org/debian"
+suite = "trixie"
+components = ["main"]
+release-sha256 = "74122bafc4253d3d42ba3657a21f7219aed1423dcbeb1b3b2c2d52fb66ed7070"
+date = "Sat, 11 Jul 2026 09:02:23 UTC"
+valid-until = "Sat, 18 Jul 2026 09:02:23 UTC"
+signed-by = ["4CB50190207B4758A3F73A796ED0E7B82643E131"]
+
+[[archive]]
+mirror = "file:///mnt/build/work/pool/trixie/amd64"
+suite = "trixie"
+components = ["main"]
+release-sha256 = "c50692c33fa2726827a5a6173eedd3d8f56a8f69f52a2ccbe1feabae7186f610"
+date = "Mon, 03 Aug 2026 06:41:35 UTC"
+signed-by = []
+```
+
+- **`mirror`** is the URL that answered, not the list that was configured. A
+  repository with a fallback resolves against whichever mirror served.
+- **`release-sha256`** is the digest of the release body that was verified. For a
+  signed archive that is the cleartext the signature covers, so it names the
+  exact archive state the signature vouched for.
+- **`signed-by`** is the key that verified it. Written empty rather than omitted
+  for an archive trusted unsigned — the run's own pool is one — because an
+  archive that verified nothing is a fact, and an absent key could not be told
+  from a record written before the field existed.
+- **`valid-until`** appears only when the release carried one. Debian's do; a
+  locally written pool's does not.
+
+This is what the plan key each root is cached on cannot say. That key digests the
+selection — names, versions, and package digests — and says nothing about what
+the selection was made from, and the same suite resolves to different versions a
+week apart.
+
+Every root a run provisions resolves against the same archives, so a run observes
+each of them many times over. The states are compared rather than assumed
+identical, and only the distinct ones are recorded. One entry per configured
+repository is the ordinary result. **Two entries for one mirror and suite is a
+run that saw the archive publish while it was building against it**, and the
+`date` each carries is what orders them: some of the run's roots hold packages
+selected from one state and some from the other.
+
+The record covers the run rather than any one component, and a run that
+provisions nothing keeps what is already there, both for the same reasons the
+sandbox record does.
 
 ## Resume state
 
