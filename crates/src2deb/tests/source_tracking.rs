@@ -22,13 +22,39 @@ use src2deb::source::SourceResolver;
 use src2deb::version::{BuildStamp, ChangelogHead, parse_changelog};
 use src2deb::{Fingerprint, Source, SourceInput, SourceRole, VersionFrom};
 
-/// Whether `git` can be launched at all; the tests no-op when it cannot.
+/// The environment variable that opts a host without `git` out of the tests
+/// that drive it.
+const SKIP_GIT: &str = "SRC2DEB_SKIP_GIT_TESTS";
+
+/// The same, for the tests that fetch through `curl`.
+const SKIP_CURL: &str = "SRC2DEB_SKIP_CURL_TESTS";
+
+/// Whether the tests that drive real `git` should run.
 fn git_available() -> bool {
-    Command::new("git")
+    tool_available("git", SKIP_GIT)
+}
+
+/// Whether `tool` can be launched, failing the test rather than skipping it
+/// when it cannot and `skip_var` is unset.
+///
+/// Most of this suite exercises `git` or `curl` against local fixtures rather
+/// than mocking them, so a host without one of them runs almost none of the
+/// source resolver. Reporting that as all-green is worse than failing, so the
+/// default is to fail and name what is missing; a host that cannot install the
+/// tool opts out deliberately.
+fn tool_available(tool: &str, skip_var: &str) -> bool {
+    let present = Command::new(tool)
         .arg("--version")
         .output()
         .map(|out| out.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        present || std::env::var_os(skip_var).is_some(),
+        "{tool} is not available, and these tests drive it against local \
+         fixtures rather than standing in for it. Install {tool}, or set \
+         {skip_var}=1 to skip the tests that need it."
+    );
+    present
 }
 
 /// Runs `git` in `dir`, asserting success.
@@ -2015,14 +2041,10 @@ fn a_declared_version_serves_a_component_packaged_from_a_second_repository() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Whether `curl` can be launched at all; the archive tests no-op when it
-/// cannot, as the git ones do without `git`.
+/// Whether the archive tests, which fetch through `curl`, should run — held to
+/// the same rule as [`git_available`].
 fn curl_available() -> bool {
-    Command::new("curl")
-        .arg("--version")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    tool_available("curl", SKIP_CURL)
 }
 
 /// Writes an uncompressed ustar archive at `path` holding `entries`, each a

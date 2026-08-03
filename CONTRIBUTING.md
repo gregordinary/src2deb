@@ -13,9 +13,14 @@ cargo build
 cargo test --workspace
 ```
 
+The integration tests drive real `git` and real `curl` against local fixtures,
+so a host without either fails them rather than reporting green having run
+almost none of the source resolver. Set `SRC2DEB_SKIP_GIT_TESTS=1` or
+`SRC2DEB_SKIP_CURL_TESTS=1` to skip those deliberately.
+
 The unit tests build no packages and provision no roots, so they run anywhere
 Cargo does. Exercising the pipeline end to end needs a host with unprivileged
-user namespaces, `git`, and `git-lfs`, and a recipe to build:
+user namespaces, `git`, `git-lfs`, and `curl`, and a recipe to build:
 
 ```sh
 cargo run -p src2deb-cli -- build recipes/pop-desktop-data --work ./work
