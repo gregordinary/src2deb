@@ -9,7 +9,10 @@
 //! For a **git** source it clones (or updates) the repository under the work
 //! directory, checks out the requested ref, initializes submodules — so a
 //! submodule superproject such as cosmic-epoch resolves its members — and
-//! materializes Git LFS content.
+//! materializes Git LFS content. A checkout is only ever updated from the
+//! repository it was cloned from: a recipe repointed at another one is refused
+//! rather than fetched into, since a fetch takes its remote from the checkout
+//! and would otherwise go on building what the recipe no longer names.
 //!
 //! For a **path** source it copies the tree on disk into the work directory and
 //! builds from the copy. See [Path sources](#path-sources).
@@ -539,16 +542,18 @@ impl<'a> SourceResolver<'a> {
     /// concrete revision even when the recipe tracked a branch or the remote's
     /// default.
     ///
-    /// A re-run always lands on the fetched remote state: a branch ref advances
-    /// to its upstream tip, a tag or commit resolves to itself, and an unset ref
-    /// tracks the remote's default branch. See `resolve_target`.
+    /// A re-run always lands on the fetched remote state of the repository the
+    /// recipe names: a branch ref advances to its upstream tip, a tag or commit
+    /// resolves to itself, and an unset ref tracks the remote's default branch.
+    /// See `resolve_target`, and `refuse_repointed_remote` for what happens when
+    /// the recipe names a repository the checkout was not cloned from.
     fn resolve_git(
         &self,
         component: &Component,
         url: &str,
         git_ref: Option<&str>,
     ) -> Result<ResolvedTree> {
-        let checkout = self.checkout_git(component, &self.sources_dir, url, git_ref)?;
+        let checkout = self.checkout_git(component, "source", &self.sources_dir, url, git_ref)?;
         let subdir = component.source.subdir.as_deref();
         let tree = source_tree(&checkout, subdir);
         refuse_missing_subdir(component, "source", subdir, &tree)?;
@@ -645,10 +650,12 @@ impl<'a> SourceResolver<'a> {
     /// the checkout.
     ///
     /// Serves a component's source and its packaging overlay alike, differing
-    /// only in the `parent` they land under.
+    /// only in the `parent` they land under; `field` names which of the two, so
+    /// an error quotes the setting the recipe wrote.
     fn checkout_git(
         &self,
         component: &Component,
+        field: &str,
         parent: &Path,
         url: &str,
         git_ref: Option<&str>,
@@ -657,6 +664,9 @@ impl<'a> SourceResolver<'a> {
         let checkout = parent.join(&component.name);
 
         if checkout.join(".git").is_dir() {
+            // A fetch takes its remote from the checkout rather than from the
+            // recipe, so what the recipe now names is checked before it runs.
+            self.refuse_repointed_remote(component, field, &checkout, url)?;
             // Fetch updates the remote-tracking refs (`origin/*`) and tags, but
             // never the local branches; the checkout below targets that fetched
             // remote state so a re-run picks up upstream. `--force` lets a moved
@@ -692,6 +702,64 @@ impl<'a> SourceResolver<'a> {
         Ok(checkout)
     }
 
+    /// Refuses a checkout whose `origin` is not the repository the recipe names.
+    ///
+    /// A fetch takes its remote from the checkout's own configuration, so
+    /// without this a recipe repointed at a fork, a mirror, a renamed upstream,
+    /// or another protocol would go on building the repository the first run
+    /// cloned — successfully, and with the run's manifest recording a commit
+    /// from a repository the recipe no longer names.
+    ///
+    /// Repointing the checkout instead would be quieter and wrong. The objects,
+    /// tags, and `origin/HEAD` of the repository it was cloned from stay behind
+    /// a `git remote set-url`, so a ref that resolves only in the old repository
+    /// still resolves after the remote moves, and the build lands on it. This is
+    /// therefore refused rather than repaired, as every other recipe setting the
+    /// resolver cannot honour is — see [`Recipe::load`](crate::Recipe::load).
+    ///
+    /// The comparison is exact. Two spellings of one repository — a trailing
+    /// `/`, a `.git` suffix — are rare beside a genuine repoint, and deciding
+    /// which differences are cosmetic is a judgement for whoever edits the
+    /// recipe, who settles it by deleting the checkout.
+    ///
+    /// The configured URL is read with `git config` rather than with
+    /// `git remote get-url`, which expands the host's `insteadOf` rewrites. A
+    /// rewrite redirects the *transport* — a company mirror standing in for
+    /// `github.com`, say — and does not change which repository the checkout is
+    /// of, so expanding it here would refuse every warm build on such a host.
+    /// `git config` returns what `git clone` stored, which is the URL the recipe
+    /// gave.
+    fn refuse_repointed_remote(
+        &self,
+        component: &Component,
+        field: &str,
+        checkout: &Path,
+        url: &str,
+    ) -> Result<()> {
+        let configured = self.git_capture(
+            component,
+            checkout,
+            &["config", "--get", "remote.origin.url"],
+        )?;
+        if configured.as_deref() == Some(url) {
+            return Ok(());
+        }
+        // A checkout with no `origin` at all is not one this resolver made, and
+        // is refused for the same reason: nothing there answers to the recipe.
+        let held = match &configured {
+            Some(configured) => format!("was cloned from {configured:?}"),
+            None => "has no origin remote".to_string(),
+        };
+        Err(Error::Source {
+            component: component.name.clone(),
+            reason: format!(
+                "{field}.git names {url:?}, but the checkout at {} {held}; \
+                 delete that directory to build from the repository the recipe names",
+                checkout.display(),
+            ),
+        })
+    }
+
     /// Puts the component's declared packaging in place of whatever `debian/`
     /// its source tree carries, and returns the input the overlay contributes to
     /// the component's fingerprint — `None` when the component declares none.
@@ -723,7 +791,8 @@ impl<'a> SourceResolver<'a> {
         let subdir = packaging.subdir.as_deref();
         match packaging.origin() {
             Some(Origin::Git { url, git_ref }) => {
-                let checkout = self.checkout_git(component, &self.packaging_dir, url, git_ref)?;
+                let checkout =
+                    self.checkout_git(component, "packaging", &self.packaging_dir, url, git_ref)?;
                 let tree = source_tree(&checkout, subdir);
                 refuse_missing_subdir(component, "packaging", subdir, &tree)?;
                 self.materialize_lfs(component, &checkout, &tree)?;
@@ -1320,6 +1389,32 @@ impl<'a> SourceResolver<'a> {
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
         })
+    }
+
+    /// Runs a git command in `cwd` for what it prints: `Ok(Some(output))`
+    /// trimmed when it exits successfully, `Ok(None)` when it exits non-zero,
+    /// and an error only when git cannot be launched.
+    ///
+    /// [`git_probe`](Self::git_probe) for a question whose answer is the exit
+    /// status; this for one whose answer is a line, where the command not
+    /// answering at all is itself an answer rather than a failure.
+    fn git_capture(
+        &self,
+        component: &Component,
+        cwd: &Path,
+        args: &[&str],
+    ) -> Result<Option<String>> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .map_err(|err| self.fail(component, err))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
     }
 
     /// Runs a git command in `cwd` as a boolean probe: `Ok(true)` when it exits

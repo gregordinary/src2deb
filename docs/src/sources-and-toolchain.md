@@ -27,6 +27,14 @@ to itself. What the run records is the `HEAD` the tree ended up at, so the
 revision in a package's version and in the manifest is always a concrete commit,
 never the moving ref that named it.
 
+A checkout is only ever updated from the repository it was cloned from. Change
+`source.git` to name another one and the component is refused, naming both URLs,
+because a fetch takes its remote from the checkout and would otherwise go on
+building the repository the first run cloned. Delete `work/sources/<component>`
+and the next run clones the repository the recipe now names. See [`source.git`
+names X, but the checkout at Y was cloned from
+Z](troubleshooting.md#sourcegit-names-x-but-the-checkout-at-y-was-cloned-from-z).
+
 A **path source** is a tree already on disk, built without being cloned. It is
 the difference between "edit, commit, push, run" and "run" while working on a
 packaging tree.

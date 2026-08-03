@@ -138,6 +138,41 @@ same terms as a failed build: `--keep-going` carries the run past it, records th
 component as failed with no source recorded, and folds it into the summary and
 the manifest.
 
+### `source.git names X, but the checkout at Y was cloned from Z`
+
+```text
+src2deb: FAILED cosmic-comp: resolving source for cosmic-comp: source.git names
+"https://github.com/example/cosmic-comp", but the checkout at
+/work/sources/cosmic-comp was cloned from
+"https://github.com/pop-os/cosmic-comp"; delete that directory to build from the
+repository the recipe names
+```
+
+The recipe was repointed at another repository — a fork, a mirror, a renamed
+upstream, or the same repository over another protocol — and the work directory
+still holds a checkout of the old one. Delete the checkout and build again:
+
+```sh
+rm -rf work/sources/cosmic-comp
+```
+
+A fetch takes its remote from the checkout rather than from the recipe, so the
+alternative would be to build the old repository and record its commit as though
+the recipe had asked for it. Repointing the checkout in place is not enough
+either: the objects, tags, and default branch of the repository it was cloned
+from survive a `git remote set-url`, so a ref that resolves only in the old
+repository would still resolve. A `packaging.git` overlay is refused the same way,
+and its checkout is under `work/packaging/` instead.
+
+The comparison is exact, so two spellings of one repository — a trailing `/`, a
+`.git` suffix — are refused as well. The remedy is the same, and it costs one
+re-clone.
+
+A git `insteadOf` rewrite is not a repoint and does not trigger this. The URL
+compared is the one the checkout was cloned from, not the one the rewrite sends
+the fetch to, so a host that redirects `github.com` at an internal mirror builds
+as it always did.
+
 ### `is stored with Git LFS, but git lfs is not available`
 
 ```text

@@ -335,6 +335,160 @@ fn an_unset_ref_tracks_the_default_branch_on_re_resolve() {
 }
 
 #[test]
+fn a_repointed_source_git_is_refused_rather_than_fetched_into() {
+    if !git_available() {
+        return;
+    }
+    let root = scratch("repointed-source");
+    let first = root.join("first");
+    init_repo(&first);
+    commit_marker(&first, "the repository the recipe first named");
+
+    let resolver = resolver_in(&root, &root);
+    let tree = resolver
+        .resolve(&component("pkg", &first, None))
+        .expect("first resolve")
+        .tree;
+    assert_eq!(
+        resolved_marker(&tree),
+        "the repository the recipe first named"
+    );
+
+    // The recipe now names a different repository — a fork, a mirror, or a
+    // renamed upstream. A fetch takes its remote from the checkout, so without a
+    // check the run would build the first repository and record its commit as
+    // though the recipe had asked for it.
+    let second = root.join("second");
+    init_repo(&second);
+    commit_marker(&second, "the repository the recipe now names");
+
+    let err = resolver
+        .resolve(&component("pkg", &second, None))
+        .expect_err("a checkout of another repository cannot serve this recipe");
+    let message = err.to_string();
+    // Both repositories, so the discrepancy is readable without inspecting the
+    // checkout, and the remedy, so it can be acted on.
+    assert!(message.contains(&second.display().to_string()), "{message}");
+    assert!(message.contains(&first.display().to_string()), "{message}");
+    assert!(message.contains("delete"), "{message}");
+    // The refusal leaves the checkout as it stands rather than acting on it.
+    assert_eq!(
+        resolved_marker(&tree),
+        "the repository the recipe first named"
+    );
+
+    // And the remedy the message names is the whole of it.
+    std::fs::remove_dir_all(root.join("sources/pkg")).unwrap();
+    let tree = resolver
+        .resolve(&component("pkg", &second, None))
+        .expect("a re-clone resolves the repository the recipe names")
+        .tree;
+    assert_eq!(
+        resolved_marker(&tree),
+        "the repository the recipe now names"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_transport_rewrite_is_not_read_as_a_repointed_remote() {
+    if !git_available() {
+        return;
+    }
+    let root = scratch("insteadof");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_marker(&upstream, "v1");
+
+    let resolver = resolver_in(&root, &root);
+    let comp = component("pkg", &upstream, None);
+    resolver.resolve(&comp).expect("first resolve");
+
+    // A mirror of the same repository, which is what such a rule points at.
+    let mirror = root.join("mirror");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            &upstream.to_string_lossy(),
+            "mirror",
+        ],
+    );
+
+    // An `insteadOf` rule redirects the transport — a company mirror standing
+    // in for the URL the recipe names — without changing which repository the
+    // checkout is of. `git remote get-url` expands it and `git config` does
+    // not, which is why the check reads the stored URL: expanding it here would
+    // refuse every warm build on a host that has such a rule.
+    let checkout = root.join("sources/pkg");
+    git(
+        &checkout,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", mirror.display()),
+            &upstream.to_string_lossy(),
+        ],
+    );
+
+    // Upstream moves, so the resolve has to have actually fetched — through the
+    // mirror — rather than passing over a checkout it left alone.
+    commit_marker(&upstream, "v2");
+    git(&mirror, &["fetch", "-q", "--prune"]);
+    let tree = resolver
+        .resolve(&comp)
+        .expect("a rewritten transport is still the repository the recipe names")
+        .tree;
+    assert_eq!(resolved_marker(&tree), "v2");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_repointed_packaging_git_is_refused_the_same_way() {
+    if !git_available() {
+        return;
+    }
+    let root = scratch("repointed-packaging");
+    let upstream = root.join("upstream");
+    init_repo(&upstream);
+    commit_bare_marker(&upstream, "v1");
+
+    let first = root.join("packaging-first");
+    init_repo(&first);
+    commit_packaging(&first, "from the first packaging repository");
+
+    let resolver = resolver_in(&root, &root);
+    let comp = component("pkg", &upstream, None);
+    let tree = resolver
+        .resolve(&overlaid_from_git(comp.clone(), &first))
+        .expect("first resolve")
+        .tree;
+    assert_eq!(
+        packaging_marker(&tree),
+        "from the first packaging repository"
+    );
+
+    // An overlay checkout is held to the rule its source is: it lands under a
+    // different parent and is otherwise the same checkout.
+    let second = root.join("packaging-second");
+    init_repo(&second);
+    commit_packaging(&second, "from the second packaging repository");
+
+    let err = resolver
+        .resolve(&overlaid_from_git(comp, &second))
+        .expect_err("a checkout of another repository cannot serve this overlay");
+    let message = err.to_string();
+    assert!(message.contains("packaging.git"), "{message}");
+    assert!(message.contains(&second.display().to_string()), "{message}");
+    assert!(message.contains(&first.display().to_string()), "{message}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn a_pinned_commit_stays_put_when_upstream_advances() {
     if !git_available() {
         return;
@@ -1817,7 +1971,11 @@ fn a_derived_version_never_reads_a_repository_enclosing_the_work_directory() {
     let err = resolver_in(&root, &root)
         .resolve(&described(path_component("pkg", &upstream)))
         .expect_err("the enclosing repository's tag is not this component's");
-    assert!(!err.to_string().contains("9.9.9"), "{err}");
+    let message = err.to_string();
+    // The failure has to be `git describe` finding nothing, rather than any
+    // other refusal that would also keep the tag out of the message.
+    assert!(message.contains("git describe"), "{message}");
+    assert!(!message.contains("9.9.9"), "{message}");
 
     let _ = std::fs::remove_dir_all(&enclosing);
 }
