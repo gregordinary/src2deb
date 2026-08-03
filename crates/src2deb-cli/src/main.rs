@@ -28,9 +28,10 @@ Usage:
                            [--arch-indep-owner ARCH] [--version-tag TAG]
                            [--keep-going] [--jobs N] [--only C]... | [--from C]
                            [--skip-published] [--build-date DATE|manifest]
+                           [--keep N]
   src2deb plan  RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]...
                            [--arch-indep-owner ARCH] [--version-tag TAG]
-                           [--build-deps]
+                           [--build-deps] [--runtime-deps]
   src2deb export RECIPE_DIR --to DIR [--work DIR] [--suite SUITE]
                            [--architecture ARCH]... [--arch-indep-owner ARCH]
   src2deb prune RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]...
@@ -77,6 +78,12 @@ Plan options:
                        a build does, so use a separate --work to plan while a
                        build is running
   --build-deps         Also print each component's build-dependencies
+  --runtime-deps       Report what the recipe's packaging declares at runtime
+                       that nothing would satisfy, answered against the target
+                       suite, the recipe's repositories, the pool as it stands,
+                       and the packages the recipe itself produces. Reads the
+                       archives, so it costs a release and index fetch per
+                       architecture
 
 Export options:
   --to DIR             Write the export to DIR/<suite>/ (required). The
@@ -1927,6 +1934,121 @@ mod tests {
     fn parse(args: &[&str]) -> Result<Cli, String> {
         let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         parse_args(&owned)
+    }
+
+    /// Whether [`USAGE`] names `flag` as a whole word, so `--keep` is not
+    /// answered for by `--keep-going`.
+    fn help_names(flag: &str) -> bool {
+        USAGE.match_indices(flag).any(|(index, _)| {
+            USAGE[index + flag.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '-')
+        })
+    }
+
+    #[test]
+    fn every_flag_the_parsers_accept_is_named_in_the_help_text() {
+        // The parsers match their flags as string literals, so the source is
+        // the list of them and there is no second one to keep in step. A flag
+        // that works and is undocumented is the one gap `--help` cannot show:
+        // there is nothing there to notice the absence of.
+        const SOURCE: &str = include_str!("main.rs");
+        let (parsers, _) = SOURCE
+            .split_once("\n#[cfg(test)]")
+            .expect("the tests follow the parsers");
+
+        let mut flags: Vec<&str> = Vec::new();
+        for (index, _) in parsers.match_indices("\"--") {
+            let rest = &parsers[index + 1..];
+            let end = rest
+                .find(|c: char| c == '"' || c.is_whitespace())
+                .unwrap_or(rest.len());
+            let flag = &rest[..end];
+            if !flags.contains(&flag) {
+                flags.push(flag);
+            }
+        }
+        // A scan that found nothing would pass silently, which is the one way
+        // this test could stop testing anything.
+        assert!(flags.len() > 10, "the scan found almost nothing: {flags:?}");
+        for flag in flags {
+            assert!(help_names(flag), "{flag} is accepted but --help omits it");
+        }
+    }
+
+    #[test]
+    fn each_subcommands_synopsis_names_the_flags_it_takes() {
+        // The options sections describe every flag; the synopsis is what a
+        // reader scans first, so a flag documented only below it reads as one
+        // the subcommand does not have.
+        for (subcommand, flags) in [
+            (
+                "src2deb build",
+                &[
+                    "--work",
+                    "--suite",
+                    "--architecture",
+                    "--arch-indep-owner",
+                    "--version-tag",
+                    "--keep-going",
+                    "--jobs",
+                    "--only",
+                    "--from",
+                    "--skip-published",
+                    "--build-date",
+                    "--keep",
+                ][..],
+            ),
+            (
+                "src2deb plan",
+                &[
+                    "--work",
+                    "--suite",
+                    "--architecture",
+                    "--arch-indep-owner",
+                    "--version-tag",
+                    "--build-deps",
+                    "--runtime-deps",
+                ][..],
+            ),
+            (
+                "src2deb export",
+                &[
+                    "--to",
+                    "--work",
+                    "--suite",
+                    "--architecture",
+                    "--arch-indep-owner",
+                ][..],
+            ),
+            (
+                "src2deb prune",
+                &["--work", "--suite", "--architecture", "--keep", "--dry-run"][..],
+            ),
+            (
+                "src2deb check",
+                &["--work", "--suite", "--architecture"][..],
+            ),
+        ] {
+            let start = USAGE
+                .find(subcommand)
+                .unwrap_or_else(|| panic!("{subcommand} has no synopsis"));
+            // A synopsis runs to the next one, or to the blank line that ends
+            // the block for the last of them.
+            let rest = &USAGE[start..];
+            let end = rest
+                .find("\n  src2deb ")
+                .or_else(|| rest.find("\n\n"))
+                .unwrap_or(rest.len());
+            let synopsis = &rest[..end];
+            for flag in flags {
+                assert!(
+                    synopsis.contains(flag),
+                    "{subcommand} takes {flag}, but its synopsis does not name it:\n{synopsis}"
+                );
+            }
+        }
     }
 
     /// Unwraps a parsed `build` command's arguments.
