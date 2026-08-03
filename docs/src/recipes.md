@@ -560,7 +560,8 @@ is byte-for-byte what `dpkg-source -x --skip-patches` produces.
 ### No vendor pass
 
 This is src2deb's one fully hermetic source kind. Every other source runs [pass
-1](how-a-build-runs.md#3-build-each-component) — `debian/rules clean` in a cage
+1](how-a-build-runs.md#the-vendor-pass-and-the-one-source-that-skips-it) —
+`debian/rules clean` in a cage
 with the *host network*, so a component that vendors its dependencies has them
 before the offline build. A Debian source package already carries everything its
 build needs; that is what makes it a source package. So the pass is skipped, and
