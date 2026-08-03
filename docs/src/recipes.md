@@ -97,6 +97,13 @@ source.git = "https://github.com/pop-os/cosmic-settings"
   ```toml
   mirror = "http://ftp.uk.debian.org/debian"
   ```
+
+  An `http://` or `file://` URL. An `https://` mirror is refused when the recipe
+  loads, naming the same mirror over `http://` as the remedy: an archive is
+  authenticated by the signature on its `Release`, which is verified after the
+  fetch and is what a tampered mirror fails, so the transport carries no part of
+  that guarantee. Every `.deb` is then checked against the digest the signed
+  index gives for it.
 - `origin`, `label`, `description` — what the pool's `Release` declares itself to
   be. All optional, and all unwritten by default: an origin names the
   organization behind an archive, and src2deb has none to offer on your behalf.
@@ -154,7 +161,8 @@ from, beyond the primary suite and the feed-forward pool.
   build-dependencies from the wrong release. A recipe that declares a suite here
   is a recipe for one target — leave it out to keep the recipe portable, or give
   each target its own recipe.
-- `mirror` — the archive mirror URL. Defaults to the recipe's primary mirror.
+- `mirror` — the archive mirror URL. Defaults to the recipe's primary mirror, and
+  is `http://` or `file://` on the same terms.
 - `components` — the archive components to enable. Defaults to `["main"]`.
 - `trust-unsigned` — trust the repository without verifying a signature, for a
   local or `file://` archive under your control. Defaults to `false`.
@@ -170,7 +178,7 @@ provisioner writes into the build root's `sources.list.d`, one archive to a
 line. A value carrying whitespace is refused, since the line would read it as
 two fields and configure an archive other than the one declared. The same holds
 for the recipe's own `mirror`, which stands in that field for every archive that
-does not name one.
+does not name one, and for the scheme each mirror carries.
 
 ### Worked examples
 

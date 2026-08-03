@@ -97,6 +97,10 @@ pub struct Recipe {
     pub maintainer: Option<String>,
     /// The primary archive mirror. Defaults to the Debian CDN inside the
     /// provisioner when unset.
+    ///
+    /// An `http://` or `file://` URL, and refused when it is neither: those are
+    /// the transports an archive is fetched over, and an archive is
+    /// authenticated by its signature rather than by its transport.
     #[serde(default)]
     pub mirror: Option<String>,
     /// The `Origin` the pool's `Release` declares, when the recipe names one.
@@ -210,6 +214,9 @@ pub struct Repository {
     pub suite: Option<String>,
     /// The archive mirror URL. Defaults to the recipe's primary mirror, or the
     /// provisioner's default Debian mirror when that is also unset.
+    ///
+    /// An `http://` or `file://` URL, as the primary [`mirror`](Recipe::mirror)
+    /// is, and refused on the same terms.
     #[serde(default)]
     pub mirror: Option<String>,
     /// The archive components to enable. Defaults to `["main"]`.
@@ -841,10 +848,11 @@ impl Recipe {
             }
         }
 
-        // The mirror every archive falls back to, held to the rule the archives
-        // that use it are: it stands in the same field of the same line.
+        // The mirror every archive falls back to, held to the rules the archives
+        // that use it are: it stands in the same field of the same line, and is
+        // fetched over the same two transports.
         if let Some(mirror) = &self.mirror
-            && let Some(reason) = source_line_field_error(mirror)
+            && let Some(reason) = mirror_error(mirror)
         {
             return Err(bad(format!("mirror {mirror:?} {reason}")));
         }
@@ -871,7 +879,7 @@ impl Recipe {
                 )));
             }
             if let Some(mirror) = &repository.mirror
-                && let Some(reason) = source_line_field_error(mirror)
+                && let Some(reason) = mirror_error(mirror)
             {
                 return Err(bad(format!(
                     "repository {:?} mirror {mirror:?} {reason}",
@@ -1031,6 +1039,31 @@ fn source_line_field_error(value: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Reports why a value cannot stand as an archive mirror, or `None` when it can.
+///
+/// A mirror is one field of the `deb` line, so it is held to
+/// [`source_line_field_error`] first and for the same reason. It is also the URL
+/// the archive is fetched over, and the provisioner's built-in transport speaks
+/// `http://` and `file://` only: authenticating a package is the archive
+/// signature's job rather than the transport's, so carrying a TLS stack is left
+/// to a consumer that supplies a fetcher of its own. src2deb supplies none, so
+/// no recipe can name an `https://` mirror, and the scheme is settled here —
+/// where the recipe names it, against a message a recipe can act on — rather
+/// than several minutes into a build, against one that names a Rust API.
+fn mirror_error(value: &str) -> Option<&'static str> {
+    if let Some(reason) = source_line_field_error(value) {
+        return Some(reason);
+    }
+    if value.starts_with("http://") || value.starts_with("file://") {
+        return None;
+    }
+    Some(
+        "is not an http:// or file:// URL, which are the only transports an archive \
+         is fetched over; an archive is authenticated by its signature rather than \
+         by its transport, so name the same mirror over http://",
+    )
 }
 
 /// Reports why a rustup toolchain version cannot be installed, or `None` when
@@ -1526,12 +1559,58 @@ mod tests {
 
         // An ordinary archive, with the fields all three settings take.
         load(&format!(
-            "name = \"r\"\nsuite = \"trixie\"\nmirror = \"https://deb.debian.org/debian\"\n\
+            "name = \"r\"\nsuite = \"trixie\"\nmirror = \"http://deb.debian.org/debian\"\n\
              [[repositories]]\nname = \"backports\"\nsuite = \"trixie-backports\"\n\
-             mirror = \"https://deb.debian.org/debian\"\ncomponents = [\"main\", \"contrib\"]\n\
+             mirror = \"http://deb.debian.org/debian\"\ncomponents = [\"main\", \"contrib\"]\n\
              keyring = \"/k.gpg\"\n{ONE_COMPONENT}"
         ))
         .expect("an ordinary archive loads");
+    }
+
+    #[test]
+    fn a_mirror_the_archive_cannot_be_fetched_over_is_rejected() {
+        // https:// is the one worth a message of its own: it is what a recipe
+        // author reaches for by habit, and the URL itself is perfectly good --
+        // it is the transport that is not carried.
+        for mirror in [
+            "https://deb.debian.org/debian",
+            "ftp://ftp.debian.org/debian",
+            "deb.debian.org/debian",
+        ] {
+            let err = load(&format!(
+                "name = \"r\"\nsuite = \"trixie\"\nmirror = {mirror:?}\n{ONE_COMPONENT}"
+            ))
+            .unwrap_err();
+            let message = format!("{err}");
+            assert!(
+                message.contains("mirror")
+                    && message.contains("http:// or file://")
+                    // The remedy has to be one a recipe can act on, which is
+                    // the whole reason this is checked here at all.
+                    && message.contains("name the same mirror over http://"),
+                "{mirror} gave: {message}"
+            );
+            // A repository's mirror is held to the rule the primary one is.
+            let err = load(&format!(
+                "name = \"r\"\nsuite = \"trixie\"\n\
+                 [[repositories]]\nname = \"extra\"\nkeyring = \"/k.gpg\"\n\
+                 mirror = {mirror:?}\n{ONE_COMPONENT}"
+            ))
+            .unwrap_err();
+            let message = format!("{err}");
+            assert!(
+                message.contains("repository \"extra\"") && message.contains("http:// or file://"),
+                "{mirror} gave: {message}"
+            );
+        }
+
+        // Both transports the archive is fetched over are accepted.
+        for mirror in ["http://deb.debian.org/debian", "file:///srv/build/pool"] {
+            load(&format!(
+                "name = \"r\"\nsuite = \"trixie\"\nmirror = {mirror:?}\n{ONE_COMPONENT}"
+            ))
+            .unwrap_or_else(|err| panic!("{mirror} is a mirror src2deb can fetch: {err}"));
+        }
     }
 
     #[test]
