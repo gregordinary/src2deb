@@ -108,6 +108,10 @@ source.git = "https://github.com/pop-os/cosmic-settings"
   from the client's own source URL. See
   [Pinning against the pool](using-the-pool.md#pinning-against-the-pool).
 
+  Each is one line of a `Release`, so a value carrying a line break is refused:
+  the remainder would stand as a `Release` field of its own and the pool would
+  claim something the recipe never said.
+
   ```toml
   origin = "Texor"
   label = "COSMIC for Debian"
@@ -128,6 +132,12 @@ from. It is optional; the default is the archive's own Rust.
     the suite's Rust.
 - `version` — the exact toolchain version, such as `1.95.0`. Required when
   `provider = "rustup"`.
+
+  The value is the toolchain rustup is asked to install, so it takes any name
+  rustup accepts — `1.95.0`, `stable`, `nightly-2026-01-01`, or a
+  target-qualified `1.95.0-x86_64-unknown-linux-gnu` — and nothing else. Letters,
+  digits, and `.`, `-`, `_`: anything more is refused rather than passed to the
+  installer, where a stray space would quietly change what is installed.
 
 ## Additional repositories
 
@@ -154,6 +164,13 @@ from, beyond the primary suite and the feed-forward pool.
 
 A signed repository must name a `keyring`: the provisioner has no embedded trust
 anchor for an archive other than the primary Debian one.
+
+The `suite`, `mirror`, and `components` become the fields of the `deb` line the
+provisioner writes into the build root's `sources.list.d`, one archive to a
+line. A value carrying whitespace is refused, since the line would read it as
+two fields and configure an archive other than the one declared. The same holds
+for the recipe's own `mirror`, which stands in that field for every archive that
+does not name one.
 
 ### Worked examples
 

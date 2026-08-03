@@ -607,8 +607,10 @@ impl Recipe {
     /// name, suite, architecture, or component name; a duplicate component or
     /// repository name; a component naming no source or two, or whose source or
     /// packaging overlay is otherwise unusable (see [`source_error`]); a rustup
-    /// toolchain missing its version; or a signed repository missing its
-    /// keyring.
+    /// toolchain missing its version or naming one that cannot be installed; a
+    /// `Release` identity that would write a second field; an archive whose
+    /// coordinates would not stand as one `deb` line; or a signed repository
+    /// missing its keyring.
     ///
     /// Recipes are trusted input, so the checks on values that become paths or
     /// subprocess arguments are defense in depth: they keep a typo from doing
@@ -806,14 +808,45 @@ impl Recipe {
             return Err(bad(format!("maintainer {maintainer:?} {reason}")));
         }
 
+        // The three fields that name the pool's archive to a client. They are
+        // written verbatim into its `Release`, so each is held to what one line
+        // of a deb822 document can hold.
+        for (setting, value) in [
+            ("origin", &self.origin),
+            ("label", &self.label),
+            ("description", &self.description),
+        ] {
+            if let Some(value) = value
+                && let Some(reason) = release_field_error(value)
+            {
+                return Err(bad(format!("{setting} {value:?} {reason}")));
+            }
+        }
+
         // A rustup toolchain must pin an exact version, so the build is
         // reproducible and the archive's own Rust cannot silently stand in.
-        if self.toolchain.rust.provider == RustProvider::Rustup
-            && self.toolchain.rust.version.is_none()
+        if self.toolchain.rust.provider == RustProvider::Rustup {
+            match &self.toolchain.rust.version {
+                None => {
+                    return Err(bad(
+                        "toolchain.rust.provider = \"rustup\" requires toolchain.rust.version"
+                            .to_string(),
+                    ));
+                }
+                Some(version) => {
+                    if let Some(reason) = toolchain_version_error(version) {
+                        return Err(bad(format!("toolchain.rust.version {version:?} {reason}")));
+                    }
+                }
+            }
+        }
+
+        // The mirror every archive falls back to, held to the rule the archives
+        // that use it are: it stands in the same field of the same line.
+        if let Some(mirror) = &self.mirror
+            && let Some(reason) = source_line_field_error(mirror)
         {
-            return Err(bad(
-                "toolchain.rust.provider = \"rustup\" requires toolchain.rust.version".to_string(),
-            ));
+            return Err(bad(format!("mirror {mirror:?} {reason}")));
         }
 
         let mut repository_names = std::collections::BTreeSet::new();
@@ -823,6 +856,35 @@ impl Recipe {
                     "duplicate repository name {:?}",
                     repository.name
                 )));
+            }
+            // The three coordinates that make up the `deb` line the provisioner
+            // writes into the build root's `sources.list.d`. ferroday-cage holds
+            // the repository's *name* to a portable file-name stem and refuses
+            // an unsigned `http://` mirror; the fields of the line itself are
+            // src2deb's to check, exactly as the recipe's primary suite is.
+            if let Some(suite) = &repository.suite
+                && let Some(reason) = name_error(suite)
+            {
+                return Err(bad(format!(
+                    "repository {:?} suite {suite:?} {reason}",
+                    repository.name
+                )));
+            }
+            if let Some(mirror) = &repository.mirror
+                && let Some(reason) = source_line_field_error(mirror)
+            {
+                return Err(bad(format!(
+                    "repository {:?} mirror {mirror:?} {reason}",
+                    repository.name
+                )));
+            }
+            for component in &repository.components {
+                if let Some(reason) = source_line_field_error(component) {
+                    return Err(bad(format!(
+                        "repository {:?} component {component:?} {reason}",
+                        repository.name
+                    )));
+                }
             }
             // The provisioner has no embedded trust anchor for a non-primary
             // archive, so a signed one must name the keyring its release is
@@ -922,6 +984,80 @@ pub fn maintainer_error(maintainer: &str) -> Option<&'static str> {
             .is_some_and(|(name, _)| !name.trim().is_empty())
     {
         Some("is not of the form \"Name <email>\"")
+    } else {
+        None
+    }
+}
+
+/// Reports why a value cannot stand as a field of the pool's `Release`, or
+/// `None` when it can.
+///
+/// [`origin`](Recipe::origin), [`label`](Recipe::label), and
+/// [`description`](Recipe::description) are written verbatim into a deb822
+/// document, one field to a line. A line break in one of them would end the
+/// field early and leave the rest standing as a field of its own — a second
+/// `Suite:`, say — so the pool would claim something the recipe never said, to
+/// every client that reads it. A value that is only whitespace would write a
+/// field naming nothing, which apt reads as declared.
+///
+/// Recipes are trusted input, so this is defense in depth: it keeps a value
+/// pasted in with its newline from changing what the archive says it is.
+fn release_field_error(value: &str) -> Option<&'static str> {
+    if value.trim().is_empty() {
+        Some("is empty")
+    } else if value.contains(['\n', '\r']) {
+        Some("contains a line break, which would start another Release field")
+    } else {
+        None
+    }
+}
+
+/// Reports why a value cannot stand as one field of a `deb` line, or `None`
+/// when it can.
+///
+/// The provisioner writes each archive into the build root's `sources.list.d`
+/// as `deb [options] <mirror> <suite> <components...>`: one archive to a line,
+/// its fields separated by whitespace. A value carrying whitespace would be
+/// read as two fields, and one carrying a line break would add a source the
+/// recipe never named.
+///
+/// The [suite](Repository::suite) is held to [`name_error`] instead, which
+/// covers this and more: it is also a path segment under `dists/`.
+fn source_line_field_error(value: &str) -> Option<&'static str> {
+    if value.is_empty() {
+        Some("is empty")
+    } else if value.contains(char::is_whitespace) {
+        Some("contains whitespace, which a deb line reads as another field")
+    } else {
+        None
+    }
+}
+
+/// Reports why a rustup toolchain version cannot be installed, or `None` when
+/// it can.
+///
+/// The value is interpolated into the `--default-toolchain` argument of a
+/// `/bin/sh -e -u -c` script run in a cage over the build root with the host
+/// network — see [`crate::toolchain`]. A shell metacharacter there runs
+/// commands of its own, and whitespace alone silently changes what is
+/// installed: `1.97.0 --profile default` reads as two arguments rather than one
+/// version, and a leading `-` reads as a flag to `rustup-init` rather than as a
+/// toolchain at all.
+///
+/// So the value is held to what a rustup toolchain name is made of, which
+/// admits every form that belongs here: `1.97.0`, `stable`,
+/// `nightly-2026-01-01`, and a target-qualified
+/// `1.97.0-x86_64-unknown-linux-gnu`.
+fn toolchain_version_error(version: &str) -> Option<&'static str> {
+    if version.is_empty() {
+        Some("is empty")
+    } else if version.starts_with('-') {
+        Some("starts with '-', which rustup-init would read as an option")
+    } else if !version
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        Some("contains a character a rustup toolchain name may not")
     } else {
         None
     }
@@ -1270,6 +1406,132 @@ mod tests {
         ))
         .unwrap_err();
         assert!(format!("{err}").contains("requires toolchain.rust.version"));
+    }
+
+    /// A recipe pinning `version` as its rustup toolchain.
+    fn with_toolchain(version: &str) -> String {
+        format!(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [toolchain.rust]\nprovider = \"rustup\"\nversion = \"{version}\"\n{ONE_COMPONENT}"
+        )
+    }
+
+    #[test]
+    fn a_toolchain_version_that_would_not_stand_as_one_argument_is_rejected() {
+        // The value is interpolated into a `/bin/sh` script run in a cage with
+        // the host network, as `--default-toolchain <version>`. A space alone
+        // silently changes what is installed; a metacharacter runs something
+        // else entirely.
+        for (version, needle) in [
+            ("", "is empty"),
+            ("-y", "starts with '-'"),
+            ("1.97.0 --profile default", "may not"),
+            ("1.97.0; echo pwned", "may not"),
+            ("$(id)", "may not"),
+        ] {
+            let err = load(&with_toolchain(version)).unwrap_err();
+            let message = format!("{err}");
+            assert!(
+                message.contains("toolchain.rust.version") && message.contains(needle),
+                "version {version:?} gave: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_form_a_rustup_toolchain_is_named_by_is_accepted() {
+        for version in [
+            "1.97.0",
+            "stable",
+            "nightly-2026-01-01",
+            "1.97.0-x86_64-unknown-linux-gnu",
+        ] {
+            load(&with_toolchain(version))
+                .unwrap_or_else(|err| panic!("{version:?} should load: {err}"));
+        }
+    }
+
+    #[test]
+    fn a_release_identity_that_would_write_a_second_field_is_rejected() {
+        // Each is written verbatim into the pool's `Release`, one field to a
+        // line, so a line break in one would have the pool claim something the
+        // recipe never said.
+        for setting in ["origin", "label", "description"] {
+            for (value, needle) in [("Texor\\nSuite: forky", "line break"), ("   ", "is empty")] {
+                let err = load(&format!(
+                    "name = \"r\"\nsuite = \"trixie\"\n{setting} = \"{value}\"\n{ONE_COMPONENT}"
+                ))
+                .unwrap_err();
+                let message = format!("{err}");
+                assert!(
+                    message.contains(setting) && message.contains(needle),
+                    "{setting} = {value:?} gave: {message}"
+                );
+            }
+        }
+        // Ordinary values, including the punctuation a description carries.
+        load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\norigin = \"Texor\"\n\
+             label = \"COSMIC for Debian\"\n\
+             description = \"COSMIC desktop packages for Debian trixie\"\n{ONE_COMPONENT}"
+        ))
+        .expect("an ordinary identity loads");
+    }
+
+    #[test]
+    fn an_archive_field_that_would_blur_a_deb_line_is_rejected() {
+        // The provisioner writes `deb [options] <mirror> <suite> <components>`
+        // into the build root's sources.list.d, one archive to a line.
+        let cases = [
+            (
+                "mirror = \"https://deb.debian.org/debian extra\"",
+                "mirror",
+                "another field",
+            ),
+            ("suite = \"two words\"", "suite", "contains whitespace"),
+            (
+                "components = [\"main contrib\"]",
+                "component",
+                "another field",
+            ),
+        ];
+        for (setting, needle, reason) in cases {
+            let err = load(&format!(
+                "name = \"r\"\nsuite = \"trixie\"\n\
+                 [[repositories]]\nname = \"extra\"\nkeyring = \"/k.gpg\"\n{setting}\n\
+                 {ONE_COMPONENT}"
+            ))
+            .unwrap_err();
+            let message = format!("{err}");
+            assert!(
+                message.contains("repository \"extra\"")
+                    && message.contains(needle)
+                    && message.contains(reason),
+                "{setting} gave: {message}"
+            );
+        }
+
+        // The recipe's own mirror stands in the same field of the same line, so
+        // it is held to the same rule.
+        let err = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             mirror = \"https://deb.debian.org/debian extra\"\n{ONE_COMPONENT}"
+        ))
+        .unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("mirror") && message.contains("another field"),
+            "{message}"
+        );
+
+        // An ordinary archive, with the fields all three settings take.
+        load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\nmirror = \"https://deb.debian.org/debian\"\n\
+             [[repositories]]\nname = \"backports\"\nsuite = \"trixie-backports\"\n\
+             mirror = \"https://deb.debian.org/debian\"\ncomponents = [\"main\", \"contrib\"]\n\
+             keyring = \"/k.gpg\"\n{ONE_COMPONENT}"
+        ))
+        .expect("an ordinary archive loads");
     }
 
     #[test]
