@@ -845,7 +845,12 @@ pub trait BuildRootProvider {
     ) -> Result<Box<dyn BuildRoot>>;
 
     /// Every distinct archive state this provider's resolves observed, in a
-    /// stable order. See [`ArchiveLog`].
+    /// stable order.
+    ///
+    /// Only the distinct ones: every root a run provisions resolves against the
+    /// same archives, so a 26-component run observes each of them 27 times and
+    /// the record should hold one entry. Two entries for one mirror and suite is
+    /// a run that saw the archive publish while it was building against it.
     ///
     /// Read once the run's roots are all provisioned, so it accounts for every
     /// resolve the run made rather than for whichever came first.

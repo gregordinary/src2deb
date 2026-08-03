@@ -97,7 +97,7 @@ pub struct PoolRelease {
     /// pinned with `--build-date` writes the same `Release` twice over. A
     /// publish clock would leave two runs of one pinned build differing in the
     /// one file the pin cannot reach. See
-    /// [`BuildStamp::seconds`](crate::BuildStamp::seconds).
+    /// [`BuildStamp::seconds`](crate::version::BuildStamp::seconds).
     pub date: i64,
     /// The `Origin`, or `None` to write none.
     pub origin: Option<String>,
