@@ -193,6 +193,23 @@ The `qemu-user-static` package registers the handlers with the `F` flag. Without
 a registered handler, provisioning a foreign root fails with a message naming the
 missing handler.
 
+## The interpreter is recorded
+
+A changed emulator silently changes compiled output, so a foreign run records
+which one it ran through — the qemu target name, the path the kernel has
+registered, that path canonicalized, its SHA-256, whether the handler is enabled,
+and its flags. See [The interpreter
+record](provenance.md#the-interpreter-record), where the digest's one caveat is
+stated: the `F` flag means the kernel holds the interpreter from registration
+time, so a digest taken during a build is of the file on disk rather than
+necessarily of the bytes that ran.
+
+The values come from `binfmt_misc` rather than from a `PATH` lookup, which is
+both the faithful answer and the only available one — a build cage carries no
+`PATH` that would find the host's qemu.
+
+A native run records no interpreter.
+
 ## Building across hosts
 
 src2deb does not orchestrate hosts. Where several architectures have hardware of

@@ -1426,25 +1426,27 @@ impl Engine {
         //    manifest: it is what `--skip-published` consults, and what the
         //    manifest written below folds forward so untouched components stay
         //    recorded.
-        let (prior_build_date, prior_sandbox, prior_archives, prior_records) = match prior.manifest
-        {
-            Some(manifest) => (
-                manifest.build_date,
-                manifest.sandbox,
-                manifest.archives,
-                manifest
-                    .components
-                    .into_iter()
-                    .map(|record| (record.name.clone(), record))
-                    .collect(),
-            ),
-            None => (
-                None,
-                None,
-                Vec::new(),
-                BTreeMap::<String, manifest::ComponentRecord>::new(),
-            ),
-        };
+        let (prior_build_date, prior_sandbox, prior_archives, prior_interpreter, prior_records) =
+            match prior.manifest {
+                Some(manifest) => (
+                    manifest.build_date,
+                    manifest.sandbox,
+                    manifest.archives,
+                    manifest.interpreter,
+                    manifest
+                        .components
+                        .into_iter()
+                        .map(|record| (record.name.clone(), record))
+                        .collect(),
+                ),
+                None => (
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    BTreeMap::<String, manifest::ComponentRecord>::new(),
+                ),
+            };
 
         let builder = Builder::new(
             recipe.toolchain.rust.rustup_version().map(str::to_string),
@@ -1664,6 +1666,16 @@ impl Engine {
             false => Some(context.stamp.calendar_date()),
             true => prior_build_date,
         };
+        // The interpreter a foreign build ran every target binary through, read
+        // from the kernel's own binfmt registration. A run that built nothing
+        // ran nothing through it and keeps what is already recorded; a native
+        // run has none, and a native run after a foreign one for this same
+        // architecture is not a thing a work directory can hold, since the
+        // manifest is keyed by architecture.
+        let interpreter = match report.built.is_empty() {
+            false => manifest::InterpreterRecord::of(architecture),
+            true => prior_interpreter,
+        };
         manifest_for_architecture(
             recipe,
             context.order,
@@ -1674,6 +1686,7 @@ impl Engine {
         )
         .with_sandbox(sandbox)
         .with_archives(archives)
+        .with_interpreter(interpreter)
         .with_build_date(build_date)
         .write(&report.manifest_path)?;
         reporter(Progress::Manifest {
@@ -3536,9 +3549,19 @@ mod tests {
             .component
     }
 
+    /// A record standing in for one taken from a real build pass. Only
+    /// `component` is read here: what these tests settle is which component's
+    /// record a run keeps, not what a record holds.
     fn sandbox_record(component: &str) -> SandboxRecord {
         SandboxRecord {
             component: component.to_string(),
+            root: manifest::RootRecord::Plain {
+                path: "/work/roots/c".to_string(),
+            },
+            identity: manifest::IdentityRecord::Single,
+            network: "isolated".to_string(),
+            rlimits: Vec::new(),
+            hardening: manifest::HardeningRecord::Unavailable,
             env: BTreeMap::new(),
             mounts: Vec::new(),
         }

@@ -29,7 +29,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ferroday_cage::provision::debian::ResolvedArchive;
-use ferroday_cage::{ResolvedInputs, ResolvedMount};
+use ferroday_cage::{
+    IdRange, Limit, Network, ResolvedHardening, ResolvedIdentity, ResolvedInputs, ResolvedMount,
+    ResolvedRlimit, ResolvedRoot, Resource,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, io_error};
@@ -124,6 +127,13 @@ pub struct Manifest {
     /// this manifest still calls built came from are the ones already recorded.
     #[serde(rename = "archive", default, skip_serializing_if = "Vec::is_empty")]
     pub archives: Vec<ArchiveRecord>,
+    /// The `qemu-user` interpreter a foreign build ran through.
+    ///
+    /// Absent for a native build, which is the honest answer rather than a
+    /// failure to look: nothing interpreted anything. Carried forward like the
+    /// sandbox record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<InterpreterRecord>,
     /// Each component's record, in build order.
     #[serde(rename = "component", default)]
     pub components: Vec<ComponentRecord>,
@@ -192,6 +202,99 @@ pub struct ArchiveRecord {
     pub signed_by: Vec<String>,
 }
 
+/// The `qemu-user` interpreter a foreign build ran every target binary through.
+///
+/// A foreign build compiles nothing on the CPU directly: `rustc`, `cc`, `ld`,
+/// and every configure probe execute under an emulator, and a changed emulator
+/// silently changes compiled output. src2deb already records the architecture
+/// and whether the build was foreign; this records what executed it.
+///
+/// The values come from the kernel's own `binfmt_misc` registration rather than
+/// from a `PATH` lookup. That is both more faithful — it is the path binaries
+/// actually execute through — and the only thing available, since the build
+/// environment strips `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterpreterRecord {
+    /// The qemu target name the handler is registered under: `aarch64` for the
+    /// Debian architecture `arm64`, and so on.
+    pub name: String,
+    /// The interpreter exactly as the kernel recorded it.
+    ///
+    /// On the common Debian layout this is a wrapper —
+    /// `/usr/libexec/qemu-binfmt/aarch64-binfmt-P` — that symlinks to the real
+    /// binary. It is the provenance-faithful value and the one hashed; it is not
+    /// a path that can be executed, since qemu refuses to run under its binfmt
+    /// wrapper name.
+    pub path: String,
+    /// [`path`](Self::path) canonicalized, absent when it does not resolve.
+    ///
+    /// Recorded beside the registered path because the two are different facts:
+    /// repointing the symlink changes the interpreter without changing the
+    /// registration, which one path alone could not show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    /// The SHA-256 of the interpreter's bytes, absent when it could not be read.
+    ///
+    /// Taken of [`path`](Self::path), which `open` follows the symlink along, so
+    /// this is the real binary's digest and needs no canonicalization.
+    ///
+    /// **It carries a caveat.** The `F` flag means the kernel opened and holds
+    /// the interpreter at *registration* time, so a digest taken during a build
+    /// may be of a file that replaced the one actually running. A digest with a
+    /// stated caveat is still worth more to a rebuild comparison than none —
+    /// two runs whose digests differ definitely ran different interpreters —
+    /// but two that agree agree only about the file on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Whether the handler was enabled.
+    ///
+    /// A registered handler that is switched off is recorded as present and not
+    /// enabled rather than as absent: the registration exists, and the
+    /// distinction is "turn it on" against "install it".
+    pub enabled: bool,
+    /// The registration's flag letters, as written — `POF` on a Debian host.
+    ///
+    /// A foreign bootstrap needs `F`, which is what keeps the interpreter
+    /// working after the cage pivots into a rootfs where its own path no longer
+    /// resolves.
+    pub flags: String,
+}
+
+impl InterpreterRecord {
+    /// Records the interpreter a build for `architecture` runs through, or
+    /// `None` for a build that runs natively or a foreign one with no handler
+    /// registered.
+    ///
+    /// A missing handler is not distinguished from a native build here because a
+    /// build needing one and not having it never gets this far: ferroday-cage
+    /// refuses the bootstrap before any download. See [`crate::arch`].
+    pub fn of(architecture: &str) -> Option<InterpreterRecord> {
+        let interpreter = ferroday_cage::provision::debian::foreign_interpreter(architecture)?;
+        Some(InterpreterRecord {
+            sha256: digest_of(&interpreter.path),
+            name: interpreter.name,
+            path: path(&interpreter.path),
+            resolved: interpreter.resolved.as_deref().map(path),
+            enabled: interpreter.enabled,
+            flags: interpreter.flags,
+        })
+    }
+}
+
+/// The SHA-256 of the file at `path`, or `None` when it cannot be read.
+///
+/// An unreadable interpreter is a fact rather than an error: everything else
+/// about the registration is still worth recording, and a run whose build
+/// succeeded plainly did execute something.
+fn digest_of(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(crate::fingerprint::hex(&hasher.finalize()))
+}
+
 impl ArchiveRecord {
     /// Records an archive as a resolve found it.
     pub fn of(archive: &ResolvedArchive) -> ArchiveRecord {
@@ -207,20 +310,34 @@ impl ArchiveRecord {
     }
 }
 
-/// The sandbox inputs a run's builds ran under: the environment the build
-/// command carried, and every mount its sandbox established.
+/// The sandbox inputs a run's builds ran under: what the build command was
+/// rooted on, the identity it held, the network and limits it ran under, the
+/// hardening applied to it, the environment it carried, and every mount its
+/// sandbox established.
 ///
-/// What a build produces depends on the environment and the filesystem it sees,
-/// and neither follows from the source revisions alone. ferroday-cage's base
-/// environment and managed mount profile are both outside its compatibility
-/// promise and may change between releases, so a library version does not state
-/// them either. Recording them says what a build actually ran under rather than
-/// leaving it to be inferred.
+/// What a build produces depends on all of these, and none of them follows from
+/// the source revisions alone. ferroday-cage's base environment and managed
+/// mount profile are both outside its compatibility promise and may change
+/// between releases, so a library version does not state them either. Recording
+/// them says what a build actually ran under rather than leaving it to be
+/// inferred.
 ///
-/// The record is run-level. Every component's build pass applies the same
-/// environment and the same mount sequence, differing only in the host paths of
-/// the source and output binds, so one component's stands for the run and
-/// [`component`](Self::component) names which one it was taken from.
+/// # Why the record is run-level
+///
+/// Every component's build pass applies the same environment, the same mount
+/// sequence, and the same posture, differing only in host paths: the source and
+/// output binds name the component's own directories, and under the layered
+/// strategy so does the overlay root's upper. So one component's record stands
+/// for the run, and [`component`](Self::component) names which one it was taken
+/// from — the earliest in build order the run built, so a `--jobs N` run records
+/// what a sequential run would.
+///
+/// The root is the field that most tests that reasoning, and it survives it for
+/// the same reason the binds do. What an overlay root says about a build is its
+/// *shape* — that the command saw a merge of this read-only lower stack with a
+/// writable layer — and the lower stack is the shared base every component
+/// builds over. The upper is that component's scratch, named here as the source
+/// bind is: one component's path, standing for a run in which each has its own.
 ///
 /// Like a component's record, it is carried forward: a run that builds nothing
 /// keeps the one already in the manifest, because the packages that manifest
@@ -231,12 +348,206 @@ pub struct SandboxRecord {
     /// in build order that the run built, so a parallel run records what a
     /// sequential run would rather than whichever worker finished first.
     pub component: String,
+    /// What the build command's root filesystem was.
+    ///
+    /// Its own field rather than a mount, as the sandbox library has it: the
+    /// root is not something the profile lays over the sandbox, it is what the
+    /// profile is laid over. Before it was recorded, a plain root and an overlay
+    /// over the same base produced byte-identical records while describing two
+    /// different builds.
+    pub root: RootRecord,
+    /// The identity the build command held inside the sandbox.
+    ///
+    /// Whether a build sees uid 0 changes what it produces: `Rules-Requires-Root`
+    /// handling turns on exactly this, and a file's recorded ownership follows
+    /// from it.
+    pub identity: IdentityRecord,
+    /// The network the build command could reach.
+    ///
+    /// The first thing a reproducibility claim is challenged on. src2deb's build
+    /// pass runs isolated; its vendor pass, which this does not record, does not.
+    pub network: String,
+    /// The resource limits the build command ran under, in the order applied.
+    ///
+    /// Empty for a build that set none, which is every build src2deb runs today.
+    /// A build that adapts its parallelism to `RLIMIT_NOFILE`, or that fails a
+    /// link under `RLIMIT_AS`, produces different output.
+    #[serde(rename = "rlimit", default, skip_serializing_if = "Vec::is_empty")]
+    pub rlimits: Vec<RlimitRecord>,
+    /// The hardening controls the build command ran under.
+    ///
+    /// Recorded as [`Unavailable`](HardeningRecord::Unavailable) when the
+    /// sandbox library was built without the layer, rather than omitted: a
+    /// record that left the key out could not be told from one written before
+    /// the key existed.
+    pub hardening: HardeningRecord,
     /// The build command's complete environment, by variable name.
     pub env: BTreeMap<String, String>,
     /// Every mount the sandbox established, in the order it established them:
     /// the managed profile first, then src2deb's own binds.
     #[serde(rename = "mount", default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountRecord>,
+}
+
+/// What a build's sandbox was rooted on.
+///
+/// A projection of ferroday-cage's [`ResolvedRoot`] into the manifest's own
+/// vocabulary, as [`MountRecord`] is of its mounts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum RootRecord {
+    /// No root swap: the command ran against the host's own filesystem.
+    Host,
+    /// A plain rootfs, pivoted into. This is full reprovisioning's per-component
+    /// root, which its build writes into directly.
+    Plain {
+        /// The rootfs as an absolute, canonicalized host path.
+        path: String,
+    },
+    /// An overlay assembled over a rootfs and pivoted into. This is the layered
+    /// strategy: the shared base as the read-only lower, and the component's own
+    /// build-dependency increment as the writable upper.
+    Overlay {
+        /// The lower layers, base first.
+        lower: Vec<String>,
+        /// The upper layer, where the sandbox's writes land. This component's
+        /// own, as the source and output binds are.
+        upper: String,
+        /// The work directory the overlay requires beside the upper.
+        work: String,
+    },
+    /// A root of a kind this version of src2deb does not recognize.
+    ///
+    /// [`ResolvedRoot`] is `#[non_exhaustive]`, so a later ferroday-cage may
+    /// root a cage in terms src2deb has no field for. Recorded rather than
+    /// passed over, for the reason [`MountRecord::Unknown`] is: the record says
+    /// the build was rooted on something it cannot describe, which is a
+    /// different statement from saying nothing.
+    Unknown,
+}
+
+/// The identity a build's command held inside its sandbox.
+///
+/// A projection of ferroday-cage's [`ResolvedIdentity`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum IdentityRecord {
+    /// No user namespace: the command ran as the calling user.
+    Caller,
+    /// The single-identity map: the calling user is root inside the sandbox and
+    /// no other id is mapped. This is what src2deb provisions and builds under.
+    Single,
+    /// A range map, written from outside the namespace by a delegate.
+    Ranged {
+        /// The uid extents, in the order they were written.
+        uid: Vec<IdRangeRecord>,
+        /// The gid extents, in the order they were written.
+        gid: Vec<IdRangeRecord>,
+    },
+    /// An identity of a kind this version of src2deb does not recognize; see
+    /// [`RootRecord::Unknown`].
+    Unknown,
+}
+
+/// One extent of a range identity map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdRangeRecord {
+    /// The first id inside the sandbox.
+    pub inside: u32,
+    /// The first id on the host.
+    pub outside: u32,
+    /// How many consecutive ids the extent covers.
+    pub count: u32,
+}
+
+/// One resource limit a build's sandbox applied.
+///
+/// Each limit is the finite amount, or `"unlimited"` for the kernel's
+/// `RLIM_INFINITY` — the spelling ferroday-cage's own profile format uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RlimitRecord {
+    /// The kernel resource the limit governs, in the kebab-case spelling
+    /// ferroday-cage names it by: `address-space`, `open-files`, and so on.
+    pub resource: String,
+    /// The soft limit: what the kernel enforced.
+    pub soft: String,
+    /// The hard limit: the ceiling the command could raise its soft limit to.
+    pub hard: String,
+}
+
+/// The hardening controls a build's sandbox applied before `execve`.
+///
+/// A projection of ferroday-cage's [`ResolvedHardening`]. The subtlest posture
+/// to record and the one most worth recording: a seccomp policy changes which
+/// syscalls succeed, and a configure test that probes one reads the refusal as
+/// an absent feature, so two builds under two policies can differ with nothing
+/// else to show for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum HardeningRecord {
+    /// The hardening layer was not compiled into the sandbox library, so no
+    /// Landlock ruleset, seccomp filter, or capability drop could apply. This is
+    /// what src2deb builds under.
+    ///
+    /// Distinct from an [`Applied`](Self::Applied) posture whose controls are
+    /// all empty, which is a build that could have hardened and did not.
+    Unavailable,
+    /// The hardening layer was compiled in; these are the controls in force.
+    Applied {
+        /// The Landlock filesystem grants, in the order declared: each a path
+        /// and the `LANDLOCK_ACCESS_FS_*` rights allowed beneath it.
+        #[serde(rename = "landlock-fs", default, skip_serializing_if = "Vec::is_empty")]
+        landlock_fs: Vec<LandlockFsRecord>,
+        /// The Landlock network grants, in the order declared.
+        #[serde(
+            rename = "landlock-net",
+            default,
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        landlock_net: Vec<LandlockNetRecord>,
+        /// The installed seccomp filter's length in BPF instructions, absent
+        /// when no filter was installed.
+        ///
+        /// The program itself is not recorded: it is thousands of instructions
+        /// and means nothing to a reader. The length distinguishes one policy
+        /// from another at a glance.
+        #[serde(
+            rename = "seccomp-instructions",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        seccomp_instructions: Option<usize>,
+        /// The capability bits retained across the drop, absent when the
+        /// namespaced capability set was left untouched.
+        #[serde(
+            rename = "keep-capabilities",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        keep_capabilities: Option<u64>,
+    },
+    /// A hardening posture this version of src2deb does not recognize; see
+    /// [`RootRecord::Unknown`].
+    Unknown,
+}
+
+/// One Landlock filesystem grant a build's sandbox enrolled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandlockFsRecord {
+    /// The granted path, as the command saw it after the root swap.
+    pub path: String,
+    /// The `LANDLOCK_ACCESS_FS_*` rights allowed beneath it, as the kernel
+    /// spells them and before the command stage narrows them to its ABI.
+    pub access: u64,
+}
+
+/// One Landlock network grant a build's sandbox enrolled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandlockNetRecord {
+    /// The TCP port the grant governs.
+    pub port: u16,
+    /// The `LANDLOCK_ACCESS_NET_*` rights allowed on it.
+    pub access: u64,
 }
 
 /// One mount a build's sandbox established.
@@ -320,6 +631,11 @@ impl SandboxRecord {
     pub fn of(component: impl Into<String>, inputs: &ResolvedInputs) -> SandboxRecord {
         SandboxRecord {
             component: component.into(),
+            root: root_record(&inputs.root),
+            identity: identity_record(&inputs.identity),
+            network: network_name(inputs.network).to_string(),
+            rlimits: inputs.rlimits.iter().map(rlimit_record).collect(),
+            hardening: hardening_record(&inputs.hardening),
             env: inputs
                 .env
                 .iter()
@@ -327,6 +643,123 @@ impl SandboxRecord {
                 .collect(),
             mounts: inputs.mounts.iter().map(mount_record).collect(),
         }
+    }
+}
+
+/// The manifest record for a resolved root.
+fn root_record(root: &ResolvedRoot) -> RootRecord {
+    match root {
+        ResolvedRoot::Host => RootRecord::Host,
+        ResolvedRoot::Plain { path: rootfs } => RootRecord::Plain { path: path(rootfs) },
+        ResolvedRoot::Overlay { lower, upper, work } => RootRecord::Overlay {
+            lower: lower.iter().map(|layer| path(layer)).collect(),
+            upper: path(upper),
+            work: path(work),
+        },
+        _ => RootRecord::Unknown,
+    }
+}
+
+/// The manifest record for a resolved identity.
+fn identity_record(identity: &ResolvedIdentity) -> IdentityRecord {
+    match identity {
+        ResolvedIdentity::Caller => IdentityRecord::Caller,
+        ResolvedIdentity::Single => IdentityRecord::Single,
+        ResolvedIdentity::Ranged { uid, gid } => IdentityRecord::Ranged {
+            uid: uid.iter().map(id_range_record).collect(),
+            gid: gid.iter().map(id_range_record).collect(),
+        },
+        _ => IdentityRecord::Unknown,
+    }
+}
+
+/// The manifest record for one extent of a range identity map.
+fn id_range_record(range: &IdRange) -> IdRangeRecord {
+    IdRangeRecord {
+        inside: range.inside,
+        outside: range.outside,
+        count: range.count,
+    }
+}
+
+/// The manifest's name for a network posture.
+///
+/// `unknown` for a posture added to ferroday-cage after this was written, for
+/// the reason [`RootRecord::Unknown`] exists: a record that named nothing could
+/// not be told from one written before the field existed.
+fn network_name(network: Network) -> &'static str {
+    match network {
+        Network::Isolated => "isolated",
+        Network::Host => "host",
+        Network::None => "none",
+        _ => "unknown",
+    }
+}
+
+/// The manifest record for one resource limit.
+fn rlimit_record(rlimit: &ResolvedRlimit) -> RlimitRecord {
+    RlimitRecord {
+        resource: resource_name(rlimit.resource).to_string(),
+        soft: limit_amount(rlimit.soft),
+        hard: limit_amount(rlimit.hard),
+    }
+}
+
+/// The manifest's name for a kernel resource, in the kebab-case spelling
+/// ferroday-cage's own profile format and command line use.
+fn resource_name(resource: Resource) -> &'static str {
+    match resource {
+        Resource::AddressSpace => "address-space",
+        Resource::CoreDump => "core-dump",
+        Resource::CpuTime => "cpu-time",
+        Resource::Data => "data",
+        Resource::FileSize => "file-size",
+        Resource::LockedMemory => "locked-memory",
+        Resource::OpenFiles => "open-files",
+        Resource::PendingSignals => "pending-signals",
+        Resource::Processes => "processes",
+        Resource::Stack => "stack",
+        _ => "unknown",
+    }
+}
+
+/// A limit as the manifest writes it: the finite amount, or `unlimited` for the
+/// kernel's `RLIM_INFINITY`, which is the spelling ferroday-cage uses.
+fn limit_amount(limit: Limit) -> String {
+    match limit.amount() {
+        Some(amount) => amount.to_string(),
+        None => "unlimited".to_string(),
+    }
+}
+
+/// The manifest record for a resolved hardening posture.
+fn hardening_record(hardening: &ResolvedHardening) -> HardeningRecord {
+    match hardening {
+        ResolvedHardening::Unavailable => HardeningRecord::Unavailable,
+        ResolvedHardening::Applied {
+            landlock_fs,
+            landlock_net,
+            seccomp_instructions,
+            keep_capabilities,
+        } => HardeningRecord::Applied {
+            landlock_fs: landlock_fs
+                .iter()
+                .map(|grant| LandlockFsRecord {
+                    path: path(&grant.path),
+                    access: grant.access,
+                })
+                .collect(),
+            landlock_net: landlock_net
+                .iter()
+                .map(|grant| LandlockNetRecord {
+                    port: grant.port,
+                    access: grant.access,
+                })
+                .collect(),
+            seccomp_instructions: *seccomp_instructions,
+            keep_capabilities: *keep_capabilities,
+        },
+        _ => HardeningRecord::Unknown,
     }
 }
 
@@ -570,6 +1003,7 @@ impl Manifest {
             build_date: None,
             sandbox: None,
             archives: Vec::new(),
+            interpreter: None,
             components: records,
         }
     }
@@ -589,6 +1023,13 @@ impl Manifest {
         self
     }
 
+    /// Records the interpreter a foreign build ran through. A native build ran
+    /// through none and records none; see [`Manifest::interpreter`].
+    pub fn with_interpreter(mut self, interpreter: Option<InterpreterRecord>) -> Manifest {
+        self.interpreter = interpreter;
+        self
+    }
+
     /// Records the date the run's versions were stamped with. A run that built
     /// nothing has none of its own to record.
     pub fn with_build_date(mut self, build_date: Option<String>) -> Manifest {
@@ -599,6 +1040,13 @@ impl Manifest {
     /// Loads the manifest a prior run wrote at `path` (see [`manifest_path`]),
     /// or `None` when none is present. A manifest that cannot be parsed is an
     /// error, so a resumed run does not silently proceed on a corrupt record.
+    ///
+    /// A manifest written before a field this version requires is refused along
+    /// with a corrupt one, and deliberately: the alternative is defaulting the
+    /// field, which would have a provenance record state a posture no build ever
+    /// observed. The remedy is to delete the manifest, which costs the next run
+    /// a rebuild of what `--skip-published` would have skipped and costs the
+    /// record nothing it could honestly have kept.
     pub fn load(path: &Path) -> Result<Option<Manifest>> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -609,7 +1057,14 @@ impl Manifest {
             io_error(
                 "parsing the manifest",
                 path,
-                std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{err}\nA manifest an older src2deb wrote may not carry a field this \
+                         one requires. Delete it and rebuild; the next run records the whole \
+                         recipe again."
+                    ),
+                ),
             )
         })?;
         Ok(Some(manifest))
@@ -864,6 +1319,25 @@ mod tests {
             .resolved_inputs()
     }
 
+    /// A record with nothing in the fields a test is not about, for filling in
+    /// around the one field it is. `SandboxRecord` has no `Default` on purpose —
+    /// a record has to state what it recorded — so this is a test's own stand-in
+    /// rather than a shape the library offers.
+    fn bare_record() -> SandboxRecord {
+        SandboxRecord {
+            component: "c".to_string(),
+            root: RootRecord::Plain {
+                path: "/work/roots/c".to_string(),
+            },
+            identity: IdentityRecord::Single,
+            network: "isolated".to_string(),
+            rlimits: Vec::new(),
+            hardening: HardeningRecord::Unavailable,
+            env: BTreeMap::new(),
+            mounts: Vec::new(),
+        }
+    }
+
     fn scratch(label: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -963,6 +1437,205 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same scratch cage as [`resolved_inputs`], rooted on an overlay of the
+    /// rootfs and an upper rather than on the rootfs directly — the two shapes
+    /// src2deb's two provisioning strategies produce.
+    fn overlay_inputs(dir: &Path) -> ferroday_cage::ResolvedInputs {
+        let (rootfs, upper) = (dir.join("root"), dir.join("upper"));
+        for path in [&rootfs, &upper] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        ferroday_cage::Cage::builder()
+            .overlay_rootfs(&rootfs, &upper)
+            .stop_with_caller(true)
+            .command("/bin/sh")
+            .args(["-e", "-u", "-c", "true"])
+            .build()
+            .expect("a cage over a scratch overlay builds")
+            .resolved_inputs()
+    }
+
+    #[test]
+    fn an_overlay_root_is_told_apart_from_a_plain_one_over_the_same_base() {
+        // The gap the root closes. Before it was recorded, these two produced
+        // byte-identical records: the same environment, the same managed mount
+        // profile, and no mention of what any of it was laid over. They are
+        // different builds — one writes into the rootfs, the other into a layer
+        // over it — and now they read as different records.
+        let dir = scratch("roots");
+        let plain = SandboxRecord::of("cosmic-randr", &resolved_inputs(&dir));
+        let overlaid = SandboxRecord::of("cosmic-randr", &overlay_inputs(&dir));
+
+        let rootfs = dir.join("root").canonicalize().unwrap();
+        assert_eq!(
+            plain.root,
+            RootRecord::Plain {
+                path: rootfs.to_string_lossy().into_owned(),
+            },
+        );
+        let RootRecord::Overlay { lower, upper, work } = &overlaid.root else {
+            panic!("an overlay-rooted cage records an overlay root: {overlaid:?}");
+        };
+        // The lower stack is the shared base every component builds over, which
+        // is the part of an overlay root that says what the build saw.
+        assert_eq!(lower, &[rootfs.to_string_lossy().into_owned()]);
+        // The upper and its work directory are this component's own, named as
+        // the source and output binds are.
+        assert!(upper.ends_with("upper"), "{upper}");
+        assert!(!work.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_postures_a_build_ran_under_are_recorded_whether_or_not_they_were_set() {
+        let dir = scratch("posture");
+        let record = SandboxRecord::of("cosmic-randr", &resolved_inputs(&dir));
+
+        // src2deb builds under the single-identity map, so the build sees uid 0
+        // — which is what `Rules-Requires-Root` handling turns on.
+        assert_eq!(record.identity, IdentityRecord::Single);
+        // The build pass has no network. This is the first thing a
+        // reproducibility claim is challenged on.
+        assert_eq!(record.network, "isolated");
+        // Nothing sets a resource limit, and an empty list says so.
+        assert!(record.rlimits.is_empty());
+        // The hardening layer is not compiled in, which is recorded as such
+        // rather than omitted: a record that left the key out could not be told
+        // from one written before the key existed.
+        assert_eq!(record.hardening, HardeningRecord::Unavailable);
+
+        // And every one of them survives the round trip a `--skip-published`
+        // run reads the manifest back through.
+        let toml = Manifest::new("r", "trixie", "amd64", Vec::new())
+            .with_sandbox(Some(record.clone()))
+            .to_toml();
+        let parsed = Manifest::load_from_str(&toml)
+            .sandbox
+            .expect("the record survives");
+        assert_eq!(parsed.root, record.root);
+        assert_eq!(parsed.identity, record.identity);
+        assert_eq!(parsed.network, record.network);
+        assert_eq!(parsed.hardening, record.hardening);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_applied_hardening_posture_is_not_an_unavailable_one() {
+        // A build that could have hardened and did not is a different fact from
+        // one whose sandbox could not harden at all, and the record has to keep
+        // them apart. src2deb produces the second today; the first is what a
+        // build under a sandbox with the layer compiled in would record.
+        let empty = HardeningRecord::Applied {
+            landlock_fs: Vec::new(),
+            landlock_net: Vec::new(),
+            seccomp_instructions: None,
+            keep_capabilities: None,
+        };
+        assert_ne!(empty, HardeningRecord::Unavailable);
+
+        let toml = Manifest::new("r", "trixie", "amd64", Vec::new())
+            .with_sandbox(Some(SandboxRecord {
+                hardening: empty.clone(),
+                ..bare_record()
+            }))
+            .to_toml();
+        assert!(toml.contains("kind = \"applied\""), "{toml}");
+        assert_eq!(
+            Manifest::load_from_str(&toml).sandbox.unwrap().hardening,
+            empty,
+        );
+    }
+
+    #[test]
+    fn a_root_kind_added_upstream_is_recorded_as_one_this_version_cannot_name() {
+        // `ResolvedRoot` is non-exhaustive, as `ResolvedMount` is, and the
+        // fallback says the same thing: the build was rooted on something this
+        // version has no field for, which is not the same as saying nothing.
+        let toml = Manifest::new("r", "trixie", "amd64", Vec::new())
+            .with_sandbox(Some(SandboxRecord {
+                root: RootRecord::Unknown,
+                ..bare_record()
+            }))
+            .to_toml();
+        assert!(toml.contains("kind = \"unknown\""), "{toml}");
+        assert_eq!(
+            Manifest::load_from_str(&toml).sandbox.unwrap().root,
+            RootRecord::Unknown,
+        );
+    }
+
+    #[test]
+    fn a_native_build_records_no_interpreter() {
+        // Nothing interpreted anything, which is a different statement from
+        // having failed to look — and the honest one.
+        let native = crate::arch::host_architecture();
+        assert_eq!(InterpreterRecord::of(&native), None);
+
+        let toml = Manifest::new("r", "trixie", &native, Vec::new()).to_toml();
+        assert!(!toml.contains("interpreter"), "{toml}");
+        assert!(Manifest::load_from_str(&toml).interpreter.is_none());
+    }
+
+    #[test]
+    fn a_foreign_build_records_the_interpreter_it_ran_through() {
+        // Reads the running kernel's own binfmt registration, so it only says
+        // anything on a host that has one. A developer host without qemu-user
+        // installed cannot build foreign either, so there is nothing to assert
+        // about it beyond the native case above.
+        let foreign = ["arm64", "amd64", "riscv64", "ppc64el"]
+            .into_iter()
+            .find(|target| crate::arch::is_foreign(&crate::arch::host_architecture(), target))
+            .expect("some architecture is foreign to any host");
+        let Some(record) = InterpreterRecord::of(foreign) else {
+            return;
+        };
+
+        // The qemu target name rather than the Debian architecture: `aarch64`
+        // for `arm64`.
+        assert!(!record.name.is_empty());
+        // The registered path, which is what binaries execute through — not
+        // whatever a `PATH` lookup would find, and the build environment has no
+        // `PATH` to look in anyway.
+        assert!(record.path.starts_with('/'), "{}", record.path);
+        // The digest is of the registered path, which `open` follows the symlink
+        // along, so it is the real binary's bytes.
+        let sha256 = record
+            .sha256
+            .clone()
+            .expect("a registered interpreter reads");
+        assert_eq!(sha256.len(), 64, "{sha256}");
+        if let Some(resolved) = &record.resolved {
+            assert_eq!(digest_of(Path::new(resolved)), Some(sha256));
+        }
+
+        let toml = Manifest::new("r", "trixie", foreign, Vec::new())
+            .with_interpreter(Some(record.clone()))
+            .to_toml();
+        assert_eq!(Manifest::load_from_str(&toml).interpreter, Some(record));
+    }
+
+    #[test]
+    fn a_registered_but_disabled_handler_is_not_an_absent_one() {
+        // The registration exists either way, and the distinction is "turn it
+        // on" against "install it". A handler that is off is recorded as
+        // present and not enabled rather than being dropped.
+        let off = InterpreterRecord {
+            name: "aarch64".to_string(),
+            path: "/usr/libexec/qemu-binfmt/aarch64-binfmt-P".to_string(),
+            resolved: Some("/usr/bin/qemu-aarch64".to_string()),
+            sha256: Some("ab".repeat(32)),
+            enabled: false,
+            flags: "POF".to_string(),
+        };
+        let toml = Manifest::new("r", "trixie", "arm64", Vec::new())
+            .with_interpreter(Some(off.clone()))
+            .to_toml();
+        assert!(toml.contains("enabled = false"), "{toml}");
+        assert_eq!(Manifest::load_from_str(&toml).interpreter, Some(off));
     }
 
     #[test]
@@ -1087,9 +1760,8 @@ mod tests {
             target: "/somewhere".to_string(),
         };
         let toml = toml::to_string(&SandboxRecord {
-            component: "c".to_string(),
-            env: BTreeMap::new(),
             mounts: vec![unknown.clone()],
+            ..bare_record()
         })
         .unwrap();
         assert!(toml.contains("kind = \"unknown\""), "{toml}");

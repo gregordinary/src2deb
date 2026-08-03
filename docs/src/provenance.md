@@ -255,13 +255,28 @@ it; it does not interpret it.
 
 ## The sandbox record
 
-What a build produces depends on the environment it runs in and the filesystem it
-sees, and neither follows from the source revisions. The `[sandbox]` section
-records both, as the build cage actually resolved them:
+What a build produces depends on what it was rooted on, the identity it held, the
+network and limits it ran under, the hardening applied to it, the environment it
+carried, and the filesystem it saw. None of that follows from the source
+revisions. The `[sandbox]` section records all of it, as the build cage actually
+resolved it:
 
 ```toml
 [sandbox]
 component = "cosmic-randr"
+network = "isolated"
+
+  [sandbox.root]
+  kind = "overlay"
+  lower = ["/mnt/build/work/base/trixie/arm64"]
+  upper = "/mnt/build/work/uppers/trixie/arm64/cosmic-randr"
+  work = "/mnt/build/work/uppers/trixie/arm64/.cosmic-randr.work"
+
+  [sandbox.identity]
+  kind = "single"
+
+  [sandbox.hardening]
+  kind = "unavailable"
 
   [sandbox.env]
   HOME = "/root"
@@ -290,30 +305,93 @@ component = "cosmic-randr"
   read-only = true
 ```
 
-`SOURCE_GIT_HASH` is the resolved commit, passed to both passes. Packaging that
-stamps a revision into the built binary reads it from there, so the package
-reports the commit the manifest names. `env` is the build command's complete
-environment. `mount` is every mount the
-sandbox established, in the order it established them — the managed profile
-first, then src2deb's own read-only source bind and read-write output bind. Each
-entry carries a `kind`: `tmpfs`, `procfs`, `devpts`, `bind`, `raw`, or `symlink`.
+- **`root`** is what the command's filesystem was, and is its own field rather
+  than a mount because it is what the mounts were laid over. `overlay` is the
+  layered strategy: the shared base as the read-only `lower`, the component's
+  build-dependency increment as the writable `upper`. `plain` is full
+  reprovisioning's per-component root. Without this a plain root and an overlay
+  over the same base produced byte-identical records while describing two
+  different builds.
+- **`identity`** is `single` for every build src2deb runs: the calling user is
+  root inside the sandbox and no other id is mapped. It decides whether a build
+  sees uid 0, which is what `Rules-Requires-Root` handling turns on.
+- **`network`** is `isolated` for a build pass. It is the first thing a
+  reproducibility claim is challenged on.
+- **`rlimit`** entries are the resource limits in force, and are absent because
+  src2deb sets none. A build that adapts its parallelism to `RLIMIT_NOFILE`
+  produces different output.
+- **`hardening`** is `unavailable` when the sandbox library was built without the
+  hardening layer, which is how src2deb builds it. That is recorded rather than
+  omitted, and it is a different fact from `applied` with no controls set — a
+  build that could have hardened and did not.
+- **`env`** is the build command's complete environment. `SOURCE_GIT_HASH` is the
+  resolved commit, passed to both passes; packaging that stamps a revision into
+  the built binary reads it from there, so the package reports the commit the
+  manifest names.
+- **`mount`** is every mount the sandbox established, in the order it established
+  them — the managed profile first, then src2deb's own read-only source bind and
+  read-write output bind. Each carries a `kind`: `tmpfs`, `procfs`, `devpts`,
+  `bind`, `raw`, or `symlink`.
 
-Recording this rather than assuming it matters because the sandbox's base
+Recording all of this rather than assuming it matters because the sandbox's base
 environment and managed mount profile are not fixed by the sandbox library's
 version — they may change between releases. The manifest states what a build ran
 under instead of leaving it to be inferred.
 
 The record is run-level, because every component's build applies the same
-environment and the same mount sequence, differing only in the host paths of the
-source and output binds. `component` names the one it was taken from: the
-earliest in build order the run built, so a `--jobs N` run records what a
-sequential run would. A run that builds nothing keeps the record already in the
-manifest, since the packages it still calls built were built under it.
+environment, the same mount sequence, and the same posture, differing only in
+host paths: the source and output binds name the component's own directories,
+and under the layered strategy so does the overlay upper. What an overlay root
+says about a build is its shape — a merge of this read-only lower stack with a
+writable layer — and the lower stack is the shared base every component builds
+over. `component` names the one it was taken from: the earliest in build order
+the run built, so a `--jobs N` run records what a sequential run would. A run
+that builds nothing keeps the record already in the manifest, since the packages
+it still calls built were built under it.
+
+A manifest an older src2deb wrote may not carry a field this one requires, and is
+refused rather than read with the missing fields defaulted — a default would have
+the record state a posture no build observed. Delete it and rebuild.
 
 Only the build pass is recorded. The vendor pass runs with the host network to
 fetch sources into the tree; it does not produce packages, so what it ran under
 says nothing about what the packages were built from. See
 [How a build runs](how-a-build-runs.md).
+
+## The interpreter record
+
+A foreign build runs every target binary through a `qemu-user` interpreter:
+`rustc`, `cc`, `ld`, and every configure probe execute under an emulator, and a
+changed emulator silently changes compiled output. The manifest already named the
+architecture and whether the build was foreign; `[interpreter]` names what
+executed it.
+
+```toml
+[interpreter]
+name = "aarch64"
+path = "/usr/libexec/qemu-binfmt/aarch64-binfmt-P"
+resolved = "/usr/bin/qemu-aarch64-static"
+sha256 = "bfcd46c842441912baed36158569ac29a7fb656684ca73c1b3b2f0f3971e9bec"
+enabled = true
+flags = "POF"
+```
+
+The values come from the kernel's own `binfmt_misc` registration, which is the
+path binaries actually execute through — not whatever a `PATH` lookup would find,
+and the build environment has no `PATH` to look in anyway. `path` is the
+registration as written, usually a wrapper; `resolved` is that path
+canonicalized, and the two are separate facts because repointing the symlink
+changes the interpreter without changing the registration.
+
+**The digest carries a caveat.** It is of `path`, which `open` follows the
+symlink along, so it is the real binary's bytes. But the `F` flag means the
+kernel opened and holds the interpreter at *registration* time, so a digest taken
+during a build may be of a file that replaced the one actually running. Two runs
+whose digests differ definitely ran different interpreters; two that agree agree
+only about the file on disk.
+
+A native build records no `[interpreter]` at all. Nothing interpreted anything,
+which is a different statement from having failed to look.
 
 ## The archive record
 
