@@ -1202,10 +1202,9 @@ fn check_after_build(
 /// quiet: it is the answer the check exists to give, and the one thing a caller
 /// that asked for nothing else still needs.
 ///
-/// A dependency satisfied only by a provider is printed at `--verbose` alone. It
-/// installs, so it is not an answer the check exists to give; it is context for
-/// one, since which provider apt picks is apt's decision rather than the
-/// packaging's.
+/// A dependency on a provided name is printed at `--verbose` alone. It installs,
+/// so it is not an answer the check exists to give; it is context for one, since
+/// which provider apt picks is apt's decision rather than the packaging's.
 fn print_check(report: &src2deb::CheckReport, verbosity: Verbosity) {
     for pool in &report.pools {
         for entry in &pool.unsatisfied {
@@ -1220,7 +1219,7 @@ fn print_check(report: &src2deb::CheckReport, verbosity: Verbosity) {
         if verbosity == Verbosity::Verbose {
             for entry in &pool.provided {
                 eprintln!(
-                    "src2deb: {}: {}: {}: {} is virtual, provided by {}",
+                    "src2deb: {}: {}: {}: {} is provided by {}",
                     pool.architecture,
                     entry.package,
                     entry.relationship.field(),

@@ -109,15 +109,20 @@ Alternatives and virtual packages are honoured, over exactly the archives that
 provision build roots. `a | b` is satisfied by either; `x-terminal-emulator` is
 satisfied by anything that `Provides` it.
 
-A dependency satisfied only by a provider is reported at `--verbose`, because it
-is a weaker satisfaction than a direct one — the clause installs because apt
-picks one of several providers, and which it picks is apt's decision rather than
-the packaging's:
+A dependency on a name something provides is reported at `--verbose`, because
+being satisfied that way is weaker than being satisfied directly — the clause
+installs because apt picks one of several providers, and which it picks is apt's
+decision rather than the packaging's:
 
 ```text
-src2deb: arm64: pop-icon-theme: Depends: adwaita-icon-theme-full is virtual,
-provided by adwaita-icon-theme
+src2deb: arm64: pop-icon-theme: Depends: adwaita-icon-theme-full is provided by
+adwaita-icon-theme
 ```
+
+The line says the name is provided, not that it is *only* provided. Debian
+policy lets a package provide a name a real package also carries — a
+transitional package is the usual case — and the archives are read as the names
+they offer rather than as a catalogue that separates the two.
 
 ## What is checked
 

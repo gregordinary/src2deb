@@ -25,9 +25,10 @@
 //!
 //! The projection names real packages and virtual ones alike, so a dependency an
 //! archive package satisfies through `Provides` is settled the same way one
-//! naming a real package is — and the providers are reported, which is what lets
-//! a virtual satisfaction be told from a direct one. It costs one release and
-//! index fetch per pool for any number of names.
+//! naming a real package is — and the providers are reported alongside, so a
+//! dependency on a name several packages offer is not read as a dependency on a
+//! package. It costs one release and index fetch per pool for any number of
+//! names.
 //!
 //! # What is checked, and what is not
 //!
@@ -130,13 +131,20 @@ pub struct Unsatisfied {
     pub alternatives: Vec<String>,
 }
 
-/// One dependency that no package of that name satisfies, but that something
-/// else provides.
+/// One dependency satisfied by a name that something in the archives provides.
 ///
-/// A weaker satisfaction than a direct one, and worth telling apart: the clause
-/// installs only because apt picks one of several providers, and which it picks
-/// is apt's decision rather than the packaging's. A dependency on `awk` is
-/// satisfiable everywhere and is a different fact from a dependency on `gawk`.
+/// Ordinarily that is the whole story: nothing carries the name, and the clause
+/// installs only because apt picks one of several providers — which is apt's
+/// decision rather than the packaging's, and a weaker satisfaction than a direct
+/// one. A dependency on `awk` is satisfiable everywhere and is a different fact
+/// from a dependency on `gawk`.
+///
+/// Policy 7.5 also permits a package to provide a name a *real* package carries,
+/// which is what a transitional package does. Such a clause is satisfied
+/// directly and appears here all the same: the projection the check reads names
+/// what the archives offer and who provides what, without saying which of the
+/// two a given name is. So this reports that a name is provided, not that it is
+/// only provided.
 #[derive(Debug, Clone)]
 pub struct Provided {
     /// The package that declares it.
@@ -171,11 +179,13 @@ pub struct CheckedPool {
     /// list its packages in, so a report is a function of what the pool holds
     /// rather than of how it was read.
     pub unsatisfied: Vec<Unsatisfied>,
-    /// The clauses satisfied only by a provider, in the same order.
+    /// The clauses satisfied by a name something provides, in the same order.
     ///
     /// Not a problem, and reported separately for that reason: these install.
     /// They are what a reader has to know to tell "this dependency names a
     /// package" from "this dependency names something several packages offer".
+    /// See [`Provided`] for the one case where the second reading is too
+    /// strong.
     pub provided: Vec<Provided>,
 }
 
@@ -317,7 +327,7 @@ fn check_pool(
 }
 
 /// Answers every clause `packages` declare against the names `archive` offers:
-/// what nothing satisfies, and what only a provider does.
+/// what nothing satisfies, and what a provider does.
 ///
 /// One pass over the archives, then a membership question per alternative. The
 /// projection already carries every virtual name and the pool's own packages
@@ -349,9 +359,12 @@ fn examine(
                 });
                 continue;
             };
-            // Providers are recorded for a virtual name only. A real package is
-            // never a provider of itself, so a non-empty list is exactly the
-            // case where nothing of that name exists and something offers it.
+            // A package is never a provider of itself, so a non-empty list
+            // means something else offers this name. That is the virtual case
+            // whenever no real package carries the name — which is the ordinary
+            // one — and a transitional `Provides` over a real name otherwise.
+            // The projection does not separate the two, and [`Provided`] is
+            // worded for what it can say.
             let providers = available.providers(name);
             if !providers.is_empty() {
                 provided.push(Provided {
@@ -606,7 +619,7 @@ mod tests {
         examine(&read_index(index), archive).unwrap().0
     }
 
-    /// Runs a check over an index, returning what only a provider satisfies.
+    /// Runs a check over an index, returning what a provider satisfies.
     fn provided(index: &str, archive: &mut Fixed) -> Vec<Provided> {
         examine(&read_index(index), archive).unwrap().1
     }
@@ -739,6 +752,25 @@ mod tests {
         let index = "Package: p\nVersion: 1\nDepends: libc6\n";
         let mut archive = Fixed::new(&["libc6"]);
         assert!(provided(index, &mut archive).is_empty());
+    }
+
+    #[test]
+    fn a_name_that_is_both_real_and_provided_is_reported_as_provided() {
+        // Debian policy 7.5 permits a package to provide a name a real package
+        // also carries, which is what a transitional package does: `git-core`
+        // provides `git`, and `git` is a package. The clause is satisfied
+        // directly, and the archives are read as the names they offer rather
+        // than as a catalogue separating real from virtual — so the entry says
+        // the name is provided, which is all it can say, and nothing gates on
+        // it either way.
+        let index = "Package: p\nVersion: 1\nDepends: git\n";
+        let mut archive = Fixed::new(&["git", "git-core"]).providing("git", &["git-core"]);
+        assert!(sieve(index, &mut archive).is_empty());
+
+        let provided = provided(index, &mut archive);
+        assert_eq!(provided.len(), 1);
+        assert_eq!(provided[0].name, "git");
+        assert_eq!(provided[0].providers, ["git-core"]);
     }
 
     #[test]
