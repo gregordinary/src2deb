@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 signal-hook.workspace = true
-src2deb = { path = "../src2deb" }
+src2deb.workspace = true
 
 [lints]
 workspace = true

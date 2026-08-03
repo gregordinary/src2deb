@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# This test reads the recipes at the repository root, which are not part of the
+# crate. It belongs to the repository rather than to the published library, so
+# it is left out rather than shipped as a test that cannot run.
+exclude = ["tests/shipped_recipes.rs"]
 
 [dependencies]
 ferroday-cage.workspace = true

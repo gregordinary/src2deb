@@ -16,6 +16,10 @@ ferroday-cage = { version = "0.1.3", features = ["debian"] }
 # so the two agree on which builds are foreign.
 rustix = { version = "1.1.4", features = ["system"] }
 serde = { version = "1", features = ["derive"] }
+# The library the CLI is a front end for. The version travels beside the path
+# because `cargo publish` rejects a path-only dependency; within the workspace
+# the path is what resolves.
+src2deb = { path = "crates/src2deb", version = "0.1.0" }
 # Checksums for the artefacts a build produces, recorded in the provenance
 # manifest. Already in the tree through ferroday-cage, which uses it to verify
 # what it downloads.
