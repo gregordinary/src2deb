@@ -642,9 +642,9 @@ dependencies = [
 
 [[package]]
 name = "ferroday-cage"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "474df867abef96fb0d82c67e3dfe9425bc7766bc6417d1410a6d8d6537a3dd91"
+checksum = "94a9b3a876ca0c562a29c59766f3c40970d03423d8a61449967fee7234712ca3"
 dependencies = [
  "flate2",
  "lzma-rust2",
