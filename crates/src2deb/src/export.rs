@@ -58,10 +58,13 @@
 //!
 //! - **An export removes only files an index of its own named.** A file the
 //!   destination held for any other reason is left where it is.
-//! - **The index is written before the files it names.** An export interrupted
-//!   partway through therefore leaves nothing the next export cannot account
-//!   for; the alternative order leaves orphans, which is the one outcome
-//!   replacement exists to prevent.
+//! - **The index names every file the directory holds on the recipe's behalf,
+//!   at every moment.** It is written before the files it names, and it goes on
+//!   naming a prior export's files — as
+//!   [`superseded`](RecipeExport::superseded) — until they have actually been
+//!   removed. So an export interrupted partway through leaves nothing the next
+//!   export cannot account for. Dropping either half leaves orphans, which is
+//!   the one outcome replacement exists to prevent.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -123,19 +126,49 @@ pub struct RecipeExport {
     /// directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub manifests: Vec<String>,
+    /// Files a prior export of this recipe left that this one is removing,
+    /// relative to the suite directory and in name order.
+    ///
+    /// Listed only for as long as the removal is outstanding: an export writes
+    /// the index naming them, removes them, and writes it again without them.
+    /// Without that, an export interrupted in between would leave the prior
+    /// export's files with nothing naming them — the next export's `prior`
+    /// would be this index, which no longer lists them, so no export could ever
+    /// reach them again. An index carrying any is one a run did not finish, and
+    /// the next export over it removes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<String>,
     /// One entry per component and architecture that contributed a file.
     #[serde(rename = "component", default)]
     pub components: Vec<ExportedComponent>,
 }
 
 impl RecipeExport {
-    /// Every file this recipe's export owns, relative to the suite directory.
+    /// Every file this recipe's export owns, relative to the suite directory —
+    /// including any [`superseded`](Self::superseded) file whose removal an
+    /// interrupted export left outstanding.
     pub fn files(&self) -> impl Iterator<Item = &str> {
-        self.manifests.iter().map(String::as_str).chain(
-            self.components
-                .iter()
-                .flat_map(|component| component.files.iter().map(String::as_str)),
-        )
+        self.manifests
+            .iter()
+            .map(String::as_str)
+            .chain(self.superseded.iter().map(String::as_str))
+            .chain(
+                self.components
+                    .iter()
+                    .flat_map(|component| component.files.iter().map(String::as_str)),
+            )
+    }
+
+    /// The same entry, naming the files it has yet to remove.
+    ///
+    /// The form the index takes between the two writes an export makes. The
+    /// entry a caller starts from names what the export *carries*, which is
+    /// what has to be compared against a prior export to work out what it
+    /// supersedes — so the two are separate values rather than one mutated in
+    /// place.
+    fn removing(mut self, superseded: Vec<String>) -> RecipeExport {
+        self.superseded = superseded;
+        self
     }
 }
 
@@ -247,6 +280,7 @@ pub fn export(work_dir: &Path, recipe: &Recipe, options: &ExportOptions) -> Resu
         name: recipe.name.clone(),
         architectures: architectures.clone(),
         manifests: manifests.iter().map(|file| file.name.clone()).collect(),
+        superseded: Vec::new(),
         components: outputs
             .iter()
             .filter(|output| !output.packages.is_empty())
@@ -258,15 +292,26 @@ pub fn export(work_dir: &Path, recipe: &Recipe, options: &ExportOptions) -> Resu
             .collect(),
     };
 
-    // The index lands before the files it names, so no file this export writes
-    // is ever unaccounted for. See the module documentation.
+    // The index lands before the files it names, and goes on naming what this
+    // export is about to remove until it has, so no file in the directory is
+    // ever unaccounted for. See the module documentation.
     let prior = read_index(&dir, recipe)?;
-    let index = merge_index(prior.as_ref(), &recipe.suite, entry.clone());
+    let superseded = superseded_files(prior.as_ref(), &entry);
     std::fs::create_dir_all(&dir)
         .map_err(|err| io_error("creating the export directory", &dir, err))?;
-    write_index(&dir, &index)?;
+    write_index(
+        &dir,
+        &merge_index(
+            prior.as_ref(),
+            &recipe.suite,
+            entry.clone().removing(superseded.clone()),
+        ),
+    )?;
 
-    let removed = remove_superseded(&dir, prior.as_ref(), &entry)?;
+    let removed = remove_files(&dir, &superseded)?;
+    // The removal is done, so the index drops what it was holding open for it
+    // and settles at what this export carries.
+    write_index(&dir, &merge_index(prior.as_ref(), &recipe.suite, entry))?;
 
     let mut bytes = 0;
     let mut files = 0;
@@ -638,30 +683,49 @@ fn write_index(dir: &Path, index: &ExportIndex) -> Result<()> {
     })
 }
 
-/// Removes the files this recipe's prior export left that this one does not
-/// carry, and returns how many were removed.
+/// The files this recipe's prior export left that this one does not carry, in
+/// name order.
 ///
-/// A file the new export carries under the same name is left where it is and
-/// overwritten by the copy, so a name that has not moved is never briefly
-/// absent from the destination.
-fn remove_superseded(
-    dir: &Path,
-    prior: Option<&ExportIndex>,
-    entry: &RecipeExport,
-) -> Result<usize> {
+/// A file the new export carries under the same name is not among them: it is
+/// left where it is and overwritten by the copy, so a name that has not moved is
+/// never briefly absent from the destination.
+///
+/// The prior entry's own [`superseded`](RecipeExport::superseded) list counts as
+/// files it left, which is what makes an export interrupted mid-removal
+/// self-healing: whatever the run before could not finish removing is removed
+/// now.
+fn superseded_files(prior: Option<&ExportIndex>, entry: &RecipeExport) -> Vec<String> {
     let Some(prior) = prior else {
-        return Ok(0);
+        return Vec::new();
     };
     let Some(previous) = prior
         .recipes
         .iter()
         .find(|recipe| recipe.name == entry.name)
     else {
-        return Ok(0);
+        return Vec::new();
     };
     let current: BTreeSet<&str> = entry.files().collect();
+    previous
+        .files()
+        .filter(|file| !current.contains(file))
+        .map(str::to_string)
+        // Collected through a set, so a name listed twice is removed once and
+        // the index records it once, in an order that does not vary.
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
+
+/// Removes `files` from the export directory, and returns how many were there
+/// to remove.
+///
+/// A file already gone is not an error: an export interrupted after removing it
+/// leaves the index still naming it, and the next export has to be able to
+/// finish the job rather than fail over the part that was done.
+fn remove_files(dir: &Path, files: &[String]) -> Result<usize> {
     let mut removed = 0;
-    for file in previous.files().filter(|file| !current.contains(file)) {
+    for file in files {
         // The index is src2deb's own and names files it wrote relative to the
         // suite directory, but a path is still checked before it is removed:
         // an index that has been edited must not be able to delete outside the
@@ -1105,6 +1169,64 @@ mod tests {
                 "manifests/r/arm64.toml",
                 "other_1.0_arm64.deb",
             ]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_export_interrupted_before_its_removal_is_finished_by_the_next_one() {
+        let root = scratch("interrupted");
+        let work = root.join("work");
+        let dest = root.join("drop");
+        manifest_for(&work, "arm64", &["c"]);
+        build_output(&work, "arm64", "c", &["c_1.0_arm64.deb"]);
+        export(&work, &recipe(None), &ExportOptions::to(&dest)).unwrap();
+
+        // The version moves, so the file name moves with it. Stop the next
+        // export where it is most exposed: its index has landed, and the file
+        // it supersedes is still on disk.
+        std::fs::remove_dir_all(build::output_dir(&work, "trixie", "arm64").join("c")).unwrap();
+        build_output(&work, "arm64", "c", &["c_2.0_arm64.deb"]);
+        let dir = dest.join("trixie");
+        let prior = read_index(&dir, &recipe(None)).unwrap();
+        let entry = RecipeExport {
+            name: "r".to_string(),
+            architectures: vec!["arm64".to_string()],
+            manifests: vec!["manifests/r/arm64.toml".to_string()],
+            superseded: Vec::new(),
+            components: vec![ExportedComponent {
+                name: "c".to_string(),
+                architecture: "arm64".to_string(),
+                files: vec!["c_2.0_arm64.deb".to_string()],
+            }],
+        };
+        let superseded = superseded_files(prior.as_ref(), &entry);
+        assert_eq!(superseded, ["c_1.0_arm64.deb"]);
+        write_index(
+            &dir,
+            &merge_index(prior.as_ref(), "trixie", entry.removing(superseded)),
+        )
+        .unwrap();
+        assert!(dir.join("c_1.0_arm64.deb").is_file());
+
+        // The index went on naming the file the interrupted export had not
+        // removed, so the next export can still reach it. Without that it would
+        // sit in the directory forever: the index would name only the new file,
+        // and nothing would ever look for the old one again.
+        let report = export(&work, &recipe(None), &ExportOptions::to(&dest)).unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(
+            listing(&report.dir),
+            ["c_2.0_arm64.deb", "export.toml", "manifests/r/arm64.toml"]
+        );
+        // And the index it settles at holds nothing outstanding, so the entry
+        // describes what the export carries rather than accumulating.
+        let index = read_index(&report.dir, &recipe(None)).unwrap().unwrap();
+        assert!(
+            index
+                .recipes
+                .iter()
+                .all(|recipe| recipe.superseded.is_empty())
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

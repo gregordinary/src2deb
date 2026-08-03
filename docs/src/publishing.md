@@ -107,13 +107,18 @@ wrote, so the next export into the same directory removes exactly those and
 writes its own — a scheduled run stays idempotent, and a superseded version
 never reaches the archive by being left behind.
 
-Two rules make that safe to point at a shared drop directory:
+Three rules make that safe to point at a shared drop directory:
 
 - **An export removes only files an export of its own wrote.** Anything else in
   the directory is left alone.
 - **The index is keyed by recipe.** Several recipes may export into one
   directory, and each replaces only its own files — which is the ordinary case
   for an archive publishing more than one recipe into a suite.
+- **The index names every file the directory holds for the recipe, at every
+  moment.** It is written before the files it names, and it goes on naming the
+  files it is superseding until they have actually been removed. An export
+  killed partway through therefore leaves nothing unaccounted for, and the next
+  one finishes what it started.
 
 An export into a directory whose `export.toml` names a different suite is
 refused, since that means the destination is not the one intended.
