@@ -785,15 +785,20 @@ pub enum SkipReason {
     /// The run was cancelled before it finished the component — either before
     /// it was reached at all, or partway through its build.
     Cancelled,
+    /// The run stopped at an earlier component's failure and never reached this
+    /// one. Only a run without [`RunOptions::keep_going`] leaves any, since that
+    /// is what carries a run past a failure.
+    NotReached,
 }
 
 impl SkipReason {
     /// Every reason, so a caller tallying them cannot leave one out.
-    pub const ALL: [SkipReason; 4] = [
+    pub const ALL: [SkipReason; 5] = [
         SkipReason::AlreadyBuilt,
         SkipReason::NotSelected,
         SkipReason::ArchIndepElsewhere,
         SkipReason::Cancelled,
+        SkipReason::NotReached,
     ];
 
     /// A short human-readable phrase for the reason.
@@ -803,6 +808,7 @@ impl SkipReason {
             SkipReason::NotSelected => "not selected",
             SkipReason::ArchIndepElsewhere => "arch-indep owned elsewhere",
             SkipReason::Cancelled => "cancelled",
+            SkipReason::NotReached => "not reached",
         }
     }
 }
@@ -912,7 +918,8 @@ pub struct RunReport {
     /// architecture never reached, and one it stopped partway through, are in
     /// its [`skipped`](ArchitectureReport::skipped) with
     /// [`SkipReason::Cancelled`]; an architecture the run never started has no
-    /// report at all.
+    /// report at all. A run stopped by a component's failure instead accounts
+    /// for the components after it with [`SkipReason::NotReached`].
     pub cancelled: bool,
 }
 
@@ -972,7 +979,10 @@ pub struct ArchitectureReport {
     /// source never resolved is in [`RunReport::unresolved`] instead, since it
     /// failed for the run rather than for this architecture.
     pub failed: Vec<Failed>,
-    /// The components this architecture did not build, in build order.
+    /// The components this architecture did not build, in build order, each
+    /// with why. Every component the run accounted for is in exactly one of
+    /// [`built`](Self::built), [`failed`](Self::failed), and this — including
+    /// the ones a run that stopped short never began. See [`SkipReason`].
     pub skipped: Vec<Skipped>,
     /// The directory the artifacts were written under
     /// (`work/out/<suite>/<architecture>`), holding one directory per component.
@@ -990,7 +1000,7 @@ impl ArchitectureReport {
 
     /// How many components were skipped for `reason`.
     ///
-    /// The four reasons are not one outcome. A run that deliberately built one
+    /// The reasons are not one outcome. A run that deliberately built one
     /// component of twenty-seven and a run that was cancelled after one both
     /// report twenty-six skipped, and only the reason tells them apart.
     pub fn skipped_for(&self, reason: SkipReason) -> usize {
@@ -1701,17 +1711,22 @@ impl Engine {
             true => prior_archives,
         };
 
-        // A cancelled run stops before reaching every component it selected.
-        // Record those, and the one it stopped partway through, so the manifest
-        // keeps what each resolved to and the summary accounts for them rather
-        // than passing over them in silence.
-        if options.cancel.requested() {
-            let selected: Vec<(&str, &Fingerprint)> =
-                items.iter().map(|item| (item.name, item.source)).collect();
-            skipped.extend(unfinished(&selected, &built, &failed));
-        }
+        // A run that stops short leaves components it selected with no outcome
+        // at all: a cancel stops it where it stands, and so does a component's
+        // failure without `--keep-going`. Record them, and the one a cancel
+        // stopped partway through, so the manifest keeps what each resolved to
+        // and the summary accounts for them rather than passing over them in
+        // silence. A run that finished has none, so this is asked
+        // unconditionally rather than guarded by how the run ended.
+        let stop = match options.cancel.requested() {
+            true => SkipReason::Cancelled,
+            false => SkipReason::NotReached,
+        };
+        let selected: Vec<(&str, &Fingerprint)> =
+            items.iter().map(|item| (item.name, item.source)).collect();
+        skipped.extend(unfinished(&selected, &built, &failed, stop));
         // The skipped were collected in three passes — the components that never
-        // resolved, those the build order passed over, and those a cancel never
+        // resolved, those the build order passed over, and those the run never
         // reached — so restore the single order the report documents.
         in_build_order(&mut skipped, &position, |skipped| {
             skipped.component.as_str()
@@ -2652,18 +2667,23 @@ fn in_build_order<T>(
     });
 }
 
-/// The components a cancelled run did not finish: every component it selected
-/// that is neither built nor failed. `selected` is in build order, so the
-/// result is too.
+/// The components a run did not finish: every component it selected that is
+/// neither built nor failed, recorded with `reason`. `selected` is in build
+/// order, so the result is too. Empty for a run that reached everything.
 ///
-/// That covers both the components the run never reached and the one it stopped
-/// partway through — from the outside they are the same thing, a selected
-/// component with no outcome, and both are recorded with what their source
-/// resolved to so the manifest keeps naming the exact input.
+/// That covers the components the run never reached and, for a cancel, the one
+/// it stopped partway through — from the outside they are the same thing, a
+/// selected component with no outcome, and both are recorded with what their
+/// source resolved to so the manifest keeps naming the exact input.
+///
+/// The alternative is what the counts would otherwise say. A twenty-seven
+/// component run that stops at the third reports two built and one failed, and
+/// the twenty-four it never began have to be somewhere for that to add up.
 fn unfinished(
     selected: &[(&str, &Fingerprint)],
     built: &[Built],
     failed: &[Failed],
+    reason: SkipReason,
 ) -> Vec<Skipped> {
     let reached: BTreeSet<&str> = built
         .iter()
@@ -2676,7 +2696,7 @@ fn unfinished(
         .map(|(name, source)| Skipped {
             component: name.to_string(),
             source: (*source).clone(),
-            reason: SkipReason::Cancelled,
+            reason,
         })
         .collect()
 }
@@ -2948,7 +2968,9 @@ fn packages_of(artifacts: &[Artifact]) -> Vec<Package> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{ComponentRecord, PackageRecord, STATUS_BUILT, STATUS_FAILED};
+    use crate::manifest::{
+        ComponentRecord, PackageRecord, STATUS_BUILT, STATUS_FAILED, STATUS_SKIPPED,
+    };
 
     fn order(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| name.to_string()).collect()
@@ -3596,7 +3618,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_run_accounts_for_every_component_it_did_not_finish() {
+    fn a_run_that_stops_short_accounts_for_every_component_it_did_not_finish() {
         let sources: Vec<(&str, Fingerprint)> = ["aaa", "bbb", "ccc", "ddd"]
             .iter()
             .zip(["a", "b", "c", "d"])
@@ -3624,17 +3646,40 @@ mod tests {
         // `c` was the component the cancel stopped partway through and `d` was
         // never reached; neither has an outcome, so both are recorded as
         // cancelled, in build order and keeping the source each resolved to.
-        let unfinished = unfinished(&selected, &built, &failed);
-        let names: Vec<&str> = unfinished
+        let cancelled = unfinished(&selected, &built, &failed, SkipReason::Cancelled);
+        let names: Vec<&str> = cancelled
             .iter()
             .map(|skipped| skipped.component.as_str())
             .collect();
         assert_eq!(names, ["c", "d"]);
-        assert_eq!(unfinished[0].source, git("ccc"));
+        assert_eq!(cancelled[0].source, git("ccc"));
         assert!(
-            unfinished
+            cancelled
                 .iter()
                 .all(|skipped| skipped.reason == SkipReason::Cancelled)
+        );
+
+        // The same components, and the same fingerprints, when what stopped the
+        // run was `b`'s failure rather than a cancel: the run's counts have to
+        // add up either way, and only the reason differs.
+        let not_reached = unfinished(&selected, &built, &failed, SkipReason::NotReached);
+        let names: Vec<&str> = not_reached
+            .iter()
+            .map(|skipped| skipped.component.as_str())
+            .collect();
+        assert_eq!(names, ["c", "d"]);
+        assert_eq!(not_reached[0].source, git("ccc"));
+        assert!(
+            not_reached
+                .iter()
+                .all(|skipped| skipped.reason == SkipReason::NotReached)
+        );
+
+        // Together they account for the whole selection, which is what makes
+        // `built + failed + skipped` equal what the run set out to build.
+        assert_eq!(
+            built.len() + failed.len() + not_reached.len(),
+            selected.len()
         );
     }
 
@@ -3737,7 +3782,11 @@ mod tests {
             buildinfo: None,
             packages: Vec::new(),
         }];
-        assert!(unfinished(&[("a", &git("aaa"))], &built, &[]).is_empty());
+        // Asked of every run rather than only of one that stopped short, so a
+        // run that reached everything has to answer with nothing.
+        for reason in [SkipReason::Cancelled, SkipReason::NotReached] {
+            assert!(unfinished(&[("a", &git("aaa"))], &built, &[], reason).is_empty());
+        }
     }
 
     /// An architecture's report, with everything a manifest does not read left
@@ -3984,6 +4033,48 @@ mod tests {
                 .unwrap()
                 .contains("no such repository")
         );
+    }
+
+    #[test]
+    fn a_component_the_run_never_reached_keeps_the_source_it_resolved_to() {
+        let recipe: Recipe = toml::from_str(
+            "name = \"r\"\nsuite = \"trixie\"\n\
+             [[components]]\nname = \"a\"\nsource.git = \"x\"\n\
+             [[components]]\nname = \"b\"\nsource.git = \"y\"\n",
+        )
+        .unwrap();
+        // `a` failed and the run was not told to keep going, so `b` was never
+        // begun — though its source had already resolved, since every source
+        // resolves before the build phase starts.
+        let report = architecture_report(
+            "amd64",
+            Vec::new(),
+            vec![Failed {
+                component: "a".to_string(),
+                source: git("abc"),
+                error: Error::Plan("boom".to_string()),
+            }],
+            vec![Skipped {
+                component: "b".to_string(),
+                source: git("def"),
+                reason: SkipReason::NotReached,
+            }],
+        );
+
+        let manifest = manifest_for_architecture(
+            &recipe,
+            &order(&["a", "b"]),
+            &[],
+            &report,
+            &BTreeMap::new(),
+            Path::new("/w"),
+        );
+        let records = manifest.records_by_name();
+        // Recorded as skipped, naming what it resolved to. Dropping the
+        // fingerprint would leave the manifest saying nothing about an input
+        // the run had already measured.
+        assert_eq!(records["b"].status, STATUS_SKIPPED);
+        assert_eq!(records["b"].source, git("def"));
     }
 
     #[test]

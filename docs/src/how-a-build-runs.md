@@ -131,6 +131,11 @@ stops at the first failure, and with `--keep-going` it continues to the next
 component. Either way the run finishes with a report of what built and what
 failed.
 
+A run that stops accounts for the components it never began as *not reached*, so
+`built + failed + skipped` covers every component the run set out to build. They
+are recorded with what their source resolved to, and the manifest keeps whatever
+it already said of them — a component a prior run built stays recorded as built.
+
 The same rule decides whether the next architecture starts. Without
 `--keep-going` a failure stops the run where it is, so the architectures after it
 are never begun and the summary names them; with it, every architecture is

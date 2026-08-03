@@ -1763,10 +1763,10 @@ fn print_summary(recipe: &Recipe, report: &RunReport) {
 /// skipped: `"26 not selected"`, `"2 already built, 1 cancelled"`, or
 /// `"0 skipped"` when none were.
 ///
-/// The four reasons are four different outcomes, and collapsing them makes a
-/// deliberate single-component build (`1 built, 26 skipped of 27`) read exactly
-/// like a run that fell over. Naming the reason is what makes the closing line
-/// say what happened.
+/// The reasons are different outcomes, and collapsing them makes a deliberate
+/// single-component build (`1 built, 26 skipped of 27`) read exactly like a run
+/// that fell over. Naming the reason is what makes the closing line say what
+/// happened.
 fn skipped_tally(architecture: &src2deb::ArchitectureReport) -> String {
     let counts: Vec<String> = SkipReason::ALL
         .into_iter()
@@ -2581,7 +2581,7 @@ source.git = \"https://example.invalid/c\"
 
     #[test]
     fn the_summary_says_why_components_were_skipped() {
-        use SkipReason::{AlreadyBuilt, Cancelled, NotSelected};
+        use SkipReason::{AlreadyBuilt, Cancelled, NotReached, NotSelected};
 
         assert_eq!(skipped_tally(&skipped_report(&[])), "0 skipped");
         // A deliberate single-component build over a large recipe reads as a
@@ -2595,6 +2595,12 @@ source.git = \"https://example.invalid/c\"
         assert_eq!(
             skipped_tally(&skipped_report(&[Cancelled, NotSelected, AlreadyBuilt])),
             "1 already built, 1 not selected, 1 cancelled"
+        );
+        // A run stopped at a component's failure is not a cancelled one, and the
+        // components after the failure are what make its counts add up.
+        assert_eq!(
+            skipped_tally(&skipped_report(&[NotReached, NotReached])),
+            "2 not reached"
         );
     }
 
