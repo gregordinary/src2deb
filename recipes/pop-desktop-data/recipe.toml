@@ -9,8 +9,10 @@
 #
 # The suite below is this recipe's default; every component builds against forky
 # as well, with only a debhelper compat-level deprecation warning. Pass
-# --suite forky for that target. No architecture is named, so the recipe builds
-# for whichever host runs it; pass --architecture to target another one.
+# --suite forky for that target. No architectures are named, so the recipe builds
+# for whichever host runs it; pass --architecture to target another one. Every
+# package here is Architecture: all, so there is nothing to gain from building
+# it for a second architecture.
 
 name = "pop-desktop-data"
 suite = "trixie"

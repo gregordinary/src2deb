@@ -35,20 +35,27 @@ source.git = "https://github.com/pop-os/cosmic-settings"
   same recipe against another suite without editing the file, and each suite gets
   its own pool, output tree, and manifest. Name the suite the recipe was written
   and tested against.
-- `architecture` — the target architecture, a Debian name such as `amd64` or
+- `architectures` — the target architectures, Debian names such as `amd64` or
   `arm64`. Optional: a recipe that omits it builds for whichever host runs it,
   and `--architecture` selects any other target without editing the file, which
-  is what keeps one recipe serving every target. Name one when the recipe is
-  meaningful for a single architecture. See
+  is what keeps one recipe serving every target. Name them when the recipe is
+  meaningful for a fixed set.
+
+  A run builds each in turn, in the order named, from one set of resolved
+  sources, into a pool and an output tree of its own. See
   [Cross-architecture builds](cross-architecture.md).
+
+  ```toml
+  architectures = ["amd64", "arm64"]
+  ```
 - `arch-indep-owner` — the architecture that produces this recipe's
-  `Architecture: all` packages, such as `amd64`. Optional: unset, every run
-  produces its own, so a single pool holds every package the recipe declares and
-  can be served as it stands. Name one when several architectures feed a single
-  published archive, where one name and version must mean one file. Every other
-  architecture then builds only its architecture-dependent packages, and a
-  component whose every binary package is `Architecture: all` is skipped for
-  them. See [Who builds the `Architecture: all`
+  `Architecture: all` packages, such as `amd64`. Optional: unset, every
+  architecture produces its own, so each pool holds every package the recipe
+  declares and can be served as it stands. Name one when several architectures
+  feed a single published archive, where one name and version must mean one file.
+  Every other architecture then builds only its architecture-dependent packages,
+  and a component whose every binary package is `Architecture: all` is skipped
+  for them. See [Who builds the `Architecture: all`
   packages](cross-architecture.md#who-builds-the-architecture-all-packages).
 - `version-tag` — the tag every built version carries, identifying the suite it
   was built for, such as `deb13`. Optional: src2deb derives it from the suite for

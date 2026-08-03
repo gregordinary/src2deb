@@ -1,9 +1,9 @@
 //! A build recipe: the components to build, and where their source comes from.
 //!
 //! A recipe is a TOML file, `recipe.toml`, in a recipe directory. It names a
-//! suite and architecture and lists components, each with a source: a git
-//! repository to clone, or a tree already on disk. See `recipes/cosmic-epoch/`
-//! for a worked example.
+//! suite and the architectures to build for, and lists components, each with a
+//! source: a git repository to clone, or a tree already on disk. See
+//! `recipes/cosmic-epoch/` for a worked example.
 
 use std::path::{Path, PathBuf};
 
@@ -45,11 +45,17 @@ pub struct Recipe {
     /// resolve its own tag.
     #[serde(default)]
     pub version_tag: Option<String>,
-    /// The target architecture, a Debian name such as `amd64` or `arm64`.
-    /// Defaults to the host's architecture, so a recipe that omits it builds
-    /// natively wherever it runs; naming a foreign one builds through qemu.
-    #[serde(default = "default_architecture")]
-    pub architecture: String,
+    /// The target architectures, Debian names such as `amd64` or `arm64`.
+    /// Defaults to the host's architecture alone, so a recipe that omits it
+    /// builds natively wherever it runs; naming a foreign one builds through
+    /// qemu.
+    ///
+    /// A run builds each in turn, in the order named, against one set of
+    /// resolved sources. Each gets a pool, an output tree, and a manifest of
+    /// its own, so the architectures share a work directory without overwriting
+    /// one another.
+    #[serde(default = "default_architectures")]
+    pub architectures: Vec<String>,
     /// The architecture that produces this recipe's `Architecture: all`
     /// packages, when one is named.
     ///
@@ -59,10 +65,10 @@ pub struct Recipe {
     /// over different bytes. Naming an owner settles which architecture makes
     /// it, and every other one builds only its architecture-dependent packages.
     ///
-    /// Unset, every run owns its own arch-indep output, which is the behaviour
-    /// a single-architecture build wants: its pool holds every package the
-    /// recipe produces and can be served as it stands. Name an owner when
-    /// several architectures feed one published archive. See
+    /// Unset, every architecture owns its own arch-indep output, which is the
+    /// behaviour a build serving its pool directly wants: that pool holds every
+    /// package the recipe produces and can be served as it stands. Name an
+    /// owner when several architectures feed one published archive. See
     /// [`owns_arch_indep`](Self::owns_arch_indep).
     #[serde(default)]
     pub arch_indep_owner: Option<String>,
@@ -529,12 +535,16 @@ impl Recipe {
     }
 
     /// The architecture that produces this recipe's `Architecture: all`
-    /// packages: the declared [`arch_indep_owner`](Self::arch_indep_owner), or
-    /// the recipe's own architecture when none is declared.
-    pub fn resolved_arch_indep_owner(&self) -> &str {
-        self.arch_indep_owner
-            .as_deref()
-            .unwrap_or(&self.architecture)
+    /// packages for a build targeting `architecture`: the declared
+    /// [`arch_indep_owner`](Self::arch_indep_owner), or `architecture` itself
+    /// when none is declared.
+    ///
+    /// Taking the target as an argument is what makes the unset case mean "each
+    /// architecture owns its own" rather than naming one of them: a recipe
+    /// building for several says nothing about which of them is special until it
+    /// declares an owner.
+    pub fn resolved_arch_indep_owner<'a>(&'a self, architecture: &'a str) -> &'a str {
+        self.arch_indep_owner.as_deref().unwrap_or(architecture)
     }
 
     /// How `component`'s stamped version orders against the archive's own
@@ -552,14 +562,14 @@ impl Recipe {
             .unwrap_or_default()
     }
 
-    /// Whether the architecture this recipe targets produces its
+    /// Whether a build targeting `architecture` produces this recipe's
     /// `Architecture: all` packages.
     ///
-    /// True unless the recipe hands arch-indep output to another architecture,
-    /// so an ordinary single-architecture build produces every package its
-    /// recipe declares.
-    pub fn owns_arch_indep(&self) -> bool {
-        self.resolved_arch_indep_owner() == self.architecture
+    /// True unless the recipe hands arch-indep output to a different
+    /// architecture, so with no owner declared every architecture produces
+    /// every package the recipe declares.
+    pub fn owns_arch_indep(&self, architecture: &str) -> bool {
+        self.resolved_arch_indep_owner(architecture) == architecture
     }
 
     /// Rejects a structurally invalid recipe: no components; an unsafe recipe
@@ -614,14 +624,27 @@ impl Recipe {
             None => {}
         }
 
-        // The architecture becomes a path segment in the local pool and a field
+        // An architecture becomes a path segment in the local pool and a field
         // in the build root's plan key, so an unsafe one is refused before it
-        // can corrupt either.
-        if let Some(reason) = crate::arch::architecture_name_error(&self.architecture) {
-            return Err(bad(format!(
-                "architecture {:?} {reason}",
-                self.architecture
-            )));
+        // can corrupt either. A repeat is refused too: a run builds each named
+        // architecture in turn, so the second pass over one would rebuild what
+        // the first had just published, into the same pool, under the same
+        // version.
+        if self.architectures.is_empty() {
+            return Err(bad(
+                "the recipe lists no architectures; omit architectures to build \
+                 for the host, or name the Debian architectures to build for"
+                    .to_string(),
+            ));
+        }
+        let mut targets = std::collections::BTreeSet::new();
+        for architecture in &self.architectures {
+            if let Some(reason) = crate::arch::architecture_name_error(architecture) {
+                return Err(bad(format!("architecture {architecture:?} {reason}")));
+            }
+            if !targets.insert(architecture.as_str()) {
+                return Err(bad(format!("duplicate architecture {architecture:?}")));
+            }
         }
         // The owner is compared against the target architecture, and a name
         // that could never be one would hand arch-indep output to nothing.
@@ -1081,10 +1104,10 @@ fn default_components() -> Vec<String> {
     vec!["main".to_string()]
 }
 
-/// The default target architecture when a recipe does not set one: the host's,
-/// so an unqualified recipe builds natively wherever it runs.
-fn default_architecture() -> String {
-    crate::arch::host_architecture()
+/// The default target architectures when a recipe does not set any: the host's
+/// alone, so an unqualified recipe builds natively wherever it runs.
+fn default_architectures() -> Vec<String> {
+    vec![crate::arch::host_architecture()]
 }
 
 #[cfg(test)]
@@ -2044,41 +2067,71 @@ mod tests {
     }
 
     #[test]
-    fn an_omitted_architecture_defaults_to_the_host() {
+    fn an_omitted_architecture_defaults_to_the_host_alone() {
         let recipe = load(&format!(
             "name = \"r\"\nsuite = \"trixie\"\n{ONE_COMPONENT}"
         ))
         .unwrap();
-        assert_eq!(recipe.architecture, crate::arch::host_architecture());
+        assert_eq!(recipe.architectures, [crate::arch::host_architecture()]);
     }
 
     #[test]
-    fn every_run_owns_its_own_arch_indep_output_unless_an_owner_is_named() {
-        // The default a single-architecture build wants: its pool holds every
-        // package the recipe declares and can be served as it stands.
+    fn a_recipe_names_the_architectures_it_builds_for_in_order() {
+        // The order is the order they build in, so it is kept as written rather
+        // than sorted: a recipe that puts its native architecture first gets the
+        // fast half of a matrix out of the way before the emulated one.
         let recipe = load(&format!(
-            "name = \"r\"\nsuite = \"trixie\"\narchitecture = \"arm64\"\n{ONE_COMPONENT}"
+            "name = \"r\"\nsuite = \"trixie\"\narchitectures = [\"arm64\", \"amd64\"]\n\
+             {ONE_COMPONENT}"
         ))
         .unwrap();
-        assert_eq!(recipe.resolved_arch_indep_owner(), "arm64");
-        assert!(recipe.owns_arch_indep());
+        assert_eq!(recipe.architectures, ["arm64", "amd64"]);
+    }
 
-        // Named elsewhere, this architecture builds only its own packages.
+    #[test]
+    fn every_architecture_owns_its_own_arch_indep_output_unless_an_owner_is_named() {
+        // The default a build serving its pool directly wants: that pool holds
+        // every package the recipe declares and can be served as it stands.
         let recipe = load(&format!(
-            "name = \"r\"\nsuite = \"trixie\"\narchitecture = \"arm64\"\n\
+            "name = \"r\"\nsuite = \"trixie\"\narchitectures = [\"arm64\", \"amd64\"]\n\
+             {ONE_COMPONENT}"
+        ))
+        .unwrap();
+        for architecture in ["arm64", "amd64"] {
+            assert_eq!(recipe.resolved_arch_indep_owner(architecture), architecture);
+            assert!(recipe.owns_arch_indep(architecture));
+        }
+
+        // Named, one architecture builds them and every other builds only its
+        // own architecture-dependent packages.
+        let recipe = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\narchitectures = [\"arm64\", \"amd64\"]\n\
              arch-indep-owner = \"amd64\"\n{ONE_COMPONENT}"
         ))
         .unwrap();
-        assert_eq!(recipe.resolved_arch_indep_owner(), "amd64");
-        assert!(!recipe.owns_arch_indep());
+        assert_eq!(recipe.resolved_arch_indep_owner("arm64"), "amd64");
+        assert!(!recipe.owns_arch_indep("arm64"));
+        assert!(recipe.owns_arch_indep("amd64"));
+    }
 
-        // Naming this architecture as the owner is the same as naming none.
-        let recipe = load(&format!(
-            "name = \"r\"\nsuite = \"trixie\"\narchitecture = \"amd64\"\n\
-             arch-indep-owner = \"amd64\"\n{ONE_COMPONENT}"
+    #[test]
+    fn a_repeated_or_empty_architecture_list_is_rejected() {
+        // A repeat would build the architecture twice in one run, the second
+        // pass rebuilding into the same pool what the first had just published.
+        let err = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\narchitectures = [\"arm64\", \"arm64\"]\n\
+             {ONE_COMPONENT}"
         ))
-        .unwrap();
-        assert!(recipe.owns_arch_indep());
+        .unwrap_err();
+        assert!(format!("{err}").contains("duplicate architecture \"arm64\""));
+
+        // An empty list is a recipe that builds nothing; omitting the key is how
+        // a recipe says "the host", so the message names that.
+        let err = load(&format!(
+            "name = \"r\"\nsuite = \"trixie\"\narchitectures = []\n{ONE_COMPONENT}"
+        ))
+        .unwrap_err();
+        assert!(format!("{err}").contains("lists no architectures"));
     }
 
     #[test]
@@ -2178,8 +2231,11 @@ mod tests {
 
     #[test]
     fn an_unsafe_architecture_is_rejected() {
+        // Checked for every architecture named, not only the first: each becomes
+        // a path segment in a pool of its own.
         let err = load(&format!(
-            "name = \"r\"\nsuite = \"trixie\"\narchitecture = \"../evil\"\n{ONE_COMPONENT}"
+            "name = \"r\"\nsuite = \"trixie\"\narchitectures = [\"amd64\", \"../evil\"]\n\
+             {ONE_COMPONENT}"
         ))
         .unwrap_err();
         assert!(format!("{err}").contains("architecture \"../evil\" contains \"..\""));

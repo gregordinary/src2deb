@@ -58,7 +58,7 @@ it holds a manifest for — not only what the last run produced. A
 still wants all twenty-six, and the manifest carries a built record forward for
 exactly this reason.
 
-To carry one architecture, name it:
+To narrow to particular architectures, name them; the flag is repeatable:
 
 ```sh
 src2deb export recipes/cosmic-epoch --to /srv/drop/rk1 --architecture arm64

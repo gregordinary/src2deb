@@ -13,7 +13,7 @@ work/
 ├── packaging/                 packaging overlays cloned from a repository
 ├── tarballs/                  fetched release archives, named by digest
 ├── cache/                     downloaded .debs, shared by every build root
-├── base/, base.plan, base.lock   the shared base build root
+├── base/                      the shared base build root, per suite and architecture
 ├── uppers/                    per-component overlay layers, during a build
 ├── roots/                     per-component build roots, on hosts with no overlay
 └── .lock                      held for the duration of a run
@@ -30,9 +30,9 @@ work/
 | `packaging/` | One tree per component that takes its `debian/` from a `packaging.git` repository or a `packaging.tarball` archive. A `packaging.path` overlay is read where it lies and appears here not at all | Yes | A re-clone or re-unpack of each on the next run |
 | `tarballs/` | Fetched release archives, each named by the SHA-256 it was verified against and shared by every component that declares it | Yes | A re-fetch of every archive the next run resolves, which needs `curl` and the network |
 | `cache/` | Downloaded `.deb` files, keyed by content and shared across roots | Yes | A re-download of every package the next provision installs |
-| `base/` | The shared base build root, with `base.plan` recording the package set it was provisioned from and `base.lock` guarding its preparation | Yes, all three together | One base bootstrap — several hundred packages — on the next run |
-| `uppers/` | A component's overlay layer, and its overlay work directory, while it builds | Between runs | Nothing. A layer is staged fresh for every build, and the next run clears whatever a killed one left |
-| `roots/` | A fully-provisioned root per component, each with its own `.plan` and `.lock`, on hosts with no unprivileged overlay | Yes | One full provision per component on the next run |
+| `base/` | One shared base build root per suite and architecture, at `base/<suite>/<arch>/`, each with a `.plan` recording the package set it was provisioned from and a `.lock` guarding its preparation | Yes, root and sidecars together | One base bootstrap — several hundred packages — per target on the next run |
+| `uppers/` | A component's overlay layer, and its overlay work directory, while it builds, under `uppers/<suite>/<arch>/` | Between runs | Nothing. A layer is staged fresh for every build, and the next run clears whatever a killed one left |
+| `roots/` | A fully-provisioned root per component, under `roots/<suite>/<arch>/` and each with its own `.plan` and `.lock`, on hosts with no unprivileged overlay | Yes | One full provision per component on the next run |
 | `.lock` | The exclusive lock a run holds | Only when no run is active | Nothing, if no run is active. See [One run at a time](quick-start.md#one-run-at-a-time) |
 
 Everything a run writes lands under the work directory, and src2deb creates
@@ -52,15 +52,15 @@ The outputs are the small part. On a recipe of two trivial packages:
 ```
 
 `base/` and `cache/` are the shared base system and the packages it was
-installed from, and they are near enough constant: they are sized by the suite,
-not by the recipe. What grows with the recipe is `sources/` — one tree per
-component, including vendored Rust crates left in the tree between runs — and
+installed from, and they are near enough constant per target: they are sized by
+the suite, not by the recipe. What grows with the recipe is `sources/` — one tree
+per component, including vendored Rust crates left in the tree between runs — and
 `pool/`, which [grows until it is
 pruned](how-a-build-runs.md#the-pool-directory-grows-until-it-is-pruned) as
 every run adds a fresh set of `.deb` files and removes none.
 
-Budget for the base and the cache once per work directory, and watch `sources/`
-over time. For `pool/`, run
+Budget for the base and the cache once per suite and architecture the work
+directory builds for, and watch `sources/` over time. For `pool/`, run
 [`src2deb prune`](using-the-pool.md#pruning-the-pool), or pass `--keep N` to the
 build that fills it.
 
@@ -68,8 +68,9 @@ build that fills it.
 
 A second run against the same work directory reuses, in order of what it saves:
 
-- **The shared base**, when its plan key still matches — that is, when the exact
-  set of packages a bootstrap would install has not moved in the archive. See
+- **The shared base for each target it builds**, when that base's plan key still
+  matches — that is, when the exact set of packages a bootstrap would install has
+  not moved in the archive. See
   [The build-root cache](build-roots.md#the-build-root-cache).
 - **The package cache**, for every `.deb` it already holds, whatever root wants
   it.
@@ -87,10 +88,21 @@ state a run cannot rebuild.
 ## Sharing one work directory
 
 Several recipes may share a work directory, and so may one recipe retargeted at
-another suite or architecture. `out/`, `pool/`, and `manifests/` are keyed by
-the identity of the run that wrote them, so no two runs overwrite each other,
-while `sources/`, `cache/`, and `base/` are shared — which is the point, since
-the base and the cache are the expensive parts.
+another suite or architecture. `out/`, `pool/`, `manifests/`, `base/`, `roots/`,
+and `uppers/` are keyed by the suite and architecture of the run that wrote them,
+so no two targets overwrite each other, while `sources/` and `cache/` are shared
+outright.
+
+Keying the build roots is what makes a work directory hold a warm base for each
+target rather than one that whichever run went last had rebuilt. A root's plan
+key names the suite and the architecture, so a base bootstrapped for `trixie`/
+`amd64` could never be reused for `forky`/`arm64` in any case — sharing the path
+would only have meant each target discarding the other's bootstrap. The cost is
+disk: one base per target rather than one in total.
+
+`cache/` is shared safely because it is content-addressed: two architectures'
+`.deb` files are different content and sit beside each other, so every target
+pays for a package once.
 
 One thing is not keyed: `sources/` holds one tree per component name, and
 `packaging/` does the same. Two recipes that name the same component for

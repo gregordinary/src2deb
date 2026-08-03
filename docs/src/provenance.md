@@ -9,8 +9,9 @@ conditions they were built under.
 ## Location
 
 A manifest belongs to one recipe built for one suite and architecture, and is
-written to that identity's own path at the end of every run, once every
-component's outcome is known:
+written to that identity's own path as each architecture finishes, once every
+component's outcome for it is known — so a run building for two architectures
+writes two manifests:
 
 ```
 <work>/manifests/<recipe>/<suite>/<architecture>.toml
@@ -331,9 +332,11 @@ moved; skipping on that basis would publish an earlier build as though it were
 this one. In practice that means a `source.path` component is rebuilt on every
 run, which is the right answer for a tree someone is editing.
 
-A run reads only the manifest of its own recipe, suite, and architecture, so
-retargeting a recipe starts from a clean slate rather than skipping components on
-the strength of packages built for somewhere else.
+Each architecture reads only the manifest of its own recipe, suite, and
+architecture, so retargeting a recipe starts from a clean slate rather than
+skipping components on the strength of packages built for somewhere else. A run
+building for two architectures therefore skips per architecture: one may be up to
+date while the other has everything to build.
 
 ## Carrying the record with the packages
 

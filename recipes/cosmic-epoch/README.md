@@ -108,6 +108,13 @@ src2deb build recipes/cosmic-epoch --work ./work --architecture arm64
 src2deb build recipes/cosmic-epoch --work ./work --suite forky --architecture arm64
 ```
 
+`--architecture` is repeatable, and a run builds each named architecture in turn
+from one set of resolved sources:
+
+```sh
+src2deb build recipes/cosmic-epoch --work ./work --architecture amd64 --architecture arm64
+```
+
 Each suite and architecture gets its own pool, output tree, and manifest, so those
 runs may share one work directory.
 

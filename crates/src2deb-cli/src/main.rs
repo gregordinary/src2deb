@@ -24,18 +24,18 @@ const USAGE: &str = "\
 Build Debian packages from source in an unprivileged sandbox.
 
 Usage:
-  src2deb build RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]
+  src2deb build RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]...
                            [--arch-indep-owner ARCH] [--version-tag TAG]
                            [--keep-going] [--jobs N] [--only C]... | [--from C]
                            [--skip-published] [--build-date DATE|manifest]
-  src2deb plan  RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]
+  src2deb plan  RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]...
                            [--arch-indep-owner ARCH] [--version-tag TAG]
                            [--build-deps]
   src2deb export RECIPE_DIR --to DIR [--work DIR] [--suite SUITE]
-                           [--architecture ARCH] [--arch-indep-owner ARCH]
-  src2deb prune RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]
+                           [--architecture ARCH]... [--arch-indep-owner ARCH]
+  src2deb prune RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]...
                            [--keep N] [--dry-run]
-  src2deb check RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]
+  src2deb check RECIPE_DIR [--work DIR] [--suite SUITE] [--architecture ARCH]...
 
 Arguments:
   RECIPE_DIR            A directory containing a recipe.toml
@@ -83,9 +83,10 @@ Export options:
                        directory holds the .deb, .changes, and .buildinfo files
                        flat, plus the provenance manifests, so an archive tool
                        ingests the whole suite in one command
-  --architecture ARCH  Carry only ARCH. By default an export carries every
-                       architecture the work directory records a build for,
-                       with one copy of each Architecture: all package
+  --architecture ARCH  Carry only ARCH (repeatable). By default an export
+                       carries every architecture the work directory records a
+                       build for, with one copy of each Architecture: all
+                       package
 
   An export carries every component the work directory records as built, not
   only what the last run produced, and replaces whatever the export before it
@@ -97,8 +98,8 @@ Prune options:
                        (default: 1, which is the version the pool's index
                        names)
   --dry-run            Report what would be removed without removing it
-  --architecture ARCH  Prune only ARCH's pool. By default every pool the suite
-                       holds is pruned
+  --architecture ARCH  Prune only ARCH's pool (repeatable). By default every
+                       pool the suite holds is pruned
 
   A pool's index names one version of each package, so every version below the
   newest is already unreachable through apt; pruning removes those files. A
@@ -107,15 +108,16 @@ Prune options:
   architecture, so pruning covers all of them.
 
 Check options:
-  --architecture ARCH  Check only ARCH's pool. By default every pool the suite
-                       holds is checked
+  --architecture ARCH  Check only ARCH's pool (repeatable). By default every
+                       pool the suite holds is checked
 
   A build validates that each component builds; this validates that what it
   produced can be installed. Every package in the pool has its Depends and
   Pre-Depends resolved against the target suite, the recipe's repositories, and
   the pool itself, and whatever nothing satisfies is reported. Exits non-zero
   when anything is unsatisfiable, so it gates a publish. A build ends with the
-  same check over its own architecture, as a note that does not fail the run.
+  same check over the pools it published into, as a note that does not fail the
+  run.
 
 Common options:
   --suite SUITE        Build for SUITE, a Debian suite name such as trixie or
@@ -125,17 +127,19 @@ Common options:
                        tag follows the suite, so a recipe's own version-tag is
                        superseded along with the suite it described
   --architecture ARCH  Build for ARCH, a Debian architecture name such as
-                       amd64 or arm64, overriding whatever the recipe names.
-                       A recipe that names none builds for the host, so one
-                       recipe serves every target
+                       amd64 or arm64, replacing whatever the recipe names.
+                       Repeatable: a run builds each named architecture in
+                       turn, from one set of resolved sources, into a pool and
+                       an output tree of its own. A recipe that names none
+                       builds for the host, so one recipe serves every target
   --arch-indep-owner ARCH
                        Leave the recipe's Architecture: all packages to ARCH.
                        Building for two architectures otherwise produces each
                        of them twice, under one name and version, which
                        collides when the architectures merge into one published
-                       archive. Unset, every run produces its own, so a single
-                       pool holds every package its recipe declares and can be
-                       served as it stands
+                       archive. Unset, every architecture produces its own, so
+                       each pool holds every package the recipe declares and
+                       can be served as it stands
   --version-tag TAG    Stamp built versions with TAG (for example deb13),
                        overriding both the recipe's version-tag and the tag
                        derived from the suite. Required with a --suite that is
@@ -234,8 +238,9 @@ struct BuildArgs {
     work: PathBuf,
     /// The target suite, overriding the recipe's own when given.
     suite: Option<String>,
-    /// The target architecture, overriding the recipe's own when given.
-    architecture: Option<String>,
+    /// The target architectures, replacing the recipe's own when any are
+    /// given.
+    architectures: Vec<String>,
     /// The architecture that produces the recipe's `Architecture: all`
     /// packages, overriding the recipe's own when given.
     arch_indep_owner: Option<String>,
@@ -268,8 +273,9 @@ struct PlanArgs {
     work: PathBuf,
     /// The target suite, overriding the recipe's own when given.
     suite: Option<String>,
-    /// The target architecture, overriding the recipe's own when given.
-    architecture: Option<String>,
+    /// The target architectures, replacing the recipe's own when any are
+    /// given.
+    architectures: Vec<String>,
     /// The architecture that produces the recipe's `Architecture: all`
     /// packages, overriding the recipe's own when given.
     arch_indep_owner: Option<String>,
@@ -293,9 +299,9 @@ struct ExportArgs {
     dest: PathBuf,
     /// The target suite, overriding the recipe's own when given.
     suite: Option<String>,
-    /// The single architecture to carry, or `None` for every architecture the
-    /// work directory records.
-    architecture: Option<String>,
+    /// The architectures to carry, or empty for every architecture the work
+    /// directory records.
+    architectures: Vec<String>,
     /// The architecture that owns the recipe's `Architecture: all` packages,
     /// overriding the recipe's own when given.
     arch_indep_owner: Option<String>,
@@ -379,7 +385,10 @@ struct CommonArgs {
     recipe_dir: PathBuf,
     work: PathBuf,
     suite: Option<String>,
-    architecture: Option<String>,
+    /// Every `--architecture ARCH` named, in the order given, and empty when
+    /// none was. `build` and `plan` retarget the recipe at exactly these; the
+    /// subcommands that read a pool narrow to them.
+    architectures: Vec<String>,
     arch_indep_owner: Option<String>,
     version_tag: Option<String>,
     verbosity: Verbosity,
@@ -399,7 +408,7 @@ fn common_args(
     let mut positional: Vec<&str> = Vec::new();
     let mut work: Option<PathBuf> = None;
     let mut suite: Option<String> = None;
-    let mut architecture: Option<String> = None;
+    let mut architectures: Vec<String> = Vec::new();
     let mut arch_indep_owner: Option<String> = None;
     let mut version_tag: Option<String> = None;
     let mut verbosity = Verbosity::Normal;
@@ -434,7 +443,14 @@ fn common_args(
                 if let Some(reason) = src2deb::arch::architecture_name_error(value) {
                     return Err(format!("--architecture value {value:?} {reason}"));
                 }
-                architecture = Some(value.clone());
+                // Repeatable, and a repeat of one name is a usage error: for a
+                // build it would target the same architecture twice, and for a
+                // subcommand that reads a pool it would visit the same pool
+                // twice and report it twice.
+                if architectures.iter().any(|named| named == value) {
+                    return Err(format!("--architecture names {value:?} twice"));
+                }
+                architectures.push(value.clone());
             }
             "--arch-indep-owner" if retargets.arch_indep_owner => {
                 let value = iter
@@ -480,7 +496,7 @@ fn common_args(
         recipe_dir,
         work: work.unwrap_or_else(|| PathBuf::from("work")),
         suite,
-        architecture,
+        architectures,
         arch_indep_owner,
         version_tag,
         verbosity,
@@ -558,7 +574,7 @@ fn parse_build(rest: &[String]) -> Result<BuildArgs, String> {
         recipe_dir: common.recipe_dir,
         work: common.work,
         suite: common.suite,
-        architecture: common.architecture,
+        architectures: common.architectures,
         arch_indep_owner: common.arch_indep_owner,
         version_tag: common.version_tag,
         keep_going,
@@ -585,7 +601,7 @@ fn parse_plan(rest: &[String]) -> Result<PlanArgs, String> {
         recipe_dir: common.recipe_dir,
         work: common.work,
         suite: common.suite,
-        architecture: common.architecture,
+        architectures: common.architectures,
         arch_indep_owner: common.arch_indep_owner,
         version_tag: common.version_tag,
         show_build_deps,
@@ -602,9 +618,8 @@ struct PruneArgs {
     work: PathBuf,
     /// The target suite, overriding the recipe's own when given.
     suite: Option<String>,
-    /// The single architecture to prune, or `None` for every pool the suite
-    /// holds.
-    architecture: Option<String>,
+    /// The architectures to prune, or empty for every pool the suite holds.
+    architectures: Vec<String>,
     /// How many versions of each binary package to keep.
     keep: usize,
     /// Report what would be removed without removing it.
@@ -632,7 +647,7 @@ fn parse_prune(rest: &[String]) -> Result<PruneArgs, String> {
         recipe_dir: common.recipe_dir,
         work: common.work,
         suite: common.suite,
-        architecture: common.architecture,
+        architectures: common.architectures,
         // One is the version the pool's index names, so the default leaves the
         // pool on disk exactly matching the archive it serves.
         keep: keep.unwrap_or(1),
@@ -650,9 +665,8 @@ struct CheckArgs {
     work: PathBuf,
     /// The target suite, overriding the recipe's own when given.
     suite: Option<String>,
-    /// The single architecture to check, or `None` for every pool the suite
-    /// holds.
-    architecture: Option<String>,
+    /// The architectures to check, or empty for every pool the suite holds.
+    architectures: Vec<String>,
     /// How much to print.
     verbosity: Verbosity,
 }
@@ -664,7 +678,7 @@ fn parse_check(rest: &[String]) -> Result<CheckArgs, String> {
         recipe_dir: common.recipe_dir,
         work: common.work,
         suite: common.suite,
-        architecture: common.architecture,
+        architectures: common.architectures,
         verbosity: common.verbosity,
     })
 }
@@ -714,7 +728,7 @@ fn parse_export(rest: &[String]) -> Result<ExportArgs, String> {
         // one to write a copy of every package into without being asked.
         dest: dest.ok_or_else(|| "--to DIR is required".to_string())?,
         suite: common.suite,
-        architecture: common.architecture,
+        architectures: common.architectures,
         arch_indep_owner: common.arch_indep_owner,
         verbosity: common.verbosity,
     })
@@ -750,6 +764,11 @@ fn execute(args: &[String]) -> Result<ExitCode, Fault> {
 /// and how they are built, not which target the run aims at. Every name was
 /// checked when the arguments were parsed, so they are safe to install here.
 ///
+/// `--architecture` is repeatable and replaces the recipe's list outright
+/// rather than adding to it, so what a run targets is either what the recipe
+/// says or what the command line says, and never a merge of the two that
+/// neither states.
+///
 /// `--suite` supersedes the recipe's `version-tag` along with its `suite`. The
 /// tag identifies the suite a package was built for, and a recipe declares one
 /// for the suite it declares — so carrying it onto another target would stamp
@@ -759,7 +778,7 @@ fn execute(args: &[String]) -> Result<ExitCode, Fault> {
 fn load_recipe(
     dir: &Path,
     suite: Option<String>,
-    architecture: Option<String>,
+    architectures: Vec<String>,
     arch_indep_owner: Option<String>,
     version_tag: Option<String>,
 ) -> Result<Recipe, Fault> {
@@ -768,8 +787,8 @@ fn load_recipe(
         recipe.suite = suite;
         recipe.version_tag = None;
     }
-    if let Some(architecture) = architecture {
-        recipe.architecture = architecture;
+    if !architectures.is_empty() {
+        recipe.architectures = architectures;
     }
     if let Some(owner) = arch_indep_owner {
         recipe.arch_indep_owner = Some(owner);
@@ -795,8 +814,8 @@ fn load_recipe(
     Ok(recipe)
 }
 
-/// Prints the recipe banner shared by `build` and `plan`: name, suite,
-/// architecture, component count, and the toolchain and extra repositories.
+/// Prints the recipe banner shared by `build` and `plan`: name, suite, target
+/// architectures, component count, and the toolchain and extra repositories.
 /// Suppressed when quiet.
 fn print_recipe_banner(recipe: &Recipe, verb: &str, verbosity: Verbosity) {
     if verbosity == Verbosity::Quiet {
@@ -806,7 +825,7 @@ fn print_recipe_banner(recipe: &Recipe, verb: &str, verbosity: Verbosity) {
         "src2deb: {verb} recipe '{}' ({}/{}) with {} component(s)",
         recipe.name,
         recipe.suite,
-        recipe.architecture,
+        recipe.architectures.join(", "),
         recipe.components.len()
     );
     if let Some(version) = recipe.toolchain.rust.rustup_version() {
@@ -860,7 +879,7 @@ fn build(args: BuildArgs) -> Result<ExitCode, Fault> {
     let recipe = load_recipe(
         &args.recipe_dir,
         args.suite,
-        args.architecture,
+        args.architectures,
         args.arch_indep_owner,
         args.version_tag,
     )?;
@@ -902,31 +921,51 @@ fn build(args: BuildArgs) -> Result<ExitCode, Fault> {
     reporter.finish();
 
     let report = outcome?;
-    print_summary(&report);
+    print_summary(&recipe, &report);
     // Pruned once the run has finished rather than as each component publishes:
     // a superseded package may still be being fetched by a build root
     // provisioning against the pool, and by here nothing is. A cancelled run is
     // left alone — it stopped where it was asked to, and reclaiming space is not
     // what it was asked for.
+    //
+    // Over the architectures the run reached rather than every one the recipe
+    // names: a run stopped short never started the ones after it, and a pool it
+    // did not open is not this run's to reclaim.
     if let Some(keep) = args.keep
         && !report.cancelled
     {
         let options = src2deb::PruneOptions {
             keep,
-            architectures: vec![recipe.architecture.clone()],
+            architectures: architectures_where(&report, |_| true),
             dry_run: false,
         };
         print_prune(&engine.prune(&recipe, &options)?, args.verbosity);
     }
     // The run built packages; whether they can be *installed* is a separate
-    // question, and the last one worth asking before they are published. Only
-    // when the run built something: a run that published nothing has nothing
-    // new to say about a pool it did not change, and a cancelled one did not
-    // finish.
-    if !report.built.is_empty() && !report.cancelled {
-        check_after_build(&engine, &recipe, args.verbosity);
+    // question, and the last one worth asking before they are published. Asked
+    // of the pools this run published into, and no others: an architecture that
+    // built nothing has nothing new to say about a pool it did not change, and
+    // a cancelled run did not finish.
+    let published = architectures_where(&report, |architecture| !architecture.built.is_empty());
+    if !published.is_empty() && !report.cancelled {
+        check_after_build(&engine, &recipe, published, args.verbosity);
     }
     Ok(ExitCode::from(exit_status(&report)))
+}
+
+/// The architectures of `report` that `keep` accepts, named as
+/// [`PruneOptions`](src2deb::PruneOptions) and
+/// [`CheckOptions`](src2deb::CheckOptions) want them.
+fn architectures_where(
+    report: &RunReport,
+    keep: impl Fn(&src2deb::ArchitectureReport) -> bool,
+) -> Vec<String> {
+    report
+        .architectures
+        .iter()
+        .filter(|architecture| keep(architecture))
+        .map(|architecture| architecture.architecture.clone())
+        .collect()
 }
 
 /// The exit status a finished run reports.
@@ -951,7 +990,7 @@ fn plan(args: PlanArgs) -> Result<ExitCode, Fault> {
     let recipe = load_recipe(
         &args.recipe_dir,
         args.suite,
-        args.architecture,
+        args.architectures,
         args.arch_indep_owner,
         args.version_tag,
     )?;
@@ -983,13 +1022,13 @@ fn export(args: ExportArgs) -> Result<ExitCode, Fault> {
     let recipe = load_recipe(
         &args.recipe_dir,
         args.suite,
-        None,
+        Vec::new(),
         args.arch_indep_owner,
         None,
     )?;
     let options = src2deb::ExportOptions {
         dest: args.dest,
-        architectures: args.architecture.into_iter().collect(),
+        architectures: args.architectures,
     };
     let engine = Engine::new(args.work);
     let report = engine.export(&recipe, &options)?;
@@ -1060,10 +1099,10 @@ fn human_bytes(bytes: u64) -> String {
 /// recipe, so the recipe is loaded without it — the same shape `export` takes,
 /// and for the same reason.
 fn prune(args: PruneArgs) -> Result<ExitCode, Fault> {
-    let recipe = load_recipe(&args.recipe_dir, args.suite, None, None, None)?;
+    let recipe = load_recipe(&args.recipe_dir, args.suite, Vec::new(), None, None)?;
     let options = src2deb::PruneOptions {
         keep: args.keep,
-        architectures: args.architecture.into_iter().collect(),
+        architectures: args.architectures,
         dry_run: args.dry_run,
     };
     let engine = Engine::new(args.work);
@@ -1081,9 +1120,9 @@ fn prune(args: PruneArgs) -> Result<ExitCode, Fault> {
 /// between a build and a publish and let the status decide. A build runs the
 /// same check as a note that does not fail it; this is the form that gates.
 fn check(args: CheckArgs) -> Result<ExitCode, Fault> {
-    let recipe = load_recipe(&args.recipe_dir, args.suite, None, None, None)?;
+    let recipe = load_recipe(&args.recipe_dir, args.suite, Vec::new(), None, None)?;
     let options = src2deb::CheckOptions {
-        architectures: args.architecture.into_iter().collect(),
+        architectures: args.architectures,
     };
     let engine = Engine::new(args.work);
     let report = engine.check(&recipe, &options, &mut |event| {
@@ -1122,8 +1161,8 @@ fn report_check(recipe: &Recipe, event: src2deb::CheckProgress, verbosity: Verbo
     }
 }
 
-/// Runs the installability check over the run's own architecture, as a closing
-/// note on a build.
+/// Runs the installability check over the pools the run published into, as a
+/// closing note on a build.
 ///
 /// Best-effort: a check that cannot reach the archive says so and leaves the
 /// run's outcome alone. The packages were built and published either way, and
@@ -1133,10 +1172,13 @@ fn report_check(recipe: &Recipe, event: src2deb::CheckProgress, verbosity: Verbo
 /// complete it — a recipe supplying a dependency may not have run yet — so a
 /// hard failure here would refuse a legitimate order of work. `src2deb check`
 /// is where the same answer gates.
-fn check_after_build(engine: &Engine, recipe: &Recipe, verbosity: Verbosity) {
-    let options = src2deb::CheckOptions {
-        architectures: vec![recipe.architecture.clone()],
-    };
+fn check_after_build(
+    engine: &Engine,
+    recipe: &Recipe,
+    architectures: Vec<String>,
+    verbosity: Verbosity,
+) {
+    let options = src2deb::CheckOptions { architectures };
     let outcome = engine.check(recipe, &options, &mut |event| {
         report_check(recipe, event, verbosity)
     });
@@ -1419,6 +1461,32 @@ impl Reporter {
                 "src2deb: skipping {component} (not selected); its source did not \
                  resolve: {error}"
             ),
+            Progress::Architecture {
+                architecture,
+                index,
+                total,
+            } => {
+                // Each architecture provisions roots of its own under the same
+                // labels, so the periodic counter starts over. Without this the
+                // second architecture's `base` would still be at the tenth the
+                // first one finished on and report nothing at all.
+                self.tenths.clear();
+                // Which target the events below belong to. Only for a run
+                // building for more than one: a single target is named in the
+                // opening banner already, and repeating it would be a heading
+                // over the whole run.
+                if total > 1 {
+                    eprintln!("src2deb: architecture {architecture} ({index}/{total})");
+                }
+            }
+            // Said before the first architecture builds rather than left to the
+            // export that would otherwise be the first to mention it, since by
+            // then the emulated time it costs has been spent.
+            Progress::ArchIndepUnowned { architectures } => eprintln!(
+                "src2deb: no arch-indep owner named, so each of {} builds its own copy of \
+                 every Architecture: all package; set arch-indep-owner to build them once",
+                architectures.join(", ")
+            ),
             Progress::ForeignArchitecture { target, host } => eprintln!(
                 "src2deb: foreign-architecture build: target {target}, host {host} \
                  (runs through qemu-user; needs qemu-user-static and binfmt with the F flag)"
@@ -1571,63 +1639,114 @@ fn root_label(component: Option<&str>) -> &str {
     component.unwrap_or("base")
 }
 
-/// Prints the closing summary: how many components built, failed, and were
-/// skipped and why; what the run produced and where; and the names of any failed
-/// components.
+/// Prints the closing summary: for each architecture, how many components built,
+/// failed, and were skipped and why, what it produced and where, and the names
+/// of any it did not deliver. A run over several architectures closes with a
+/// line totalling them.
 ///
-/// A cancelled run says so in the same line, because the counts read very
+/// A cancelled run says so in the first line, because the counts read very
 /// differently when the run stopped short: the components it never reached are
-/// among the skipped.
-fn print_summary(report: &RunReport) {
+/// among the skipped, and the architectures it never started have no section at
+/// all.
+///
+/// A single-architecture run prints one section unlabelled — the architecture is
+/// in the opening banner and in the output path already — so the common case
+/// reads as one summary rather than as a table of one row.
+///
+/// The recipe is read for the architectures it names, which is what tells a run
+/// that stopped short from one that finished: the report holds only the
+/// architectures it reached.
+fn print_summary(recipe: &Recipe, report: &RunReport) {
     let verdict = if report.cancelled {
         "summary (cancelled)"
     } else {
         "summary"
     };
-    eprintln!(
-        "src2deb: {verdict}: {} built, {} failed, {} of {} component(s)",
-        report.built.len(),
-        report.failed.len(),
-        skipped_tally(report),
-        report.order.len()
-    );
-    if report.is_success() {
-        // What this run produced, which is not what the directory holds: a run
-        // that skipped everything produced nothing while the tree still holds
-        // every package the runs before it built. Saying "0 artifacts in <dir>"
-        // of a directory full of packages reads as a failed run.
-        match report.artifact_count() {
-            0 => eprintln!(
-                "src2deb: no artifacts produced; {} is unchanged",
-                report.out_dir.display()
-            ),
-            count => eprintln!(
-                "src2deb: {count} artifact(s) produced, in {}",
-                report.out_dir.display()
-            ),
-        }
-    } else {
-        let names: Vec<&str> = report
-            .failed
-            .iter()
+    let labelled = report.architectures.len() > 1;
+    for architecture in &report.architectures {
+        let label = match labelled {
+            true => format!("{verdict} ({})", architecture.architecture),
+            false => verdict.to_string(),
+        };
+        let undelivered: Vec<&str> = report
+            .undelivered(architecture)
             .map(|failed| failed.component.as_str())
             .collect();
-        eprintln!("src2deb: failed: {}", names.join(", "));
+        eprintln!(
+            "src2deb: {label}: {} built, {} failed, {} of {} component(s)",
+            architecture.built.len(),
+            undelivered.len(),
+            skipped_tally(architecture),
+            report.order.len()
+        );
+        if undelivered.is_empty() {
+            // What this run produced, which is not what the directory holds: a
+            // run that skipped everything produced nothing while the tree still
+            // holds every package the runs before it built. Saying "0 artifacts
+            // in <dir>" of a directory full of packages reads as a failed run.
+            match architecture.artifact_count() {
+                0 => eprintln!(
+                    "src2deb: no artifacts produced; {} is unchanged",
+                    architecture.out_dir.display()
+                ),
+                count => eprintln!(
+                    "src2deb: {count} artifact(s) produced, in {}",
+                    architecture.out_dir.display()
+                ),
+            }
+        } else {
+            eprintln!("src2deb: failed: {}", undelivered.join(", "));
+        }
+    }
+    if labelled {
+        eprintln!(
+            "src2deb: {verdict}: {} architecture(s), {} artifact(s) in total",
+            report.architectures.len(),
+            report.artifact_count(),
+        );
+    }
+    // What ended the run partway, when it was not a component's failure — a
+    // build root that would not provision, say. It is reported here rather than
+    // as the whole answer, because the architectures before it built and
+    // published and their sections above are the record of that.
+    if let Some(error) = &report.stopped_by {
+        eprintln!("src2deb: {error}");
+    }
+    // The architectures the run never started, so the sections above are not
+    // read as the whole of what was asked for. A run stops where it is at a
+    // cancel and at a failure it was not told to carry past, either of which
+    // leaves the rest of a matrix untouched.
+    let unreached: Vec<&str> = recipe
+        .architectures
+        .iter()
+        .map(String::as_str)
+        .filter(|architecture| {
+            !report
+                .architectures
+                .iter()
+                .any(|reached| reached.architecture == *architecture)
+        })
+        .collect();
+    if !unreached.is_empty() {
+        eprintln!(
+            "src2deb: the run stopped before building for {}",
+            unreached.join(", ")
+        );
     }
 }
 
-/// The skipped components of a run, counted by why they were skipped: `"26 not
-/// selected"`, `"2 already built, 1 cancelled"`, or `"0 skipped"` when none
-/// were.
+/// The skipped components of one architecture, counted by why they were
+/// skipped: `"26 not selected"`, `"2 already built, 1 cancelled"`, or
+/// `"0 skipped"` when none were.
 ///
-/// The three reasons are three different outcomes, and collapsing them makes a
+/// The four reasons are four different outcomes, and collapsing them makes a
 /// deliberate single-component build (`1 built, 26 skipped of 27`) read exactly
 /// like a run that fell over. Naming the reason is what makes the closing line
 /// say what happened.
-fn skipped_tally(report: &RunReport) -> String {
+fn skipped_tally(architecture: &src2deb::ArchitectureReport) -> String {
     let counts: Vec<String> = SkipReason::ALL
         .into_iter()
-        .filter_map(|reason| match report.skipped_for(reason) {
+        .filter_map(|reason| match architecture.skipped_for(reason) {
             0 => None,
             count => Some(format!("{count} {}", reason.label())),
         })
@@ -1788,7 +1907,7 @@ mod tests {
         // Unset, so the export carries whatever the work directory holds. A
         // default destination would be a guess at where a copy of every package
         // belongs, so there is none.
-        assert_eq!(args.architecture, None);
+        assert!(args.architectures.is_empty());
         assert!(
             parse(&["export", "r"])
                 .unwrap_err()
@@ -1797,7 +1916,7 @@ mod tests {
     }
 
     #[test]
-    fn export_narrows_to_one_architecture_and_takes_an_arch_indep_owner() {
+    fn export_narrows_to_the_named_architectures_and_takes_an_arch_indep_owner() {
         let args = export_args(&[
             "export",
             "r",
@@ -1805,10 +1924,12 @@ mod tests {
             "drop",
             "--architecture",
             "arm64",
+            "--architecture",
+            "amd64",
             "--arch-indep-owner",
             "amd64",
         ]);
-        assert_eq!(args.architecture, Some("arm64".to_string()));
+        assert_eq!(args.architectures, ["arm64", "amd64"]);
         assert_eq!(args.arch_indep_owner, Some("amd64".to_string()));
     }
 
@@ -1842,7 +1963,7 @@ mod tests {
         let args = prune_args(&["prune", "r"]);
         assert_eq!(args.keep, 1);
         assert!(!args.dry_run);
-        assert_eq!(args.architecture, None);
+        assert!(args.architectures.is_empty());
 
         let args = prune_args(&["prune", "r", "--keep", "3", "--dry-run"]);
         assert_eq!(args.keep, 3);
@@ -1879,15 +2000,15 @@ mod tests {
         // Unset, so every pool the suite holds is checked: a package that
         // installs on one architecture and not on another is exactly what this
         // is for.
-        assert_eq!(args.architecture, None);
+        assert!(args.architectures.is_empty());
 
         let args = check_args(&["check", "r", "--work", "/mnt/w", "--suite", "forky", "-q"]);
         assert_eq!(args.work, PathBuf::from("/mnt/w"));
         assert_eq!(args.suite.as_deref(), Some("forky"));
         assert_eq!(args.verbosity, Verbosity::Quiet);
         assert_eq!(
-            check_args(&["check", "r", "--architecture", "arm64"]).architecture,
-            Some("arm64".to_string()),
+            check_args(&["check", "r", "--architecture", "arm64"]).architectures,
+            ["arm64"],
         );
     }
 
@@ -1933,19 +2054,53 @@ mod tests {
 
     #[test]
     fn the_architecture_override_is_absent_unless_given() {
-        assert_eq!(build_args(&["build", "r"]).architecture, None);
-        assert_eq!(plan_args(&["plan", "r"]).architecture, None);
+        assert!(build_args(&["build", "r"]).architectures.is_empty());
+        assert!(plan_args(&["plan", "r"]).architectures.is_empty());
     }
 
     #[test]
     fn the_architecture_override_is_parsed_by_both_subcommands() {
         assert_eq!(
-            build_args(&["build", "r", "--architecture", "arm64"]).architecture,
-            Some("arm64".to_string()),
+            build_args(&["build", "r", "--architecture", "arm64"]).architectures,
+            ["arm64"],
         );
         assert_eq!(
-            plan_args(&["plan", "r", "--architecture", "riscv64"]).architecture,
-            Some("riscv64".to_string()),
+            plan_args(&["plan", "r", "--architecture", "riscv64"]).architectures,
+            ["riscv64"],
+        );
+    }
+
+    #[test]
+    fn the_architecture_override_is_repeatable_and_keeps_the_order_given() {
+        // The order is the order they build in, so a matrix run puts the native
+        // architecture first and gets it out of the way before the emulated one.
+        assert_eq!(
+            build_args(&[
+                "build",
+                "r",
+                "--architecture",
+                "arm64",
+                "--architecture",
+                "amd64",
+            ])
+            .architectures,
+            ["arm64", "amd64"],
+        );
+        // A repeat is a usage error rather than a target built twice: for a
+        // build the second pass would rebuild into the pool the first had just
+        // published to, and for a subcommand reading a pool it would report the
+        // same pool twice.
+        assert!(
+            parse(&[
+                "build",
+                "r",
+                "--architecture",
+                "arm64",
+                "--architecture",
+                "arm64",
+            ])
+            .unwrap_err()
+            .contains("names \"arm64\" twice")
         );
     }
 
@@ -1973,7 +2128,7 @@ mod tests {
         // both axes are overridable at once and neither implies the other.
         let args = build_args(&["build", "r", "--suite", "forky", "--architecture", "arm64"]);
         assert_eq!(args.suite, Some("forky".to_string()));
-        assert_eq!(args.architecture, Some("arm64".to_string()));
+        assert_eq!(args.architectures, ["arm64"]);
     }
 
     #[test]
@@ -2215,10 +2370,29 @@ mod tests {
         ))
     }
 
-    /// A report with the given outcome counts, for exercising the exit status.
+    /// A single-architecture report with the given outcome counts, for
+    /// exercising the exit status.
     fn report(built: usize, failed: usize, cancelled: bool) -> RunReport {
         RunReport {
             order: Vec::new(),
+            unresolved: Vec::new(),
+            architectures: vec![architecture_report("amd64", built, failed, Vec::new())],
+            stopped_by: None,
+            cancelled,
+        }
+    }
+
+    /// One architecture's report with `built` components that produced an
+    /// artifact each, `failed` that did not, and `skipped` carrying the given
+    /// reasons.
+    fn architecture_report(
+        architecture: &str,
+        built: usize,
+        failed: usize,
+        skipped: Vec<SkipReason>,
+    ) -> src2deb::ArchitectureReport {
+        src2deb::ArchitectureReport {
+            architecture: architecture.to_string(),
             built: (0..built)
                 .map(|n| src2deb::Built {
                     component: format!("built-{n}"),
@@ -2241,8 +2415,15 @@ mod tests {
                     error: src2deb::Error::Pool("boom".to_string()),
                 })
                 .collect(),
-            skipped: Vec::new(),
-            cancelled,
+            skipped: skipped
+                .into_iter()
+                .enumerate()
+                .map(|(n, reason)| src2deb::Skipped {
+                    component: format!("skipped-{n}"),
+                    source: git("abc"),
+                    reason,
+                })
+                .collect(),
             out_dir: PathBuf::from("/out"),
             manifest_path: PathBuf::from("/m"),
         }
@@ -2262,7 +2443,7 @@ mod tests {
 name = \"tagged\"
 suite = \"sid\"
 version-tag = \"debsid\"
-architecture = \"amd64\"
+architectures = [\"amd64\"]
 
 [[components]]
 name = \"c\"
@@ -2275,21 +2456,27 @@ source.git = \"https://example.invalid/c\"
 
         // Untouched, the recipe stamps the tag it declares for the suite it
         // declares.
-        let recipe = load_recipe(&dir, None, None, None, None).unwrap();
+        let recipe = load_recipe(&dir, None, Vec::new(), None, None).unwrap();
         assert_eq!(recipe.resolved_version_tag(), Some("debsid"));
 
         // Retargeted, that tag described a suite the run is no longer building
         // for, so the new suite's own tag stands. Carrying `debsid` onto a
         // trixie build would stamp packages with the name of a release they
         // were not built against.
-        let recipe = load_recipe(&dir, Some("trixie".to_string()), None, None, None).unwrap();
+        let recipe = load_recipe(&dir, Some("trixie".to_string()), Vec::new(), None, None).unwrap();
         assert_eq!(recipe.suite, "trixie");
         assert_eq!(recipe.resolved_version_tag(), Some("deb13"));
 
         // A suite with no derivable tag is refused rather than guessed, and the
         // refusal names the flag that settles it.
-        let err =
-            load_recipe(&dir, Some("experimental".to_string()), None, None, None).unwrap_err();
+        let err = load_recipe(
+            &dir,
+            Some("experimental".to_string()),
+            Vec::new(),
+            None,
+            None,
+        )
+        .unwrap_err();
         let Fault::Usage(message) = err else {
             panic!("expected a usage error");
         };
@@ -2299,7 +2486,7 @@ source.git = \"https://example.invalid/c\"
         let recipe = load_recipe(
             &dir,
             Some("experimental".to_string()),
-            None,
+            Vec::new(),
             None,
             Some("debexp".to_string()),
         )
@@ -2308,27 +2495,16 @@ source.git = \"https://example.invalid/c\"
 
         // The flag also overrides a tag the recipe would otherwise resolve on
         // its own, since it is the more specific statement of the two.
-        let recipe = load_recipe(&dir, None, None, None, Some("debexp".to_string())).unwrap();
+        let recipe = load_recipe(&dir, None, Vec::new(), None, Some("debexp".to_string())).unwrap();
         assert_eq!(recipe.suite, "sid");
         assert_eq!(recipe.resolved_version_tag(), Some("debexp"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A report whose skipped components carry `reasons`.
-    fn skipped_report(reasons: &[SkipReason]) -> RunReport {
-        RunReport {
-            skipped: reasons
-                .iter()
-                .enumerate()
-                .map(|(n, reason)| src2deb::Skipped {
-                    component: format!("skipped-{n}"),
-                    source: git("abc"),
-                    reason: *reason,
-                })
-                .collect(),
-            ..report(0, 0, false)
-        }
+    /// An architecture whose skipped components carry `reasons`.
+    fn skipped_report(reasons: &[SkipReason]) -> src2deb::ArchitectureReport {
+        architecture_report("amd64", 0, 0, reasons.to_vec())
     }
 
     #[test]
@@ -2359,6 +2535,69 @@ source.git = \"https://example.invalid/c\"
         // cancellation: it never finished, so its failure count is not the
         // whole story.
         assert_eq!(exit_status(&report(1, 1, true)), CANCELLED_EXIT);
+    }
+
+    #[test]
+    fn one_architecture_failing_fails_the_run() {
+        // A run is asked for a set of packages; delivering them for one target
+        // and not another has not delivered them.
+        let report = RunReport {
+            order: Vec::new(),
+            unresolved: Vec::new(),
+            architectures: vec![
+                architecture_report("amd64", 2, 0, Vec::new()),
+                architecture_report("arm64", 1, 1, Vec::new()),
+            ],
+            stopped_by: None,
+            cancelled: false,
+        };
+        assert_eq!(exit_status(&report), 1);
+        // Counted across the architectures that produced them, one artifact per
+        // built component here.
+        assert_eq!(report.artifact_count(), 3);
+    }
+
+    #[test]
+    fn an_error_that_ended_a_later_architecture_still_fails_the_run() {
+        // The first architecture built and published, so the run has something
+        // to report and the error travels in the report rather than in place of
+        // it. It is still a run that did not deliver what it was asked for.
+        let report = RunReport {
+            order: Vec::new(),
+            unresolved: Vec::new(),
+            architectures: vec![architecture_report("amd64", 2, 0, Vec::new())],
+            stopped_by: Some(src2deb::Error::BuildDependency(
+                "the pool does not hold it".to_string(),
+            )),
+            cancelled: false,
+        };
+        assert!(!report.is_success());
+        assert_eq!(exit_status(&report), 1);
+        // What the architecture before it managed is still counted.
+        assert_eq!(report.artifact_count(), 2);
+    }
+
+    #[test]
+    fn the_pools_a_run_prunes_and_checks_are_the_ones_it_reached() {
+        // A run stopped short never started the architectures after it, so
+        // neither its pool nor its manifest exists to act on. Checking narrows
+        // further, to the pools this run actually published into: one that built
+        // nothing has nothing new to say.
+        let report = RunReport {
+            order: Vec::new(),
+            unresolved: Vec::new(),
+            architectures: vec![
+                architecture_report("amd64", 2, 0, Vec::new()),
+                architecture_report("arm64", 0, 0, vec![SkipReason::AlreadyBuilt]),
+            ],
+            stopped_by: None,
+            cancelled: false,
+        };
+        assert_eq!(architectures_where(&report, |_| true), ["amd64", "arm64"]);
+        assert_eq!(
+            architectures_where(&report, |architecture| !architecture.built.is_empty()),
+            ["amd64"],
+        );
     }
 
     #[test]

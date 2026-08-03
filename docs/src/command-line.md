@@ -29,8 +29,8 @@ it builds against.
 | --- | --- | --- |
 | `--work DIR` | all | The working directory for sources, build roots, the package cache, the pool, and output. Defaults to `./work` |
 | `--suite SUITE` | all | Build for a Debian suite such as `trixie` or `forky`, superseding the recipe's `suite` and the `version-tag` that described it |
-| `--architecture ARCH` | all | Build for a Debian architecture such as `amd64` or `arm64`. A recipe naming none builds for the host. For `export`, `prune`, and `check` it narrows what is read rather than retargeting anything |
-| `--arch-indep-owner ARCH` | `build`, `plan`, `export` | Leave the recipe's `Architecture: all` packages to `ARCH`. Unset, every run produces its own |
+| `--architecture ARCH` | all | Build for a Debian architecture such as `amd64` or `arm64`, replacing whatever the recipe names. Repeatable: `build` and `plan` build each in turn. A recipe naming none builds for the host. For `export`, `prune`, and `check` it narrows what is read rather than retargeting anything |
+| `--arch-indep-owner ARCH` | `build`, `plan`, `export` | Leave the recipe's `Architecture: all` packages to `ARCH`. Unset, every architecture produces its own |
 | `--version-tag TAG` | `build`, `plan` | Stamp built versions with `TAG`, such as `deb13`, overriding both the recipe's `version-tag` and the tag derived from the suite |
 
 The last two are not accepted where they would do nothing: an `export` carries
@@ -40,8 +40,9 @@ output to hand anywhere. Naming one there is a usage error rather than a
 silently ignored flag.
 
 Every value is validated as it is parsed, so a malformed one is a usage error
-against the flag rather than a failure partway into the run. Each suite and
-architecture pair gets its own pool, output tree, and manifest, so runs for
+against the flag rather than a failure partway into the run — including a
+`--architecture` naming the same architecture twice. Each suite and architecture
+pair gets its own pool, output tree, manifest, and build roots, so runs for
 several targets share one `--work` directory. See
 [Cross-architecture builds](cross-architecture.md) and
 [Package versions](package-versions.md).
@@ -56,7 +57,7 @@ several targets share one `--work` directory. See
 | `--from C` | Build component `C` and every component after it in the build order |
 | `--skip-published` | Skip a component whose source resolves to what a prior run recorded as built, at the same declared version. A source that is not pinned to exact content is always rebuilt |
 | `--build-date DATE` | Stamp every version with `DATE` (`YYYY-MM-DD`) instead of today, and hand the build the same `SOURCE_DATE_EPOCH`. `--build-date manifest` takes the date the prior run recorded |
-| `--keep N` | Prune the run's pool to the newest `N` versions of each binary package once the run has finished. Unset, nothing is pruned |
+| `--keep N` | Prune the pools the run reached to the newest `N` versions of each binary package once the run has finished. Unset, nothing is pruned |
 
 `--only` and `--from` are mutually exclusive, and `--jobs` takes an integer of 1
 or more.
@@ -78,6 +79,11 @@ from every `debian/control`. It takes the same exclusive lock on its work
 directory that `build` does, so planning while a build runs wants a `--work`
 directory of its own.
 
+The order is one answer whatever the recipe targets, since neither the sources
+nor the order depends on an architecture. What does is announced as the plan
+runs: each architecture the recipe names, whether it is foreign, and whether it
+would produce the recipe's `Architecture: all` packages.
+
 A component that [declares its version](recipes.md#components-with-no-changelog)
 gets a line for it, which is where to see what `version-from = "git-describe"`
 derived before a build stamps it into a package:
@@ -92,7 +98,7 @@ derived before a build stamps it into a package:
 | Option | Effect |
 | --- | --- |
 | `--to DIR` | Write the export to `DIR/<suite>/`. Required |
-| `--architecture ARCH` | Carry only `ARCH`. By default an export carries every architecture the work directory records a build for |
+| `--architecture ARCH` | Carry only `ARCH`. Repeatable. By default an export carries every architecture the work directory records a build for |
 
 An export carries every component the work directory records as **built**, not
 only what the last run produced, and replaces whatever the export before it left
@@ -104,7 +110,7 @@ in the same directory. See [Publishing to an archive](publishing.md).
 | --- | --- |
 | `--keep N` | Keep the newest `N` versions of each binary package. Defaults to `1`, the version the pool's index names |
 | `--dry-run` | Report what would be removed without removing it |
-| `--architecture ARCH` | Prune only `ARCH`'s pool. By default every pool the suite holds is pruned |
+| `--architecture ARCH` | Prune only `ARCH`'s pool. Repeatable. By default every pool the suite holds is pruned |
 
 Pruning covers the pool for a suite, which is shared by every recipe built into
 the work directory for it. See [Pruning the pool](using-the-pool.md#pruning-the-pool).
@@ -113,13 +119,14 @@ the work directory for it. See [Pruning the pool](using-the-pool.md#pruning-the-
 
 | Option | Effect |
 | --- | --- |
-| `--architecture ARCH` | Check only `ARCH`'s pool. By default every pool the suite holds is checked |
+| `--architecture ARCH` | Check only `ARCH`'s pool. Repeatable. By default every pool the suite holds is checked |
 
 A check resolves each pool package's `Depends` and `Pre-Depends` against the
 target suite, the recipe's repositories, and the pool, and reports what nothing
 satisfies. It exits non-zero when anything is unsatisfiable, so it gates a
-publish; a build ends with the same check as a note that does not fail the run.
-See [Checking installability](installability.md).
+publish; a build ends with the same check over the pools it published into, as a
+note that does not fail the run. See
+[Checking installability](installability.md).
 
 ## Verbosity
 

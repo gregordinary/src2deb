@@ -109,13 +109,16 @@ leaves those to another architecture:
 src2deb: unsatisfiable build-dependency: this run builds "cosmic-osd", which
   build-depends on "cosmic-icons"; that package is produced by component
   "cosmic-icons", which produces only Architecture: all packages, left to
-  "amd64" by this recipe, and the pool does not hold it. Build for "amd64"
-  first, or stop naming an arch-indep owner
+  "amd64" by this recipe, and the pool does not hold it. Stop naming an
+  arch-indep owner, so this architecture builds "cosmic-icons" itself; the
+  owner's copy is published to the owner's pool, which this build does not
+  resolve against
 ```
 
-Build the owning architecture into the same pool first, or drop
-`arch-indep-owner` so every architecture produces its own. See [Who builds the
-`Architecture: all`
+Drop `arch-indep-owner` so every architecture produces its own. Building for the
+owner first does not settle this: a pool belongs to one architecture, so the
+owner's copy lands in the owner's pool and this build never resolves against it.
+See [Who builds the `Architecture: all`
 packages](cross-architecture.md#who-builds-the-architecture-all-packages).
 
 ## While sources resolve
@@ -428,7 +431,7 @@ qemu-user; needs qemu-user-static and binfmt with the F flag)
 
 Every compiler invocation runs under emulation, which costs roughly an order of
 magnitude in compile time. Expected when you asked for a foreign target;
-otherwise check `--architecture` and the recipe's `architecture` field. See
+otherwise check `--architecture` and the recipe's `architectures` field. See
 [Cross-architecture builds](cross-architecture.md).
 
 ### An unsatisfiable dependency after a successful build

@@ -26,8 +26,8 @@ pool/trixie/amd64/
         └── c/cosmic-comp/cosmic-comp_1.0.0~alpha.7-1+deb13.20260731.abc1234_amd64.deb
 ```
 
-One pool serves one suite and one architecture. Building for several targets
-means several pools, each complete on its own; see
+One pool serves one suite and one architecture. A run building for several
+architectures fills several pools, each complete on its own; see
 [The local pool](how-a-build-runs.md#the-local-pool) for why they are kept
 apart.
 

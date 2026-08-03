@@ -65,8 +65,8 @@ pub use build::{Artifact, BuildInfo};
 pub use cancel::Cancel;
 pub use check::{CheckOptions, CheckProgress, CheckReport, CheckedPool, Relationship, Unsatisfied};
 pub use engine::{
-    BuildDate, Built, Engine, Failed, Package, PlanReport, PlannedComponent, Progress, RunOptions,
-    RunReport, Selection, SkipReason, Skipped,
+    ArchitectureReport, BuildDate, Built, Engine, Failed, Package, PlanReport, PlannedComponent,
+    Progress, RunOptions, RunReport, Selection, SkipReason, Skipped,
 };
 pub use error::{Error, Result};
 pub use export::{ExportOptions, ExportReport};

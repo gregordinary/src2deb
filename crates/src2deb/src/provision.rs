@@ -39,6 +39,12 @@
 //! existing, would miss. This keys [`FullReprovision`]'s per-component roots and
 //! [`LayeredProvision`]'s shared base.
 //!
+//! The plan key names the suite and the architecture, so a root provisioned for
+//! one target never matches another's key. Roots are therefore kept per target
+//! on disk as well ([`base_dir`], [`roots_dir`], [`uppers_dir`]): a work
+//! directory building for two architectures keeps a warm base for each, rather
+//! than each run discarding the other's.
+//!
 //! Recording is deferred to the point a root is actually reusable, which differs
 //! by strategy. The shared base is never written by a build, so it is recorded
 //! the moment it is provisioned. A full-reprovision root is written in place by
@@ -114,6 +120,52 @@ pub const TOOLCHAIN: [&str; 5] = [
     "ca-certificates",
     "git",
 ];
+
+/// The directory within the work directory holding every shared base.
+pub const BASE_DIR: &str = "base";
+/// The directory within the work directory holding every fully-reprovisioned
+/// root.
+pub const ROOTS_DIR: &str = "roots";
+/// The directory within the work directory holding every overlay upper.
+pub const UPPERS_DIR: &str = "uppers";
+
+/// The path of the shared base for `suite` and `architecture` under `work_dir`:
+/// `base/<suite>/<architecture>/`.
+///
+/// Keyed by the target for the same reason the plan key carries one: a root is a
+/// bootstrap of one suite for one architecture, so a base provisioned for
+/// another target never matches the key and is rebuilt from clean. Sharing one
+/// path across targets is therefore not sharing at all — it is each target
+/// discarding the last one's bootstrap. Keying it instead lets a work directory
+/// hold a warm base per target, which is what makes a multi-architecture run
+/// pay for one bootstrap each rather than one per run.
+///
+/// The cost is disk: a base per suite and architecture rather than one. See the
+/// work-directory chapter of the guide.
+pub fn base_dir(work_dir: &Path, suite: &str, architecture: &str) -> PathBuf {
+    work_dir.join(BASE_DIR).join(suite).join(architecture)
+}
+
+/// The path of the fully-reprovisioned roots for `suite` and `architecture`
+/// under `work_dir`: `roots/<suite>/<architecture>/`, holding one root per
+/// component.
+///
+/// Keyed like [`base_dir`], and for the same reason.
+pub fn roots_dir(work_dir: &Path, suite: &str, architecture: &str) -> PathBuf {
+    work_dir.join(ROOTS_DIR).join(suite).join(architecture)
+}
+
+/// The path of the overlay uppers for `suite` and `architecture` under
+/// `work_dir`: `uppers/<suite>/<architecture>/`, holding one upper per
+/// component while it builds.
+///
+/// An upper is disposable, so nothing here is cached and nothing is reused — it
+/// is keyed to stay symmetric with the base it layers over, so a work directory
+/// holding two targets' roots holds two targets' uppers beside them rather than
+/// one shared directory whose contents belong to whichever target ran last.
+pub fn uppers_dir(work_dir: &Path, suite: &str, architecture: &str) -> PathBuf {
+    work_dir.join(UPPERS_DIR).join(suite).join(architecture)
+}
 
 /// A stable, archive-anchored cache key for a resolved [`Plan`]: the suite,
 /// architecture, the pinned rustup toolchain if the recipe names one, and every

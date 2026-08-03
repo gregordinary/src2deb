@@ -249,6 +249,16 @@ architecture records no date, and the run is refused rather than quietly falling
 back to today — which would produce a build that looks like a reproduction and is
 not.
 
+One date stamps the whole run, so a run targeting several architectures reads
+every one of their manifests and needs them to agree. Architectures recorded on
+different days are refused for the same reason, naming both:
+
+```text
+src2deb: cannot settle the build date: the build date was to be taken from the
+prior manifests, and they disagree: amd64 records 2026-07-30, arm64 records
+2026-07-31; reproduce one architecture at a time, or name the date outright
+```
+
 The default stays today's date. A moving date is what lets a rebuild reach a
 machine that already installed the build before it, and that is what an ordinary
 build wants; pinning is for verifying a build already made.

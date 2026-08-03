@@ -38,7 +38,8 @@ it. A work directory shared by three recipes checks as one archive, the same way
 [pruning](using-the-pool.md#pruning-the-pool) does, because a pool for a suite
 and architecture *is* one archive.
 
-Every pool the suite holds is checked. `--architecture` narrows that to one:
+Every pool the suite holds is checked. `--architecture` narrows that, and is
+repeatable:
 
 ```sh
 src2deb check recipes/cosmic-epoch --architecture arm64
@@ -82,7 +83,8 @@ that is not there at all, which is the failure that reaches a target machine.
 
 ## After a build
 
-A build ends with the same check over the architecture it built for:
+A build ends with the same check over the pools it published into — every
+architecture that built something, and no others:
 
 ```text
 src2deb: 26 built, 0 failed, 1 skipped

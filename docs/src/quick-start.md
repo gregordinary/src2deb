@@ -62,15 +62,17 @@ component rather than the run.
 A run that reaches the build phase ends with a summary — how many components
 built, failed, and were skipped and why; what the run produced and where; and
 the names of any that failed — and exits non-zero if any component failed. A run
-stopped before that point, by a locked work directory or a dependency cycle or a
-selection it cannot satisfy, prints the error alone: it has nothing to summarize
-and writes no manifest.
+building for several architectures gets one section each, plus a line totalling
+them. A run stopped before that point, by a locked work directory or a dependency
+cycle or a selection it cannot satisfy, prints the error alone: it has nothing to
+summarize and writes no manifest.
 
 ## Choose a target suite and architecture
 
-A recipe names the suite it was written against and, optionally, an architecture.
-Both are defaults: what a recipe fixes is its components and how they build, not
-which target a run aims at. `--suite` and `--architecture` retarget it:
+A recipe names the suite it was written against and, optionally, the
+architectures to build for. Both are defaults: what a recipe fixes is its
+components and how they build, not which target a run aims at. `--suite` and
+`--architecture` retarget it:
 
 ```sh
 src2deb build recipes/cosmic-epoch --suite forky
@@ -78,10 +80,17 @@ src2deb build recipes/cosmic-epoch --architecture arm64
 src2deb build recipes/cosmic-epoch --suite forky --architecture arm64
 ```
 
-A recipe that names no `architecture` builds for whichever host runs it. Each run
-builds for one suite and one architecture, so covering several means one run per
-target — and because the pool, output tree, and manifest are all keyed by that
-pair, those runs may share a single `--work` directory.
+A recipe that names no `architectures` builds for whichever host runs it.
+`--architecture` is repeatable, so one run covers a whole architecture matrix for
+a suite:
+
+```sh
+src2deb build recipes/cosmic-epoch --architecture amd64 --architecture arm64
+```
+
+A run still builds for one suite, so covering several means one run per suite —
+and because the pool, output tree, manifest, and build roots are all keyed by
+suite and architecture, those runs may share a single `--work` directory.
 
 The version tag follows the suite. `--suite` supersedes a recipe's `version-tag`
 along with the `suite` it described, so a retargeted run stamps the tag of the

@@ -11,8 +11,9 @@
 # builds independently. Builds vendor Rust crates (cargo/just) and expect a
 # vendor.tar prepared before an offline build; see README.md.
 #
-# No architecture is named, so the recipe builds for whichever host runs it.
-# Pass --architecture to target another one.
+# No architectures are named, so the recipe builds for whichever host runs it.
+# Pass --architecture to target another one, or repeat it to build for several
+# in one run.
 
 name = "cosmic-epoch"
 suite = "trixie"

@@ -57,6 +57,13 @@ toolchain is installed into the root as part of provisioning it. Without it the
 key would describe less than the root holds, and repinning a recipe's toolchain
 would reuse a root carrying the version it replaced.
 
+The key names the suite and the architecture as well, so a root provisioned for
+one target never matches another's key. Roots are therefore kept per target on
+disk — `base/<suite>/<arch>/`, and likewise for `roots/` and `uppers/` — so a
+work directory building for two architectures keeps a warm base for each rather
+than each run rebuilding over the last one's. See
+[Sharing one work directory](work-directory.md#sharing-one-work-directory).
+
 Every run resolves that plan, including one that goes on to reuse the root
 untouched: the archive has to be consulted to tell a current root from a stale
 one. That is why a run reports fetching a release and an index even when it

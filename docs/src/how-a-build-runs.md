@@ -1,6 +1,17 @@
 # How a build runs
 
-A build is driven by the engine over a recipe. For each recipe, in order:
+A build is driven by the engine over a recipe, in order:
+
+1. **Resolve** every component's source, and **plan** the order over them. Once
+   per run, whatever it targets: neither a source nor the order over the sources
+   depends on an architecture.
+2. **Build** each component in that order, and **record** what happened. Once per
+   architecture the recipe names, in the order it names them.
+
+Splitting there is what makes a run targeting two architectures a build of the
+same commits at the same stamped versions — a pair of separate runs cannot
+promise that, since a `git-ref` naming a branch may move between them. See
+[Cross-architecture builds](cross-architecture.md).
 
 ## 1. Resolve
 
@@ -76,7 +87,18 @@ so an in-set build edge must be a direct dependency rather than a later
 alternative. The COSMIC recipe's single edge is direct, so this bounds how a
 future recipe may express an edge rather than affecting the current build.
 
-## 3. Build each component
+## 3. Build each architecture
+
+Each architecture the recipe names is built in turn, against the one resolution
+above. What it settles for itself is its build roots, the pool it publishes into,
+its output tree, and its manifest — all keyed by suite and architecture, so the
+architectures of a run never write over one another.
+
+It also settles which of the recipe's binary packages to build: an architecture
+that does not own the recipe's `Architecture: all` output builds only the
+architecture-dependent half, and skips a component that has no other half. See
+[Who builds the `Architecture: all`
+packages](cross-architecture.md#who-builds-the-architecture-all-packages).
 
 For each component, in order:
 
@@ -106,6 +128,11 @@ stops at the first failure, and with `--keep-going` it continues to the next
 component. Either way the run finishes with a report of what built and what
 failed.
 
+The same rule decides whether the next architecture starts. Without
+`--keep-going` a failure stops the run where it is, so the architectures after it
+are never begun and the summary names them; with it, every architecture is
+attempted and the summary tallies them all.
+
 ### The vendor pass, and the one source that skips it
 
 The vendor pass is the only step in a run that executes upstream's own code with
@@ -133,7 +160,10 @@ writes no manifest — there is nothing yet to record.
 
 ### Building in parallel
 
-With `--jobs N`, up to `N` components build concurrently. A scheduler over the
+With `--jobs N`, up to `N` components build concurrently — components within one
+architecture, not architectures alongside each other. Two emulated builds running
+at once contend for the same cores and the same package cache without finishing
+sooner. A scheduler over the
 dependency graph releases each component the moment the components producing its
 build-dependencies have published, so the build fans out across the graph's
 independent components while still ordering each consumer after its producers.
@@ -146,10 +176,12 @@ job (the default) reproduces the sequential order exactly.
 
 ## 4. Record
 
-The run writes a provenance manifest to
-`<work>/manifests/<recipe>/<suite>/<architecture>.toml`, mapping every component
-to what its source resolved to, the `.buildinfo` its build wrote, and the package
-versions it produced. See [The provenance manifest](provenance.md).
+Each architecture writes a provenance manifest to
+`<work>/manifests/<recipe>/<suite>/<architecture>.toml` as it finishes, mapping
+every component to what its source resolved to, the `.buildinfo` its build wrote,
+and the package versions it produced. A component whose source never resolved is
+recorded as failed in every architecture's manifest: it failed once, for the run,
+and no architecture has it. See [The provenance manifest](provenance.md).
 
 ## Provisioning progress
 
@@ -255,6 +287,9 @@ Everything the next run can pick up from:
 - **The component the cancel interrupted, and any it never reached,** are
   recorded as skipped, with what their source resolved to. Nothing claims
   they were built.
+- **The architectures the run had not started** have no manifest written for
+  them and nothing published, so nothing was recorded that a later run would have
+  to undo. The summary names them.
 - **A partly-provisioned build root** is removed rather than left half-made, so
   it can never be mistaken for a usable one. The next run provisions it from
   clean.
