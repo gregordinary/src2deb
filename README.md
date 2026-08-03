@@ -21,9 +21,9 @@ cargo install --path crates/src2deb-cli
 That puts `src2deb` on `PATH` via `~/.cargo/bin`. To build without installing,
 `cargo build --release` leaves the binary at `target/release/src2deb`.
 
-The host needs Linux with unprivileged user namespaces, `git`, and `git-lfs`.
-src2deb provisions each build root itself, so the Debian build tooling lives
-inside the sandbox.
+The host needs Linux with unprivileged user namespaces, `git`, `git-lfs`, and
+`curl`. src2deb provisions each build root itself, so the Debian build tooling
+lives inside the sandbox.
 
 ## Usage
 
