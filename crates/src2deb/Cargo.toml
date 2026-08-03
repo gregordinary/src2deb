@@ -15,13 +15,11 @@ exclude = ["tests/shipped_recipes.rs"]
 ferroday-cage.workspace = true
 rustix.workspace = true
 serde.workspace = true
+# Also what the integration tests measure a release archive with, to declare the
+# digest that pins it the way a recipe author would. A test target sees the
+# normal dependencies, so that needs no separate dev-dependency.
 sha2.workspace = true
 toml.workspace = true
-
-[dev-dependencies]
-# The integration tests build release archives and declare the digests that pin
-# them, which means measuring one the way a recipe author would.
-sha2.workspace = true
 
 [lints]
 workspace = true
