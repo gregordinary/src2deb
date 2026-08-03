@@ -134,6 +134,114 @@ pub fn has_architecture_dependent_packages(control: &str) -> bool {
     false
 }
 
+/// One runtime relationship a component's packaging declares, and the binary
+/// package that declares it.
+///
+/// Read from `debian/control` rather than from a built `.deb`, which is what
+/// makes it available before a build and what bounds what it can see: a
+/// `${shlibs:Depends}` substitution is still a substitution here, and the
+/// library packages it will expand to are unknown until something links. See
+/// [`runtime_relationships`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeRelation {
+    /// The binary package that declares it.
+    pub package: String,
+    /// The field it was declared in.
+    pub relationship: crate::check::Relationship,
+    /// The clause as the field spells it, alternatives and version constraints
+    /// included, so what is reported can be found in the packaging by searching
+    /// for it.
+    pub clause: String,
+    /// The package names the clause would accept, in the order it names them.
+    pub alternatives: Vec<String>,
+}
+
+/// The runtime relationships a `debian/control`'s binary stanzas declare:
+/// `Pre-Depends`, `Depends`, and `Recommends`, in stanza order.
+///
+/// The source stanza is passed over. Its `Build-Depends` are a different
+/// question, answered by [`build_dependencies`], and a source stanza declares no
+/// runtime relationship of its own.
+///
+/// A substitution variable — `${shlibs:Depends}`, `${misc:Depends}` — names no
+/// package and contributes nothing. That is the whole gap between this reading
+/// and [`crate::check`]'s: the built `.deb` carries what those expanded to, and
+/// nothing before a build does.
+pub fn runtime_relationships(control: &str) -> Vec<RuntimeRelation> {
+    use crate::check::Relationship;
+
+    let mut relations = Vec::new();
+    for stanza in crate::check::stanzas(control) {
+        // A binary stanza is one with a `Package`; the source stanza has
+        // `Source` instead, so its `Build-Depends` never reach here.
+        let Some(package) = stanza.get("package") else {
+            continue;
+        };
+        for (field, relationship) in [
+            ("pre-depends", Relationship::PreDepends),
+            ("depends", Relationship::Depends),
+            ("recommends", Relationship::Recommends),
+        ] {
+            if let Some(value) = stanza.get(field) {
+                relations.extend(runtime_clauses(package, relationship, value));
+            }
+        }
+    }
+    relations
+}
+
+/// The clauses one relationship field declares, in order.
+///
+/// A clause naming nothing readable — one that is only a substitution variable —
+/// contributes nothing rather than an entry naming a package of nothing.
+fn runtime_clauses(
+    package: &str,
+    relationship: crate::check::Relationship,
+    value: &str,
+) -> Vec<RuntimeRelation> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .filter_map(|clause| {
+            let alternatives: Vec<String> = clause
+                .split('|')
+                .filter_map(crate::check::package_name)
+                .filter(|name| !name.starts_with("${"))
+                .map(str::to_string)
+                .collect();
+            (!alternatives.is_empty()).then(|| RuntimeRelation {
+                package: package.to_string(),
+                relationship,
+                clause: clause.to_string(),
+                alternatives,
+            })
+        })
+        .collect()
+}
+
+/// The virtual package names a `debian/control`'s binary stanzas provide.
+///
+/// A recipe's own `Provides` count towards what its packages can satisfy in each
+/// other, exactly as its `Package:` names do — a component depending on
+/// `cosmic-wm` is satisfied by the component whose packaging provides it, and
+/// neither is in any archive before the build.
+pub fn provided_packages(control: &str) -> Vec<String> {
+    crate::check::stanzas(control)
+        .into_iter()
+        .filter(|stanza| stanza.contains_key("package"))
+        .filter_map(|stanza| stanza.get("provides").cloned())
+        .flat_map(|value| {
+            value
+                .split(',')
+                .filter_map(crate::check::package_name)
+                .filter(|name| !name.starts_with("${"))
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .collect()
+}
+
 /// A resolved build order over a set of components, with the dependency
 /// structure it was ordered from.
 ///
@@ -292,6 +400,82 @@ mod tests {
             .map(|(name, control)| (name.to_string(), control.to_string()))
             .collect();
         BuildGraph::resolve(&owned).map(|graph| graph.order().to_vec())
+    }
+
+    #[test]
+    fn runtime_relationships_are_read_from_the_binary_stanzas_alone() {
+        use crate::check::Relationship;
+
+        // A metapackage as one is actually written: the fields wrap across
+        // lines, which is what a reader that takes each line on its own silently
+        // loses most of.
+        let control = "Source: cosmic-desktop\n\
+                       Build-Depends: debhelper-compat (= 13)\n\
+                       \nPackage: cosmic-desktop\nArchitecture: all\n\
+                       Pre-Depends: init-system-helpers\n\
+                       Depends:\n cosmic-session,\n cosmic-initial-setup,\n ${misc:Depends}\n\
+                       Recommends:\n cosmic-edit,\n cosmic-term\n";
+        let relations = runtime_relationships(control);
+
+        let read: Vec<(&str, &str)> = relations
+            .iter()
+            .map(|relation| (relation.relationship.field(), relation.clause.as_str()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("Pre-Depends", "init-system-helpers"),
+                ("Depends", "cosmic-session"),
+                ("Depends", "cosmic-initial-setup"),
+                ("Recommends", "cosmic-edit"),
+                ("Recommends", "cosmic-term"),
+            ],
+        );
+        // Every clause knows which binary package declares it.
+        assert!(
+            relations
+                .iter()
+                .all(|relation| relation.package == "cosmic-desktop")
+        );
+        assert_eq!(relations[1].relationship, Relationship::Depends);
+        // The source stanza's Build-Depends is a different question and does not
+        // appear; `${misc:Depends}` names no package and contributes nothing,
+        // which is the whole gap between reading packaging and reading a .deb.
+        assert!(!relations.iter().any(
+            |relation| relation.clause.contains("debhelper") || relation.clause.contains("${")
+        ));
+    }
+
+    #[test]
+    fn a_runtime_clause_keeps_its_alternatives_in_preference_order() {
+        let control = "Source: s\n\nPackage: p\nArchitecture: any\n\
+                       Depends: default-dbus-session-bus | dbus-session-bus, libc6 (>= 2.41)\n";
+        let relations = runtime_relationships(control);
+        assert_eq!(
+            relations[0].alternatives,
+            ["default-dbus-session-bus", "dbus-session-bus"]
+        );
+        // The clause is kept as written, so it can be found in the packaging by
+        // searching for it, while the name is read without what qualifies it.
+        assert_eq!(relations[1].clause, "libc6 (>= 2.41)");
+        assert_eq!(relations[1].alternatives, ["libc6"]);
+    }
+
+    #[test]
+    fn a_recipes_own_provides_count_as_names_it_will_offer() {
+        // A component depending on `cosmic-wm` is satisfied by the component
+        // whose packaging provides it, and neither is in any archive before the
+        // build — so a plan-time reading has to know both.
+        let control = "Source: cosmic-comp\n\
+                       \nPackage: cosmic-comp\nArchitecture: any\n\
+                       Provides: cosmic-wm,\n x-window-manager\n";
+        assert_eq!(
+            provided_packages(control),
+            ["cosmic-wm", "x-window-manager"]
+        );
+        // The source stanza has none, and a package that provides nothing
+        // contributes nothing.
+        assert!(provided_packages("Source: s\n\nPackage: p\nArchitecture: any\n").is_empty());
     }
 
     #[test]

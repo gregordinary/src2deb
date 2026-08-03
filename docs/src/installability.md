@@ -25,6 +25,49 @@ packages until something provides what they name
 It exits non-zero when anything is unsatisfiable, so it belongs between a build
 and a publish.
 
+## Before the build
+
+`src2deb check` answers after the build, which for a large recipe is hours after
+the recipe declared the dependency that will fail. `src2deb plan --runtime-deps`
+answers before it:
+
+```sh
+src2deb plan recipes/pop-desktop-data --work /mnt/build/work --runtime-deps
+```
+
+```text
+src2deb: arm64: pop-gtk-theme: pop-gtk-theme: Depends: gtk2-engines-murrine
+src2deb: arm64: 11 runtime relationship(s) declared, 1 unsatisfiable
+```
+
+It reads each component's `debian/control` — the same file the build order comes
+from — for the `Pre-Depends`, `Depends`, and `Recommends` its binary stanzas
+declare, and answers each against the target suite, the recipe's repositories,
+the pool as it stands, and **the packages the recipe itself will build**. That
+last is what makes the question answerable at all before a build: a metapackage
+depending on everything its recipe produces is satisfied by its siblings, none of
+which is in any archive yet.
+
+The two answer the same question at different strengths and different times, and
+neither replaces the other:
+
+|  | `plan --runtime-deps` | `check` |
+| --- | --- | --- |
+| Reads | `debian/control` | the built `.deb`s in the pool |
+| Sees `${shlibs:Depends}` | no, it is still a substitution | yes, expanded |
+| Reports `Recommends` | yes | no |
+| Answers | before the build | after it |
+| Exit status | unaffected | non-zero when anything is unsatisfiable |
+
+A plan reports and does not gate, for the reason a build's closing check does
+not: a pool is often built before the packages that complete it. `Recommends` is
+included here and not there because the questions differ — apt passes over a
+`Recommends` it cannot satisfy, so it is not part of installability, but a
+`Recommends` nothing will ever satisfy is a gap in what a recipe delivers.
+
+Costs one release and index fetch per architecture the recipe names, and nothing
+when the flag is absent.
+
 ## What it reads
 
 The pool, not the recipe. That matters, because `debian/control` declares

@@ -314,6 +314,21 @@ impl LocalPool {
         self.repository().map(Some)
     }
 
+    /// The pool as a trusted `file://` repository when its index on disk names
+    /// anything, and `None` otherwise.
+    ///
+    /// [`as_repository`](Self::as_repository) answers from what this process has
+    /// published, which a run tracks so a parallel build does not re-read the
+    /// index once per component. A caller that publishes nothing has nothing to
+    /// have tracked, and asks the pool itself — which is also what lets a plan
+    /// read a pool an earlier run filled.
+    pub fn repository_if_populated(&self) -> Result<Option<Repository>> {
+        match self.index_has_packages()? {
+            true => self.repository().map(Some),
+            false => Ok(None),
+        }
+    }
+
     /// The pool as a trusted `file://` repository, whatever it holds.
     ///
     /// [`as_repository`](Self::as_repository) answers `None` for a pool nothing

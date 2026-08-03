@@ -255,6 +255,15 @@ pub enum Progress<'a> {
         /// The path the manifest was written to.
         path: &'a std::path::Path,
     },
+    /// An architecture's archives are about to be read, for a plan asked to
+    /// report runtime dependencies. Reported once per architecture.
+    ///
+    /// It precedes the work it describes, as a check's own event does: the cost
+    /// is entirely in the fetch, which is silent and takes seconds.
+    ReadingArchives {
+        /// The architecture whose archives they are.
+        architecture: &'a str,
+    },
 }
 
 /// An owned [`Progress`] event, for sending across the channel a parallel build
@@ -343,6 +352,7 @@ enum OwnedProgress {
     },
     Cancelled,
     Manifest(PathBuf),
+    ReadingArchives(String),
 }
 
 impl OwnedProgress {
@@ -460,6 +470,9 @@ impl OwnedProgress {
             }
             OwnedProgress::Cancelled => reporter(Progress::Cancelled),
             OwnedProgress::Manifest(path) => reporter(Progress::Manifest { path }),
+            OwnedProgress::ReadingArchives(architecture) => {
+                reporter(Progress::ReadingArchives { architecture })
+            }
         }
     }
 }
@@ -580,6 +593,9 @@ impl From<&Progress<'_>> for OwnedProgress {
             },
             Progress::Cancelled => OwnedProgress::Cancelled,
             Progress::Manifest { path } => OwnedProgress::Manifest(path.to_path_buf()),
+            Progress::ReadingArchives { architecture } => {
+                OwnedProgress::ReadingArchives(architecture.to_string())
+            }
         }
     }
 }
@@ -993,6 +1009,59 @@ pub struct PlanReport {
     pub order: Vec<String>,
     /// Each component, in build order.
     pub components: Vec<PlannedComponent>,
+    /// What the recipe's packaging declares that the target cannot satisfy, one
+    /// entry per architecture, in the order the recipe names them.
+    ///
+    /// Empty unless [`PlanOptions::runtime_deps`] asked for it: the reading
+    /// costs a release and index fetch per architecture, which a plan that only
+    /// wants an order should not pay.
+    pub runtime_deps: Vec<RuntimeDepReport>,
+}
+
+/// One architecture's plan-time runtime-dependency reading.
+///
+/// The counterpart of a [pool check](crate::CheckedPool) at the other end of a
+/// build. They answer the same question at different strengths and different
+/// times, and neither replaces the other: a check reads built packages, so it
+/// sees `${shlibs:Depends}` expanded — a strictly stronger reading — but it
+/// answers after the build. This reads packaging, so it misses whatever a
+/// substitution will expand to, and it answers before a machine commits hours to
+/// a build.
+#[derive(Debug)]
+pub struct RuntimeDepReport {
+    /// The architecture the archives were read for.
+    pub architecture: String,
+    /// How many relationship clauses were read across every component.
+    pub clauses: usize,
+    /// The clauses nothing the target offers can satisfy, in build order and
+    /// then in the order the packaging declares them.
+    pub unsatisfied: Vec<UnsatisfiedRuntimeDep>,
+}
+
+/// One clause a recipe's packaging declares that nothing available satisfies.
+#[derive(Debug, Clone)]
+pub struct UnsatisfiedRuntimeDep {
+    /// The component whose packaging declares it.
+    pub component: String,
+    /// The binary package the clause belongs to.
+    pub package: String,
+    /// The field it was declared in.
+    pub relationship: crate::check::Relationship,
+    /// The clause as the field spells it.
+    pub clause: String,
+    /// The package names the clause would accept, none of which is available.
+    pub alternatives: Vec<String>,
+}
+
+/// What a plan reports beyond the build order.
+#[derive(Debug, Clone, Default)]
+pub struct PlanOptions {
+    /// Read each component's packaging for runtime relationships the target
+    /// suite, the recipe's repositories, the pool, and the recipe's own packages
+    /// cannot satisfy between them.
+    ///
+    /// Costs one release and index fetch per architecture the recipe names.
+    pub runtime_deps: bool,
 }
 
 /// One component in a [`PlanReport`]: what it resolved to and what it will need.
@@ -1718,6 +1787,7 @@ impl Engine {
     pub fn plan(
         &self,
         recipe: &Recipe,
+        options: &PlanOptions,
         cancel: &Cancel,
         reporter: &mut dyn FnMut(Progress),
     ) -> Result<PlanReport> {
@@ -1763,9 +1833,95 @@ impl Engine {
                 }
             })
             .collect();
+
+        // The order is architecture-independent; what the target can satisfy is
+        // not, so the reading runs once per architecture the recipe names.
+        let mut runtime_deps = Vec::new();
+        if options.runtime_deps {
+            for architecture in &recipe.architectures {
+                runtime_deps.push(self.runtime_dependencies(
+                    recipe,
+                    architecture,
+                    graph.order(),
+                    &resolved,
+                    reporter,
+                )?);
+            }
+        }
+
         Ok(PlanReport {
             order: graph.order().to_vec(),
             components,
+            runtime_deps,
+        })
+    }
+
+    /// Reads what `recipe`'s packaging declares at runtime and answers each
+    /// clause against what a build for `architecture` would have to satisfy it:
+    /// the target suite, the recipe's additional repositories, the pool as it
+    /// stands, and the recipe's own binary and virtual package names.
+    ///
+    /// The recipe's own names are what make this answerable before a build. A
+    /// metapackage depending on everything its recipe produces is satisfied by
+    /// its siblings, none of which is in any archive yet.
+    ///
+    /// The pool as it stands is read too, because a work directory often already
+    /// holds packages from a recipe that ran earlier. An empty or absent pool is
+    /// simply not among the archives.
+    fn runtime_dependencies(
+        &self,
+        recipe: &Recipe,
+        architecture: &str,
+        order: &[String],
+        resolved: &BTreeMap<&str, &Resolved>,
+        reporter: &mut dyn FnMut(Progress),
+    ) -> Result<RuntimeDepReport> {
+        reporter(Progress::ReadingArchives { architecture });
+        let pool = crate::pool::LocalPool::new(
+            crate::pool::pool_dir(&self.work_dir, &recipe.suite, architecture),
+            recipe.suite.clone(),
+            crate::pool::POOL_COMPONENT,
+            architecture.to_string(),
+        );
+        let available = crate::provision::available_names(
+            recipe,
+            architecture,
+            pool.repository_if_populated()?,
+        )?;
+
+        // Everything the recipe itself will put in the pool, real and virtual.
+        let own: BTreeSet<String> = order
+            .iter()
+            .flat_map(|name| {
+                let control = &resolved[name.as_str()].control;
+                plan::binary_packages(control)
+                    .into_iter()
+                    .chain(plan::provided_packages(control))
+            })
+            .collect();
+
+        let (mut clauses, mut unsatisfied) = (0, Vec::new());
+        for name in order {
+            for relation in plan::runtime_relationships(&resolved[name.as_str()].control) {
+                clauses += 1;
+                let satisfied = relation.alternatives.iter().any(|alternative| {
+                    own.contains(alternative) || available.contains(alternative)
+                });
+                if !satisfied {
+                    unsatisfied.push(UnsatisfiedRuntimeDep {
+                        component: name.clone(),
+                        package: relation.package,
+                        relationship: relation.relationship,
+                        clause: relation.clause,
+                        alternatives: relation.alternatives,
+                    });
+                }
+            }
+        }
+        Ok(RuntimeDepReport {
+            architecture: architecture.to_string(),
+            clauses,
+            unsatisfied,
         })
     }
 
@@ -2873,6 +3029,9 @@ mod tests {
             Progress::Skipped { component, reason } => format!("Skipped {component} {reason}"),
             Progress::Cancelled => "Cancelled".to_string(),
             Progress::Manifest { path } => format!("Manifest {}", path.display()),
+            Progress::ReadingArchives { architecture } => {
+                format!("ReadingArchives {architecture}")
+            }
         }
     }
 

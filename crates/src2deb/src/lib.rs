@@ -63,10 +63,13 @@ pub mod version;
 
 pub use build::{Artifact, BuildInfo};
 pub use cancel::Cancel;
-pub use check::{CheckOptions, CheckProgress, CheckReport, CheckedPool, Relationship, Unsatisfied};
+pub use check::{
+    CheckOptions, CheckProgress, CheckReport, CheckedPool, Provided, Relationship, Unsatisfied,
+};
 pub use engine::{
-    ArchitectureReport, BuildDate, Built, Engine, Failed, Package, PlanReport, PlannedComponent,
-    Progress, RunOptions, RunReport, Selection, SkipReason, Skipped,
+    ArchitectureReport, BuildDate, Built, Engine, Failed, Package, PlanOptions, PlanReport,
+    PlannedComponent, Progress, RunOptions, RunReport, RuntimeDepReport, Selection, SkipReason,
+    Skipped, UnsatisfiedRuntimeDep,
 };
 pub use error::{Error, Result};
 pub use export::{ExportOptions, ExportReport};

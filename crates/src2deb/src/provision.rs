@@ -86,7 +86,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ferroday_cage::provision::debian::{
-    BuildLayer, Debian, DebianBuilder, DebianEvent, Plan, Repository, ResolvedArchive,
+    Available, BuildLayer, Debian, DebianBuilder, DebianEvent, Plan, Repository, ResolvedArchive,
 };
 use ferroday_cage::provision::{self, Provision, ProvisionEvent, ProvisionObserver};
 use ferroday_cage::{Cage, CageBuilder};
@@ -641,6 +641,71 @@ pub(crate) fn add_repositories<'a>(
         )?);
     }
     Ok(builder)
+}
+
+/// The names an archive offers, and what provides each virtual one.
+///
+/// Answered rather than handed over: a merged Debian suite is tens of thousands
+/// of names, and the provisioner's own projection of them is the thing to
+/// interrogate rather than copy. A trait rather than the projection itself so
+/// the readings built on it — [`crate::check`]'s over a pool, and
+/// [`crate::plan`]'s over a recipe's packaging — can be exercised over a known
+/// set of names.
+pub(crate) trait Names {
+    /// Whether `name` is there, as a real package or as one something provides.
+    fn contains(&self, name: &str) -> bool;
+
+    /// The real packages that provide the virtual package `name`, in a stable
+    /// order, and empty for an ordinary real package — nothing provides itself.
+    fn providers(&self, name: &str) -> Vec<String>;
+}
+
+impl Names for Available {
+    fn contains(&self, name: &str) -> bool {
+        Available::contains(self, name)
+    }
+
+    fn providers(&self, name: &str) -> Vec<String> {
+        Available::providers(self, name)
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// Every name the archives a build root is provisioned from offer, for
+/// `architecture`: the recipe's suite, its additional repositories, and `pool`
+/// when the run has one to read.
+///
+/// Reading them downloads no package, unpacks nothing, and resolves nothing — it
+/// fetches each archive's release and index and projects them to their names —
+/// so a foreign architecture is read as readily as the host's, and any number of
+/// names costs one pass.
+///
+/// Shared for the same reason [`add_repositories`] is: a dependency is judged
+/// available against exactly the archives a build root resolves from, rather
+/// than against a second reading of the same recipe fields.
+pub(crate) fn available_names(
+    recipe: &crate::recipe::Recipe,
+    architecture: &str,
+    pool: Option<Repository>,
+) -> Result<Box<dyn Names>> {
+    let mirror = recipe.mirror.as_deref();
+    let builder: DebianBuilder<'static> =
+        Debian::builder(recipe.suite.clone()).architecture(architecture.to_string());
+    let builder = match mirror {
+        Some(mirror) => builder.mirror(mirror.to_string()),
+        None => builder,
+    };
+    let mut builder = add_repositories(builder, &recipe.repositories, &recipe.suite, mirror)?;
+    if let Some(pool) = pool {
+        builder = builder.repository(pool);
+    }
+    let names = builder
+        .build()
+        .map_err(Error::Debian)?
+        .available()
+        .map_err(Error::Debian)?;
+    Ok(Box::new(names))
 }
 
 /// Builds a ferroday-cage [`Repository`] from a recipe [`Repository`](RecipeRepository).

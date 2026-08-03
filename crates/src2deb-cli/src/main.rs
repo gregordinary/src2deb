@@ -284,6 +284,9 @@ struct PlanArgs {
     version_tag: Option<String>,
     /// Print each component's build-dependencies alongside the order.
     show_build_deps: bool,
+    /// Report the runtime relationships the recipe's packaging declares that
+    /// the target cannot satisfy.
+    runtime_deps: bool,
     /// How much to print.
     verbosity: Verbosity,
 }
@@ -589,10 +592,14 @@ fn parse_build(rest: &[String]) -> Result<BuildArgs, String> {
 
 /// Parses the `plan` subcommand's arguments.
 fn parse_plan(rest: &[String]) -> Result<PlanArgs, String> {
-    let mut show_build_deps = false;
+    let (mut show_build_deps, mut runtime_deps) = (false, false);
     let common = common_args(rest, Retargets::BUILD, |flag, _iter| match flag {
         "--build-deps" => {
             show_build_deps = true;
+            Ok(true)
+        }
+        "--runtime-deps" => {
+            runtime_deps = true;
             Ok(true)
         }
         _ => Ok(false),
@@ -605,6 +612,7 @@ fn parse_plan(rest: &[String]) -> Result<PlanArgs, String> {
         arch_indep_owner: common.arch_indep_owner,
         version_tag: common.version_tag,
         show_build_deps,
+        runtime_deps,
         verbosity: common.verbosity,
     })
 }
@@ -1000,7 +1008,10 @@ fn plan(args: PlanArgs) -> Result<ExitCode, Fault> {
     let cancel = cancel_on_signal()?;
     let mut reporter = Reporter::planning(args.verbosity);
     let engine = Engine::new(args.work);
-    let outcome = engine.plan(&recipe, &cancel, &mut |event| {
+    let options = src2deb::PlanOptions {
+        runtime_deps: args.runtime_deps,
+    };
+    let outcome = engine.plan(&recipe, &options, &cancel, &mut |event| {
         if let Progress::Started = event {
             print_recipe_banner(&recipe, "planning", args.verbosity);
         }
@@ -1008,7 +1019,7 @@ fn plan(args: PlanArgs) -> Result<ExitCode, Fault> {
     });
     reporter.finish();
 
-    print_plan(&outcome?, args.show_build_deps);
+    print_plan(&outcome?, args.show_build_deps, args.verbosity);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1777,7 +1788,7 @@ fn skipped_tally(architecture: &src2deb::ArchitectureReport) -> String {
 /// A component that declares its version gets a line for it. Most do not, and a
 /// line saying so for every component would bury the ones where the version was
 /// a decision — for `version-from`, one the plan made.
-fn print_plan(report: &PlanReport, show_build_deps: bool) {
+fn print_plan(report: &PlanReport, show_build_deps: bool, verbosity: Verbosity) {
     for (position, component) in report.components.iter().enumerate() {
         println!(
             "{:>3}. {} @ {}",
@@ -1795,6 +1806,54 @@ fn print_plan(report: &PlanReport, show_build_deps: bool) {
                 println!("     build-deps: {}", component.build_deps.join(", "));
             }
         }
+    }
+    print_runtime_deps(report, verbosity);
+}
+
+/// Prints what `--runtime-deps` found: each clause nothing available satisfies,
+/// and a line per architecture.
+///
+/// Report-only, and the exit status is unaffected. A plan reads packaging rather
+/// than built packages, so what it sees is weaker than what
+/// [`src2deb check`](src2deb::CheckReport) sees after the build — a
+/// `${shlibs:Depends}` is still a substitution here — and a pool is often built
+/// before the packages that complete it. `src2deb check` is where the same
+/// question decides an exit status.
+fn print_runtime_deps(report: &PlanReport, verbosity: Verbosity) {
+    for target in &report.runtime_deps {
+        for entry in &target.unsatisfied {
+            eprintln!(
+                "src2deb: {}: {}: {}: {}: {}",
+                target.architecture,
+                entry.component,
+                entry.package,
+                entry.relationship.field(),
+                entry.clause,
+            );
+        }
+        if verbosity != Verbosity::Quiet {
+            eprintln!(
+                "src2deb: {}: {} runtime relationship(s) declared, {}",
+                target.architecture,
+                target.clauses,
+                match target.unsatisfied.len() {
+                    0 => "all satisfiable".to_string(),
+                    count => format!("{count} unsatisfiable"),
+                },
+            );
+        }
+    }
+    if verbosity != Verbosity::Quiet
+        && report
+            .runtime_deps
+            .iter()
+            .any(|target| !target.unsatisfied.is_empty())
+    {
+        eprintln!(
+            "src2deb: those name packages the target does not have and this recipe does not \
+             build; src2deb check answers the same question after the build, over what \
+             ${{shlibs:Depends}} expanded to"
+        );
     }
 }
 

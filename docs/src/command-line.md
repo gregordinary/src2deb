@@ -73,11 +73,18 @@ is refused before anything is provisioned, naming the component to add. See
 | Option | Effect |
 | --- | --- |
 | `--build-deps` | Print each component's build-dependencies alongside the order |
+| `--runtime-deps` | Report what the recipe's packaging declares that the target cannot satisfy |
 
 `plan` still clones every component's source, because the build order is read
 from every `debian/control`. It takes the same exclusive lock on its work
 directory that `build` does, so planning while a build runs wants a `--work`
 directory of its own.
+
+`--runtime-deps` reads each component's packaging for the runtime relationships
+it declares and answers them against the target suite, the recipe's
+repositories, the pool as it stands, and the packages the recipe itself will
+build. See
+[Before the build](installability.md#before-the-build).
 
 The order is one answer whatever the recipe targets, since neither the sources
 nor the order depends on an architecture. What does is announced as the plan

@@ -46,10 +46,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use ferroday_cage::provision::debian::{Available, Debian, DebianBuilder, Repository};
+use ferroday_cage::provision::debian::Repository;
 
 use crate::error::{Error, Result};
 use crate::pool::LocalPool;
+use crate::provision::Names;
 use crate::recipe::Recipe;
 
 /// Which pools to check.
@@ -90,6 +91,15 @@ pub enum Relationship {
     PreDepends,
     /// `Depends`, the ordinary runtime dependency.
     Depends,
+    /// `Recommends`, which apt installs by default and passes over when it
+    /// cannot satisfy.
+    ///
+    /// Never produced by a pool check, which answers installability and so reads
+    /// only what makes a package installable. A
+    /// [plan-time reading](crate::plan::runtime_relationships) reports it,
+    /// because a `Recommends` nothing satisfies is a gap in what a recipe
+    /// delivers even though it is not a gap in what apt will install.
+    Recommends,
 }
 
 impl Relationship {
@@ -98,6 +108,7 @@ impl Relationship {
         match self {
             Relationship::PreDepends => "Pre-Depends",
             Relationship::Depends => "Depends",
+            Relationship::Recommends => "Recommends",
         }
     }
 }
@@ -422,7 +433,7 @@ fn read_index(index: &str) -> Vec<PoolPackage> {
 /// one beginning with whitespace — is folded onto its field with a single space
 /// between, which is exactly right for a relationship field wrapped across
 /// lines and lossy only for a `Description`, which nothing here reads.
-fn stanzas(text: &str) -> Vec<BTreeMap<String, String>> {
+pub(crate) fn stanzas(text: &str) -> Vec<BTreeMap<String, String>> {
     let mut stanzas = Vec::new();
     let mut fields: BTreeMap<String, String> = BTreeMap::new();
     let mut last: Option<String> = None;
@@ -480,7 +491,7 @@ fn clauses(value: &str, relationship: Relationship) -> Vec<Relation> {
 /// restriction (`[linux-any]`), or a build profile (`<!nocheck>`). The last two
 /// belong to source relationships rather than binary ones, and cost nothing to
 /// pass over here.
-fn package_name(atom: &str) -> Option<&str> {
+pub(crate) fn package_name(atom: &str) -> Option<&str> {
     let atom = atom.trim();
     let end = atom
         .find(|c: char| c.is_whitespace() || matches!(c, '(' | ':' | '[' | '<'))
@@ -499,32 +510,6 @@ trait Archive {
     fn available(&mut self) -> Result<Box<dyn Names>>;
 }
 
-/// The names an archive offers, and what provides each virtual one.
-///
-/// Answered rather than handed over: a merged Debian suite is tens of thousands
-/// of names, and the provisioner's own projection of them is the thing to
-/// interrogate rather than copy.
-trait Names {
-    /// Whether `name` is there, as a real package or as one something provides.
-    fn contains(&self, name: &str) -> bool;
-
-    /// The real packages that provide the virtual package `name`, in a stable
-    /// order, and empty for an ordinary real package — nothing provides itself.
-    fn providers(&self, name: &str) -> Vec<String>;
-}
-
-impl Names for Available {
-    fn contains(&self, name: &str) -> bool {
-        Available::contains(self, name)
-    }
-
-    fn providers(&self, name: &str) -> Vec<String> {
-        Available::providers(self, name)
-            .map(str::to_string)
-            .collect()
-    }
-}
-
 /// [`Archive`] over the Debian provisioner: the target suite, the recipe's
 /// additional repositories, and the pool.
 ///
@@ -534,10 +519,8 @@ impl Names for Available {
 /// release and index and projects them to their names, which is why a foreign
 /// architecture is read as readily as the host's.
 struct DebianArchive<'a> {
-    suite: &'a str,
+    recipe: &'a Recipe,
     architecture: &'a str,
-    mirror: Option<&'a str>,
-    repositories: &'a [crate::recipe::Repository],
     pool: Repository,
 }
 
@@ -546,10 +529,8 @@ impl<'a> DebianArchive<'a> {
     /// alongside it.
     fn new(recipe: &'a Recipe, architecture: &'a str, pool: Repository) -> DebianArchive<'a> {
         DebianArchive {
-            suite: &recipe.suite,
+            recipe,
             architecture,
-            mirror: recipe.mirror.as_deref(),
-            repositories: &recipe.repositories,
             pool,
         }
     }
@@ -557,23 +538,7 @@ impl<'a> DebianArchive<'a> {
 
 impl Archive for DebianArchive<'_> {
     fn available(&mut self) -> Result<Box<dyn Names>> {
-        let builder: DebianBuilder<'static> =
-            Debian::builder(self.suite.to_string()).architecture(self.architecture.to_string());
-        let builder = match self.mirror {
-            Some(mirror) => builder.mirror(mirror.to_string()),
-            None => builder,
-        };
-        let mut debian = crate::provision::add_repositories(
-            builder,
-            self.repositories,
-            self.suite,
-            self.mirror,
-        )?
-        .repository(self.pool.clone())
-        .build()
-        .map_err(Error::Debian)?;
-        let names = debian.available().map_err(Error::Debian)?;
-        Ok(Box::new(names))
+        crate::provision::available_names(self.recipe, self.architecture, Some(self.pool.clone()))
     }
 }
 
