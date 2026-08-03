@@ -104,7 +104,13 @@ pub struct Recipe {
     /// Origin, [`label`](Self::label), and [`description`](Self::description)
     /// are what `apt policy` renders a repository as, and the first two are what
     /// an apt pin matches on. A pool that declares none is pinnable only by its
-    /// URL, which is the form apt's documentation reaches for last.
+    /// host, which is the form apt's documentation reaches for last.
+    ///
+    /// **A vendor name, not a hostname.** apt spells two different things
+    /// "origin": `Pin: release o=...` matches this field, and
+    /// `Pin: origin "host"` matches the host the client fetched from, which
+    /// comes from its source URL rather than from the archive. Naming a host
+    /// here collapses the two and gives up an axis to pin on.
     ///
     /// There is no default. An origin names the organization behind an archive,
     /// and src2deb inventing one would put a name in the archive that its owner

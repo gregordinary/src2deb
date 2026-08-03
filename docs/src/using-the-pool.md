@@ -37,7 +37,7 @@ matters for every client below.
 ## What the `Release` declares
 
 ```text
-Origin: texor.io
+Origin: Texor
 Label: COSMIC for Debian
 Suite: trixie
 Codename: trixie
@@ -56,7 +56,7 @@ file the pin cannot reach differing between two runs of the same build.
 when it names them:
 
 ```toml
-origin = "texor.io"
+origin = "Texor"
 label = "COSMIC for Debian"
 description = "COSMIC desktop packages for Debian"
 ```
@@ -125,7 +125,7 @@ form apt's own documentation leads with:
 ```text
 # /etc/apt/preferences.d/cosmic
 Package: *
-Pin: release o=texor.io,l=COSMIC for Debian
+Pin: release o=Texor,l=COSMIC for Debian
 Pin-Priority: 1001
 ```
 
@@ -138,11 +138,24 @@ stamp otherwise arranges by version alone.
 
 ```text
 500 http://build-host.example:8000 trixie/main amd64 Packages
-    release o=texor.io,l=COSMIC for Debian,c=main,b=amd64
+    release o=Texor,l=COSMIC for Debian,c=main,b=amd64
 ```
 
 A pool that declared no identity renders that line with the fields blank, and
-can be pinned only by its URL: `Pin: origin build-host.example`.
+can be pinned only by its host: `Pin: origin "build-host.example"`.
+
+That last form is a different thing from `o=`, and apt spells both "origin":
+
+| Pin form | Matches | Comes from |
+| --- | --- | --- |
+| `Pin: release o=Texor` | the `Release` file's `Origin` field | the recipe's `origin` |
+| `Pin: origin "apt.example.org"` | the host serving the archive | the client's source URL |
+
+So an `origin` naming a hostname is a mistake worth avoiding: it makes the two
+forms say the same thing and gives up an axis to pin on. apt's own manual puts
+it plainly — what follows `Origin:` in a `Release` file "is not an Internet
+address but an author or vendor name". Name whoever publishes the archive, and
+let the URL carry the host.
 
 ### What `Trusted: yes` gives up
 

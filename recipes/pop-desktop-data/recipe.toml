@@ -19,7 +19,7 @@ suite = "trixie"
 
 # The pool's Release identity, the same three values the other recipes built
 # into this pool declare. See recipes/cosmic-epoch/recipe.toml.
-origin = "texor.io"
+origin = "Texor"
 label = "COSMIC for Debian"
 description = "COSMIC desktop packages for Debian"
 

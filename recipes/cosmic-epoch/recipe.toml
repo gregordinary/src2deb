@@ -24,7 +24,7 @@ suite = "trixie"
 #
 # These three recipes are built into one pool, so they name one identity: the
 # pool has a single Release, and the last recipe to publish writes it.
-origin = "texor.io"
+origin = "Texor"
 label = "COSMIC for Debian"
 description = "COSMIC desktop packages for Debian"
 
