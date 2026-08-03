@@ -38,8 +38,9 @@
 //!
 //! Extraction is [`ferroday_cage::provision::Tarball`], which src2deb already
 //! depends on for its build roots. It detects gzip, xz, and zstd from the
-//! stream's content rather than from a file name, reads ustar, GNU, and pax,
-//! and resolves every entry strictly beneath the destination — so an archive
+//! stream's content rather than from a file name, reads ustar, GNU, pax, and
+//! pre-POSIX v7, and resolves every entry strictly beneath the destination — so
+//! an archive
 //! carrying an absolute path, a `..`, or a symlink chain leading out fails
 //! rather than writing outside the work directory.
 //!
@@ -293,8 +294,8 @@ pub(crate) fn extract(component: &str, archive: &Path, dest: &Path, subject: &st
         .map_err(|err| Error::Source {
             component: component.to_string(),
             reason: format!(
-                "unpacking {subject}: {err}. src2deb reads ustar and GNU tar \
-                 archives, optionally compressed with gzip, xz, or zstd"
+                "unpacking {subject}: {err}. src2deb reads ustar, GNU, pax, and \
+                 v7 tar archives, optionally compressed with gzip, xz, or zstd"
             ),
         })
 }

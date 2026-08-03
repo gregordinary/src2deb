@@ -1,17 +1,18 @@
 # Pool-level packaging for a COSMIC desktop on Debian.
 #
-# The metapackage that installs the desktop, and the compatibility packages
-# needed because Pop's packaging names its dependencies as Ubuntu's archive names
-# them. Each component is a packaging-only source: no upstream code, plain dh, and
-# an empty Architecture: all package whose whole content is its dependency
-# relationships, so one build serves every architecture.
+# The metapackage that installs the desktop, and the packages that fill the gaps
+# between what COSMIC's packaging names and what the target suite ships. Those
+# gaps come in two shapes, and this recipe holds both:
 #
-# The repository holds one directory per source package; each component names its
-# own with source.subdir.
-#
-# source.git names the packaging repository's home. That repository is not
-# published yet, so this recipe does not build until it is; point source.git at a
-# local clone to build it before then.
+#   - Packaging written here, for a name Debian never carried or no longer does.
+#     A packaging-only source: no upstream code, plain dh, and an empty
+#     Architecture: all package whose whole content is its dependency
+#     relationships, so one build serves every architecture. It comes from the
+#     packaging repository, one directory per source package, named with
+#     source.subdir.
+#   - A rebuild of Debian's own source, for a package a later suite dropped while
+#     an earlier one still carries it. Nothing is written: the .dsc from the suite
+#     that has it is built for the suite that does not.
 #
 # Build this into the same pool as the COSMIC packages, for the same suite: the
 # metapackage is only useful next to the packages it names.
@@ -36,3 +37,16 @@ name = "network-manager-gnome"
 source.git = "https://github.com/gregordinary/cosmic-debian.git"
 source.git-ref = "main"
 source.subdir = "network-manager-gnome"
+
+# gtk2-engines-murrine: required by pop-gtk-theme, removed from Debian after
+# trixie along with much of what still uses GTK 2. GTK 2 itself is still in
+# forky, so trixie's source builds there unchanged and no packaging has to be
+# written for it.
+#
+# The stamp is a backport: trixie carries the real package at a version that has
+# to keep winning there, and this fills the gap only where the archive has none.
+[[components]]
+name = "gtk2-engines-murrine"
+version-stamp = "backport"
+source.dsc = "http://deb.debian.org/debian/pool/main/g/gtk2-engines-murrine/gtk2-engines-murrine_0.98.2-4.dsc"
+source.sha256 = "85789dd8d50f0030fb2202dd84a99500e695e39bc947cdfb36c53c3ecf64bc61"

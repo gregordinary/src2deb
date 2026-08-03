@@ -481,22 +481,19 @@ archive as it stands rather than the leavings of the run before.
 
 ### Archive formats src2deb reads
 
-An archive may be uncompressed or compressed with gzip, xz, or zstd, and must be
-a POSIX `ustar` or GNU tar archive. Those are what contemporary tooling produces,
-and between them they cover most of what upstreams publish.
-
-Pre-POSIX **v7** tar archives — the oldest format, which carries no magic in its
-headers — are not read. A small number of long-lived releases still ship one; if
-you meet it, the failure names the archive and the formats src2deb reads:
+An archive may be uncompressed or compressed with gzip, xz, or zstd, and may be a
+POSIX `ustar`, GNU, pax, or pre-POSIX **v7** tar archive. Between them those are
+every format in circulation, so an archive that fails to unpack is a damaged file
+rather than an unsupported one. The failure names the archive it was reading:
 
 ```text
 pkg: unpacking https://example.org/releases/foo-1.2.3.tar.gz: ... is neither a
-recognized compression format nor a tar archive. src2deb reads ustar and GNU tar
-archives, optionally compressed with gzip, xz, or zstd
+recognized compression format nor a tar archive. src2deb reads ustar, GNU, pax,
+and v7 tar archives, optionally compressed with gzip, xz, or zstd
 ```
 
-Build such a component from a git repository instead, with [packaging from
-elsewhere](#packaging-overlays) if upstream ships none.
+Compression is detected from the stream's content rather than from the file name,
+so an archive served under a name that does not match its contents still unpacks.
 
 ## Rebuilding a Debian source package
 

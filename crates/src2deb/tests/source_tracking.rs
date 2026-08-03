@@ -1875,8 +1875,26 @@ fn curl_available() -> bool {
 /// on the host and the bytes they exercise are fixed rather than whatever the
 /// local `tar` happens to emit.
 fn write_tar(path: &Path, entries: &[(&str, &str)]) {
+    write_tar_in_format(path, entries, true);
+}
+
+/// Writes the same archive as [`write_tar`] in the pre-POSIX **v7** format: no
+/// magic, no version, and a plain `0` type flag for a directory rather than
+/// ustar's `5`.
+///
+/// The v7 header is a prefix of the ustar one, so the difference is entirely in
+/// the fields left NUL. That is what makes the format hard to detect and worth a
+/// test of its own: roughly one in twelve Debian `.orig.tar.*` files is still
+/// one of these.
+fn write_tar_v7(path: &Path, entries: &[(&str, &str)]) {
+    write_tar_in_format(path, entries, false);
+}
+
+/// The body of [`write_tar`] and [`write_tar_v7`]. `ustar` selects between the
+/// POSIX header and the pre-POSIX one.
+fn write_tar_in_format(path: &Path, entries: &[(&str, &str)], ustar: bool) {
     /// Copies `text` into `header` at `offset`, leaving the rest of the field
-    /// as the NUL padding a ustar field takes.
+    /// as the NUL padding a tar field takes.
     fn put(header: &mut [u8; 512], offset: usize, text: &str) {
         header[offset..offset + text.len()].copy_from_slice(text.as_bytes());
     }
@@ -1898,9 +1916,13 @@ fn write_tar(path: &Path, entries: &[(&str, &str)]) {
         put(&mut header, 136, "00000000000");
         // The checksum field counts as spaces while the checksum is summed.
         header[148..156].fill(b' ');
-        header[156] = if directory { b'5' } else { b'0' };
-        put(&mut header, 257, "ustar\0");
-        put(&mut header, 263, "00");
+        // v7 has no directory type flag: a directory is a zero-length entry
+        // whose name ends in `/`, which is how the format said it at the time.
+        header[156] = if directory && ustar { b'5' } else { b'0' };
+        if ustar {
+            put(&mut header, 257, "ustar\0");
+            put(&mut header, 263, "00");
+        }
         let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
         put(&mut header, 148, &format!("{sum:06o}\0"));
 
@@ -1998,6 +2020,45 @@ fn an_archive_source_unpacks_and_is_pinned_by_its_digest() {
     // It was cached under its digest, so a second component naming it fetches
     // nothing.
     assert!(root.join("tarballs").join(&sha256).is_file());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_pre_posix_v7_archive_unpacks_like_any_other() {
+    if !curl_available() {
+        return;
+    }
+    let root = scratch("archive-v7");
+    let archive = root.join("pkg-1.2.3.tar");
+    write_tar_v7(
+        &archive,
+        &[
+            ("pkg-1.2.3/", ""),
+            ("pkg-1.2.3/marker", "from the archive\n"),
+            ("pkg-1.2.3/src/", ""),
+            ("pkg-1.2.3/src/main.c", "int main(void) { return 0; }\n"),
+        ],
+    );
+    // A v7 header carries no magic, so nothing in the file announces the format
+    // and a reader that keys on the magic sees no tar archive at all.
+    assert_eq!(&std::fs::read(&archive).unwrap()[257..265], &[0u8; 8]);
+
+    let packaging = root.join("packaging");
+    write_packaging(&packaging, "from packaging");
+    let comp = overlaid_from_path(
+        archive_component("pkg", &archive, &digest(&archive)),
+        &packaging,
+    );
+    let resolved = resolver_in(&root, &root).resolve(&comp).expect("resolve");
+
+    // The same tree a ustar archive of the same entries produces: the release
+    // directory is descended into, the files are there, and the packaging
+    // overlay lands on top.
+    assert_eq!(resolved.tree, root.join("sources/pkg/pkg-1.2.3"));
+    assert_eq!(resolved_marker(&resolved.tree), "from the archive\n");
+    assert!(resolved.tree.join("src/main.c").is_file());
+    assert_eq!(packaging_marker(&resolved.tree), "from packaging");
 
     let _ = std::fs::remove_dir_all(&root);
 }
